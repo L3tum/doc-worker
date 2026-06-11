@@ -31,10 +31,10 @@ jobs:
       - name: Lint with ruff
         run: |
           pip install ruff
-          ruff check app/
+          ruff check worker.py
 
       - name: Validate syntax
-        run: python -c "import ast; [ast.parse(open(f).read()) for f in __import__('glob').glob('app/*.py')]"
+        run: python -c "import ast; [ast.parse(open(f).read()) for f in __import__('glob').glob('*.py')]"
 
   publish:
     needs: [test]
