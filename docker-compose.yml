@@ -1,0 +1,119 @@
+# =============================================================================
+# Doc-Worker — Example docker-compose.yml
+# =============================================================================
+# This file shows a complete setup with Doc-Worker, Docling, and Paperless-ngx.
+# Adjust volumes and network settings to match your environment.
+# =============================================================================
+
+services:
+
+  # -----------------------------------------------------------------------
+  # Doc-Worker: polls inbox → OCR + sidecar → Paperless
+  # -----------------------------------------------------------------------
+  doc-worker:
+    build: .
+    # image: doc-worker       # use this if you pre-built the image
+    container_name: doc-worker
+    restart: unless-stopped
+    volumes:
+      # Worker staging directories
+      - ./work/inbox:/work/inbox
+      - ./work/processing:/work/processing
+      - ./work/done:/work/done
+      - ./work/error:/work/error
+      - ./work/docling:/work/docling
+      # Paperless consume directory (mount the same path Paperless uses)
+      - ./paperless-consume:/paperless-consume
+    environment:
+      # Docling API
+      - DOCLING_BASE_URL=http://docling:12000
+      - DOCLING_TIMEOUT=900          # 15 minutes for large documents
+
+      # OCR settings
+      - OCR_LANG=deu+eng
+      - RAPIDOCR_CONFIG=/app/rapidocr.yaml
+
+      # Polling
+      - POLL_INTERVAL=5
+
+      # Retry
+      - MAX_RETRIES=3
+      - RETRY_DELAY=10
+    depends_on:
+      docling:
+        condition: service_started
+    networks:
+      - doc-worker-net
+
+  # -----------------------------------------------------------------------
+  # Docling: document parsing & sidecar generation API
+  # -----------------------------------------------------------------------
+  docling:
+    image: ghcr.io/ds4sd/docling:latest
+    container_name: docling
+    restart: unless-stopped
+    ports:
+      - "12000:12000"
+    networks:
+      - doc-worker-net
+
+  # -----------------------------------------------------------------------
+  # Paperless-ngx: document management system
+  # Uncomment and configure if you need a full stack.
+  # -----------------------------------------------------------------------
+  # paperless:
+  #   image: ghcr.io/paperless-ngx/paperless-ngx:latest
+  #   container_name: paperless
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ./paperless-data/data:/usr/src/paperless/data
+  #     - ./paperless-data/media:/usr/src/paperless/media
+  #     - ./paperless-data/export:/usr/src/paperless/export
+  #     - ./paperless-data/consume:/usr/src/paperless/consume
+  #     - ./paperless-data/static:/usr/src/paperless/static
+  #   environment:
+  #     - PAPERLESS_CONSUME_DIR=/usr/src/paperless/consume
+  #     - PAPERLESS_URL=http://localhost:8000
+  #     - PAPERLESS_REDIS=redis://redis:6379
+  #     - PAPERLESS_DBHOST=db
+  #     - PAPERLESS_DBPORT=5432
+  #     - PAPERLESS_DBNAME=paperless
+  #     - PAPERLESS_DBUSER=paperless
+  #     - PAPERLESS_DBPASS=paperless
+  #   depends_on:
+  #     - redis
+  #     - db
+  #   networks:
+  #     - doc-worker-net
+
+  # -----------------------------------------------------------------------
+  # Redis (required by Paperless)
+  # -----------------------------------------------------------------------
+  # redis:
+  #   image: redis:7
+  #   container_name: paperless-redis
+  #   restart: unless-stopped
+  #   networks:
+  #     - doc-worker-net
+
+  # -----------------------------------------------------------------------
+  # PostgreSQL (required by Paperless)
+  # -----------------------------------------------------------------------
+  # db:
+  #   image: postgres:16
+  #   container_name: paperless-db
+  #   restart: unless-stopped
+  #   environment:
+  #     - POSTGRES_USER=paperless
+  #     - POSTGRES_PASSWORD=paperless
+  #     - POSTGRES_DB=paperless
+  #   volumes:
+  #     - ./paperless-data/postgres:/var/lib/postgresql/data
+  #   networks:
+  #     - doc-worker-net
+
+networks:
+  doc-worker-net:
+    driver: bridge
