@@ -19,7 +19,7 @@ DOCLING_OUT = Path("/work/docling")
 PAPERLESS_CONSUME = Path(os.getenv("PAPERLESS_CONSUME", "/paperless-consume"))
 DOCLING_BASE_URL = os.getenv("DOCLING_BASE_URL", "http://docling:5001").rstrip("/")
 DOCLING_MODE = os.getenv("DOCLING_MODE", "best_effort")  # "off" | "best_effort" | "required"
-OCR_LANG = os.getenv("OCR_LANG", "deu+eng")
+OCR_LANG = os.getenv("OCR_LANG", "deu")
 
 for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
     path.mkdir(parents=True, exist_ok=True)
@@ -162,6 +162,7 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
         "ocrmypdf",
         "--plugin", "ocrmypdf_rapidocr",
         "--rapidocr-config-path", rapidocr_config,
+        "-l", OCR_LANG,
 
         "--force-ocr",
         "--deskew",
