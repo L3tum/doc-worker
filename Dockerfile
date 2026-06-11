@@ -18,17 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     curl \
     ca-certificates \
-    tesseract-ocr \
-    tesseract-ocr-deu \
-    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir \
-    ocrmypdf \
-    ocrmypdf-rapidocr \
-    modelscope \
-    pyyaml \
-    requests
+COPY requirements.txt /opt/doc-worker/requirements.txt
+RUN pip install --no-cache-dir -r /opt/doc-worker/requirements.txt
 
 RUN python - <<'PY'
 import os
