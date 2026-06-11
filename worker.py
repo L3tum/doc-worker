@@ -18,6 +18,7 @@ DOCLING_OUT = Path("/work/docling")
 
 PAPERLESS_CONSUME = Path(os.getenv("PAPERLESS_CONSUME", "/paperless-consume"))
 DOCLING_BASE_URL = os.getenv("DOCLING_BASE_URL", "http://docling:5001").rstrip("/")
+DOCLING_MODE = os.getenv("DOCLING_MODE", "best_effort")  # "off" | "best_effort"
 OCR_LANG = os.getenv("OCR_LANG", "deu+eng")
 
 for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
@@ -199,12 +200,13 @@ def process_pdf(input_path: Path) -> None:
     print(f"Processing {cleaned_name}", flush=True)
 
     try:
-        try:
-            call_docling_api(work_pdf, sidecar_dir)
-        except Exception as exc:
-            # Do not block Paperless ingestion if Docling sidecar creation fails.
-            (sidecar_dir / "docling-error.txt").write_text(str(exc), encoding="utf-8")
-            print(f"Docling failed for {cleaned_name}: {exc}", flush=True)
+        if DOCLING_MODE != "off":
+            try:
+                call_docling_api(work_pdf, sidecar_dir)
+            except Exception as exc:
+                # Do not block Paperless ingestion if Docling sidecar creation fails.
+                (sidecar_dir / "docling-error.txt").write_text(str(exc), encoding="utf-8")
+                print(f"Docling failed for {cleaned_name}: {exc}", flush=True)
 
         run_ocrmypdf(work_pdf, ocr_pdf)
         atomic_move_into_consume(ocr_pdf, cleaned_name)
@@ -222,7 +224,8 @@ def process_pdf(input_path: Path) -> None:
 
 
 def main() -> None:
-    wait_for_docling()
+    if DOCLING_MODE != "off":
+        wait_for_docling()
 
     while True:
         pdfs = sorted(INBOX.glob("*.pdf")) + sorted(INBOX.glob("*.PDF"))
