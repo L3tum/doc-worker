@@ -3,7 +3,7 @@
 A Docker-based OCR pipeline worker that:
 
 1. **Polls** an inbox directory for new PDF files.
-2. **Runs OCR** using [OCRmyPDF](https://github.com/jbarlow83/OCRmyPDF) with the [RapidOCR](https://github.com/RapidAI/RapidOCR) ONNX plugin (no Tesseract required).
+2. **Runs OCR** using [OCRmyPDF](https://github.com/jbarlow83/OCRmyPDF) with the [RapidOCR](https://github.com/RapidAI/RapidOCR) ONNX plugin via Python API (no Tesseract required).
 3. **Generates sidecar documents** via the [Docling](https://github.com/DS4SD/docling) API (Markdown + JSON).
 4. **Pushes** the processed PDFs into a [Paperless-ngx](https://paperless-ngx.com/) consume directory.
 
@@ -16,7 +16,7 @@ INBOX/*.pdf
   │
   ├─ PROCESSING/
   │   ├─ Docling API  →  sidecar JSON
-  │   ├─ OCRmyPDF + RapidOCR  →  searchable PDF
+  │   ├─ ocrmypdf.ocr() + RapidOCR  →  searchable PDF
   │   └─ Push → Paperless consume/
   │
   ├─ DONE/       (successfully processed)
@@ -81,7 +81,7 @@ All settings are environment variables:
 | `POLL_INTERVAL` | `5` | Seconds between inbox polls |
 | `DOCLING_BASE_URL` | `http://docling:12000` | Docling API endpoint |
 | `DOCLING_TIMEOUT` | `900` | Timeout for Docling API calls (seconds) |
-| `RAPIDOCR_CONFIG` | `/app/rapidocr.yaml` | RapidOCR YAML config path |
+| `RAPIDOCR_CONFIG` | *(none)* | Optional path to a custom RapidOCR YAML config. If omitted, RapidOCR uses its built-in defaults. |
 | `MAX_RETRIES` | `3` | Max OCR retry attempts |
 | `RETRY_DELAY` | `10` | Seconds between OCR retries |
 
