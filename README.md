@@ -3,7 +3,7 @@
 A Docker-based OCR pipeline worker that:
 
 1. **Polls** an inbox directory for new PDF files.
-2. **Runs OCR** using [OCRmyPDF](https://github.com/jbarlow83/OCRmyPDF) with the [RapidOCR](https://github.com/RapidAI/RapidOCR) ONNX plugin via Python API (no Tesseract required).
+2. **Runs OCR** using [OCRmyPDF](https://github.com/jbarlow83/OCRmyPDF) with the [RapidOCR](https://github.com/RapidAI/RapidOCR) ONNX plugin via Python API. Tesseract is used for deskewing and image optimization (the RapidOCR plugin handles text recognition).
 3. **Generates sidecar documents** via the [Docling](https://github.com/DS4SD/docling) API (Markdown + JSON).
 4. **Pushes** the processed PDFs into a [Paperless-ngx](https://paperless-ngx.com/) consume directory.
 
