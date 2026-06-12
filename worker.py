@@ -157,22 +157,19 @@ def write_docling_sidecars(doc: dict, out_dir: Path) -> None:
 
 def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
     """Run OCRmyPDF with RapidOCR engine via Python API."""
-    kwargs = {
-        "input": str(input_pdf),
-        "output": str(output_pdf),
-        "plugins": ["ocrmypdf_rapidocr"],
-        "language": OCR_LANG,
-        "force_ocr": True,
-        "deskew": True,
-        "clean": True,
-        "optimize": 1,
-    }
-    # Optional: pass config path if set via env var
-    rapidocr_config = os.environ.get("RAPIDOCR_CONFIG")
-    if rapidocr_config:
-        kwargs["rapidocr_config_path"] = rapidocr_config
-
-    ocrmypdf.ocr(**kwargs)
+    # input_file_or_options and output_file are positional args in ocrmypdf.ocr()
+    # Everything else is keyword-only (after the * in the signature)
+    ocrmypdf.ocr(
+        input_pdf,
+        output_pdf,
+        plugins=["ocrmypdf_rapidocr"],
+        language=OCR_LANG,
+        force_ocr=True,
+        deskew=True,
+        clean=True,
+        optimize=1,
+        rapidocr_config_path=os.environ.get("RAPIDOCR_CONFIG"),
+    )
 
 def atomic_move_into_consume(source: Path, final_name: str) -> None:
     tmp_target = PAPERLESS_CONSUME / f".{final_name}.tmp"
