@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /opt/doc-worker/requirements.txt
 RUN pip install --no-cache-dir -r /opt/doc-worker/requirements.txt
 
-# Pre-download RapidOCR models during build to avoid runtime download delay
+# Verify RapidOCR models are available (they are bundled with the package)
 RUN python - <<'PY'
 import tempfile
 from pathlib import Path
@@ -32,11 +32,11 @@ tmp = Path(tempfile.mkdtemp()) / "test.png"
 img = Image.new("RGB", (200, 50), color="white")
 img.save(str(tmp))
 
-# Instantiate RapidOCR — triggers model auto-download
+# Instantiate RapidOCR to verify models load correctly
 from rapidocr import RapidOCR
 ocr = RapidOCR()
-result, _ = ocr(str(tmp))
-print("RapidOCR model download complete.")
+result = ocr(str(tmp))
+print("RapidOCR models loaded successfully.")
 PY
 
 # Copy worker script
