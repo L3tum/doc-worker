@@ -8,6 +8,8 @@ ENV PIP_NO_CACHE_DIR=1
 ENV HOME=/opt/doc-worker
 
 # Install system dependencies for OCRmyPDF
+# Note: tesseract-ocr is required for deskew/clean/optimization features,
+# even when using the RapidOCR plugin (which only replaces the OCR engine).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
     qpdf \
@@ -15,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pngquant \
     jbig2dec \
     libgl1 \
+    tesseract-ocr \
+    tesseract-ocr-deu \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
