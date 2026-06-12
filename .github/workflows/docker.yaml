@@ -32,6 +32,20 @@ jobs:
       - name: Validate syntax
         run: python -c "import ast; [ast.parse(open(f).read()) for f in __import__('glob').glob('*.py')]"
 
+  build-docker:
+    needs: [test]
+    if: github.event_name != 'release'
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+
   publish:
     needs: [test]
     if: github.event_name == 'release' && github.event.action == 'published' && github.server_url != 'https://github.com'
