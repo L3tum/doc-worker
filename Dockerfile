@@ -26,23 +26,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /opt/doc-worker/requirements.txt
 RUN pip install --no-cache-dir -r /opt/doc-worker/requirements.txt
 
-# Verify RapidOCR models are available (they are bundled with the package)
-RUN python - <<'PY'
-import tempfile
-from pathlib import Path
-from PIL import Image
-
-# Create a minimal test image
-tmp = Path(tempfile.mkdtemp()) / "test.png"
-img = Image.new("RGB", (200, 50), color="white")
-img.save(str(tmp))
-
-# Instantiate RapidOCR to verify models load correctly
-from rapidocr import RapidOCR
-ocr = RapidOCR()
-result = ocr(str(tmp))
-print("RapidOCR models loaded successfully.")
-PY
+# Pre-download RapidOCR models for the target language(s)
+# This triggers the download of language-specific recognition models at build time,
+# avoiding slow first-run downloads at container startup.
+RUN python -c "from PIL import Image; Image.new('RGB', (200, 50), 'white').save('/tmp/test.png')" \
+    && ocrmypdf --plugin ocrmypdf_rapidocr -l deu -f /tmp/test.png /tmp/test_ocr.pdf \
+    && rm -f /tmp/test.png /tmp/test_ocr.pdf \
+    && echo "RapidOCR models preloaded successfully."
 
 # Copy worker script
 COPY worker.py /usr/local/bin/worker.py
