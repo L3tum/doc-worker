@@ -3,10 +3,10 @@
 import json
 import os
 import shutil
-import subprocess
 import time
 from pathlib import Path
 
+import ocrmypdf
 import requests
 
 
@@ -156,24 +156,23 @@ def write_docling_sidecars(doc: dict, out_dir: Path) -> None:
 
 
 def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
-    rapidocr_config = os.getenv("RAPIDOCR_CONFIG", "/opt/doc-worker/rapidocr.yaml")
+    """Run OCRmyPDF with RapidOCR engine via Python API."""
+    kwargs = {
+        "input": str(input_pdf),
+        "output": str(output_pdf),
+        "plugins": ["ocrmypdf_rapidocr"],
+        "language": OCR_LANG,
+        "force_ocr": True,
+        "deskew": True,
+        "clean": True,
+        "optimize": 1,
+    }
+    # Optional: pass config path if set via env var
+    rapidocr_config = os.environ.get("RAPIDOCR_CONFIG")
+    if rapidocr_config:
+        kwargs["rapidocr_config_path"] = rapidocr_config
 
-    cmd = [
-        "ocrmypdf",
-        "--plugin", "ocrmypdf_rapidocr",
-        "--rapidocr-config-path", rapidocr_config,
-        "-l", OCR_LANG,
-
-        "--force-ocr",
-        "--deskew",
-        "--clean",
-        "--optimize", "1",
-
-        str(input_pdf),
-        str(output_pdf),
-    ]
-
-    subprocess.run(cmd, check=True)
+    ocrmypdf.ocr(**kwargs)
 
 def atomic_move_into_consume(source: Path, final_name: str) -> None:
     tmp_target = PAPERLESS_CONSUME / f".{final_name}.tmp"

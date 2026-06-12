@@ -31,7 +31,6 @@ services:
 
       # OCR settings
       - OCR_LANG=deu+eng
-      - RAPIDOCR_CONFIG=/app/rapidocr.yaml
 
       # Polling
       - POLL_INTERVAL=5
