@@ -27,7 +27,7 @@ services:
       - DOCLING_TIMEOUT=900          # 15 minutes for large documents
 
       # OCR settings
-      - OCR_LANG=deu+eng
+      - OCR_LANG=deu
 
       # Runtime selection: "cpu", "cuda", "openvino", or "rocm"
       # Must match the ONNX_RUNTIME build arg used when building the image.

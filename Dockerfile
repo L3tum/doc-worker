@@ -63,6 +63,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
     fonts-dejavu \
     fonts-noto-cjk \
+    # OCRmyPDF helpers (deskew, clean, optimize)
+    qpdf unpaper pngquant jbig2dec libgl1 tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -86,6 +88,11 @@ RUN if [ "$ONNX_RUNTIME" = "cuda" ]; then \
 # ---------------------------------------------------------------------------
 WORKDIR /app
 COPY . .
+
+# ---------------------------------------------------------------------------
+# Pre-download RapidOCR models (avoids first-run download delay / offline fail)
+# ---------------------------------------------------------------------------
+RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR()" 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label

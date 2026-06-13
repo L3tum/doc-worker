@@ -281,15 +281,43 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
 # Paperless push
 # ---------------------------------------------------------------------------
 def push_to_paperless(ocr_pdf: Path) -> bool:
-    """Upload the OCR'd PDF to Paperless-ngx consume directory."""
+    """Upload the OCR'd PDF to Paperless-ngx consume directory.
+
+    Uses an atomic write pattern (write to .tmp, then rename) so Paperless
+    never picks up a partially-written file.
+    """
     dest = PAPERLESS_CONSUME / ocr_pdf.name
+    tmp_dest = PAPERLESS_CONSUME / f"{ocr_pdf.name}.tmp"
     try:
-        shutil.copy2(str(ocr_pdf), str(dest))
+        shutil.copy2(str(ocr_pdf), str(tmp_dest))
+        os.replace(str(tmp_dest), str(dest))
         log(f"  Pushed to Paperless: {dest}")
         return True
     except Exception as exc:
         log_error(f"Paperless push failed: {exc}")
+        # Clean up temp file on failure
+        if tmp_dest.exists():
+            tmp_dest.unlink()
         return False
+
+
+# ---------------------------------------------------------------------------
+# Docling health check
+# ---------------------------------------------------------------------------
+def wait_for_docling(timeout: int = 120) -> None:
+    """Wait for Docling API to become available before processing."""
+    log(f"Waiting for Docling at {DOCLING_BASE_URL}...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            resp = requests.get(f"{DOCLING_BASE_URL}/health", timeout=5)
+            if resp.status_code == 200:
+                log("Docling is ready.")
+                return
+        except Exception:
+            pass
+        time.sleep(2)
+    log(f"WARNING: Docling did not become ready within {timeout}s — continuing anyway.")
 
 
 # ---------------------------------------------------------------------------
@@ -335,15 +363,28 @@ def process_file(pdf_path: Path) -> None:
     log(f"  → DONE/ ({filename})")
 
 
-def wait_for_stable_file(pdf_path: Path, stability_check: int = 30) -> bool:
-    """Wait until the file size stops changing (upload finished)."""
+def wait_for_stable_file(pdf_path: Path, stability_timeout: int | None = None) -> bool:
+    """Wait until the file size stops changing (upload finished).
+
+    Polls the file size for up to *stability_timeout* seconds (default from
+    STABILITY_TIMEOUT env-var, fallback 10 s).  If the size stays the same for
+    the full period the file is considered stable.
+    """
+    if stability_timeout is None:
+        stability_timeout = int(os.getenv("STABILITY_TIMEOUT", "10"))
     try:
         last_size = pdf_path.stat().st_size
-        time.sleep(stability_check)
-        current_size = pdf_path.stat().st_size
-        if last_size != current_size:
-            log(f"  File still changing: {pdf_path.name} ({last_size} → {current_size})")
-            return False
+        start = time.time()
+        while time.time() - start < stability_timeout:
+            time.sleep(1)
+            current_size = pdf_path.stat().st_size
+            if current_size != last_size:
+                last_size = current_size
+                start = time.time()  # reset timer on change
+                continue
+        # If we exited because size stayed constant → stable;
+        # if timer expired → still process (warn).
+        log(f"  Stable: {pdf_path.name}")
         return True
     except FileNotFoundError:
         log(f"  File disappeared during stability check: {pdf_path.name}")
@@ -353,7 +394,7 @@ def wait_for_stable_file(pdf_path: Path, stability_check: int = 30) -> bool:
 def main() -> None:
     log("Doc-Worker starting...")
     log(f"  INBOX:     {INBOX}")
-    log(f"  PROCESSING:{PROCESSING}")
+    log(f"  PROCESSING: {PROCESSING}")
     log(f"  DONE:      {DONE}")
     log(f"  ERROR:     {ERROR}")
     log(f"  DOCLING:   {DOCLING_OUT}")
@@ -362,9 +403,15 @@ def main() -> None:
     log(f"  DOCLING_MODE: {DOCLING_MODE}")
     log(f"  OCR_LANG:  {OCR_LANG}")
     log(f"  OCR_RUNTIME: {OCR_RUNTIME}")
+    log(f"  STABILITY_TIMEOUT: {os.getenv('STABILITY_TIMEOUT', '10')}s")
 
     # Crash recovery
     recover_leftover_files()
+
+    # Wait for Docling to become available (if configured)
+    if DOCLING_BASE_URL and DOCLING_MODE != "off":
+        docling_timeout = int(os.getenv("DOCLING_TIMEOUT", "900"))
+        wait_for_docling(docling_timeout)
 
     poll_interval = int(os.getenv("POLL_INTERVAL", "5"))
     max_retries = int(os.getenv("MAX_RETRIES", "3"))
@@ -377,12 +424,15 @@ def main() -> None:
 
     while True:
         try:
-            # Find new PDFs in inbox
-            pdf_files = sorted(INBOX.glob("*.pdf"))
+            # Find new PDFs in inbox (match both lower- and upper-case extensions)
+            pdf_files = sorted(
+                {f for p in ("*.pdf", "*.PDF") for f in INBOX.glob(p)},
+                key=lambda p: p.name.lower(),
+            )
 
             for pdf in pdf_files:
                 # Stability check
-                if not wait_for_stable_file(pdf, stability_check=30):
+                if not wait_for_stable_file(pdf):
                     log(f"  Skipping (unstable): {pdf.name}")
                     continue
 
