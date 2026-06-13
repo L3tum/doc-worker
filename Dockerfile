@@ -91,8 +91,10 @@ COPY . .
 
 # ---------------------------------------------------------------------------
 # Pre-download RapidOCR models (avoids first-run download delay / offline fail)
+# Specify language 'deu' so the Latin recognition model is downloaded
+# instead of the default Chinese model.
 # ---------------------------------------------------------------------------
-RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR()" 2>&1 || true
+RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(use_lang='deu')" 2>&1 || true
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label
