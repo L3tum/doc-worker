@@ -11,7 +11,13 @@ services:
   # Doc-Worker: polls inbox → OCR + sidecar → Paperless
   # -----------------------------------------------------------------------
   doc-worker:
-    build: .
+    build:
+      context: .
+      args:
+        # Runtime selection: "cpu" (default) or "cuda" for GPU acceleration
+        # When set to "cuda", the image is built on NVIDIA CUDA 12.6.2 base
+        # and installs onnxruntime-gpu instead of onnxruntime.
+        ONNX_RUNTIME: cpu
     # image: doc-worker       # use this if you pre-built the image
     container_name: doc-worker
     restart: unless-stopped
@@ -32,12 +38,27 @@ services:
       # OCR settings
       - OCR_LANG=deu+eng
 
+      # Runtime selection: "cpu" (default) or "cuda" for GPU acceleration
+      # Must match the ONNX_RUNTIME build arg used when building the image.
+      # At runtime, the worker will auto-detect if CUDA is available and
+      # fall back to CPU if not.
+      - OCR_RUNTIME=cpu
+
       # Polling
       - POLL_INTERVAL=5
 
       # Retry
       - MAX_RETRIES=3
       - RETRY_DELAY=10
+
+      # GPU passthrough (uncomment when using ONNX_RUNTIME=cuda)
+      # deploy:
+      #   resources:
+      #     reservations:
+      #       devices:
+      #         - driver: nvidia
+      #           count: 1
+      #           capabilities: [gpu]
     depends_on:
       docling:
         condition: service_started

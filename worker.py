@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import importlib
 import json
 import os
 import shutil
@@ -7,6 +8,7 @@ import time
 from pathlib import Path
 
 import ocrmypdf
+import rapidocr
 import requests
 
 
@@ -20,6 +22,7 @@ PAPERLESS_CONSUME = Path(os.getenv("PAPERLESS_CONSUME", "/paperless-consume"))
 DOCLING_BASE_URL = os.getenv("DOCLING_BASE_URL", "http://docling:5001").rstrip("/")
 DOCLING_MODE = os.getenv("DOCLING_MODE", "best_effort")  # "off" | "best_effort" | "required"
 OCR_LANG = os.getenv("OCR_LANG", "deu")
+OCR_RUNTIME = os.getenv("OCR_RUNTIME", "cpu").lower()  # "cpu" | "cuda"
 
 for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
     path.mkdir(parents=True, exist_ok=True)
@@ -155,8 +158,86 @@ def write_docling_sidecars(doc: dict, out_dir: Path) -> None:
     )
 
 
+def _configure_rapidocr_runtime() -> None:
+    """Patch RapidOCR to use the selected runtime (CPU or CUDA).
+
+    This is called once at startup. It monkey-patches RapidOCR.__init__ so
+    every instance picks up our runtime preference.
+    """
+    global _rapidocr_configured
+    if _rapidocr_configured:
+        return
+    _rapidocr_configured = True
+
+    # Validate runtime
+    if OCR_RUNTIME not in ("cpu", "cuda"):
+        print(
+            f"WARNING: OCR_RUNTIME='{OCR_RUNTIME}' is invalid, falling back to 'cpu'. "
+            "Valid values: cpu, cuda",
+            flush=True,
+        )
+        OCR_RUNTIME = "cpu"
+
+    # If CUDA requested, verify it's actually available
+    if OCR_RUNTIME == "cuda":
+        try:
+            import onnxruntime as ort
+            providers = ort.get_available_providers()
+            if "CUDAExecutionProvider" not in providers:
+                print(
+                    f"WARNING: OCR_RUNTIME=cuda requested but CUDAExecutionProvider "
+                    f"is not available. Falling back to CPU. "
+                    f"Available providers: {providers}",
+                    flush=True,
+                )
+                OCR_RUNTIME = "cpu"
+            else:
+                print("INFO: CUDAExecutionProvider found — GPU acceleration enabled", flush=True)
+        except Exception as exc:
+            print(
+                f"WARNING: Failed to check CUDA availability ({exc}), falling back to CPU",
+                flush=True,
+            )
+            OCR_RUNTIME = "cpu"
+
+    print(f"INFO: RapidOCR runtime = {OCR_RUNTIME}", flush=True)
+
+    # Build params dict for RapidOCR
+    params = {
+        "EngineConfig": {
+            "onnxruntime": {
+                "use_cuda": OCR_RUNTIME == "cuda",
+            }
+        }
+    }
+
+    # Monkey-patch RapidOCR.__init__ to inject our params
+    _orig_init = rapidocr.RapidOCR.__init__
+
+    def _patched_init(self, config_path=None, user_params=None):
+        merged = {
+            "EngineConfig": {
+                "onnxruntime": dict(params["EngineConfig"]["onnxruntime"]),
+            }
+        }
+        if user_params:
+            for key, value in user_params.items():
+                if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+                    merged[key].update(value)
+                else:
+                    merged[key] = value
+        _orig_init(self, config_path=config_path, params=merged)
+
+    rapidocr.RapidOCR.__init__ = _patched_init
+
+
+_rapidocr_configured = False
+
+
 def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
     """Run OCRmyPDF with RapidOCR engine via Python API."""
+    _configure_rapidocr_runtime()
+
     # input_file_or_options and output_file are positional args in ocrmypdf.ocr()
     # Everything else is keyword-only (after the * in the signature)
     ocrmypdf.ocr(
