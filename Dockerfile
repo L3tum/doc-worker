@@ -30,7 +30,7 @@ RUN pip install --no-cache-dir -r /opt/doc-worker/requirements.txt
 # This triggers the download of language-specific recognition models at build time,
 # avoiding slow first-run downloads at container startup.
 RUN python -c "from PIL import Image; Image.new('RGB', (200, 50), 'white').save('/tmp/test.png')" \
-    && ocrmypdf --plugin ocrmypdf_rapidocr -l deu -d 300 -f /tmp/test.png /tmp/test_ocr.pdf \
+    && ocrmypdf --plugin ocrmypdf_rapidocr -l deu --image-dpi 300 -f /tmp/test.png /tmp/test_ocr.pdf \
     && rm -f /tmp/test.png /tmp/test_ocr.pdf \
     && echo "RapidOCR models preloaded successfully."
 
