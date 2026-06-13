@@ -1,18 +1,26 @@
 # =============================================================================
 # Doc-Worker — Dockerfile
 # =============================================================================
-# Multi-stage: CPU (default) or CUDA GPU build.
+# Multi-stage: CPU (default) or GPU build.
 #
 # Usage:
 #   CPU (default):
 #     docker build -t doc-worker .
 #
-#   CUDA GPU:
+#   CUDA GPU (NVIDIA):
 #     docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker .
 #
+#   OpenVINO (Intel GPU/CPU):
+#     docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker .
+#
+#   ROCm (AMD GPU):
+#     docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker .
+#
 # The ONNX_RUNTIME build arg controls the ONNX Runtime package installed:
-#   cpu   — onnxruntime (CPU-only, smaller image)
-#   cuda  — onnxruntime-gpu (CUDA 13.3.0, requires NVIDIA GPU at runtime)
+#   cpu       — onnxruntime (CPU-only, smallest image)
+#   cuda      — onnxruntime-gpu (CUDA 13.3.0, NVIDIA GPU)
+#   openvino  — onnxruntime-openvino (Intel GPU/CPU via OpenVINO)
+#   rocm      — onnxruntime-rocm (AMD GPU via ROCm)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -23,7 +31,7 @@ ARG ONNX_RUNTIME=cpu
 # CPU base (default)
 FROM python:3.12-slim-bookworm AS base-cpu
 
-# CUDA base (GPU) — install Python 3.12 on top of CUDA 13.3.0
+# CUDA base (NVIDIA GPU) — install Python 3.12 on top of CUDA 13.3.0
 FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS base-cuda
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -31,6 +39,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip
+
+# OpenVINO base (Intel GPU/CPU)
+FROM python:3.12-slim-bookworm AS base-openvino
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    intel-openvino-runtime \
+    && rm -rf /var/lib/apt/lists/*
+
+# ROCm base (AMD GPU)
+FROM python:3.12-slim-bookworm AS base-rocm
 
 # Pick the correct base
 FROM base-${ONNX_RUNTIME} AS base
@@ -57,6 +75,10 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Swap in GPU runtime if requested
 RUN if [ "$ONNX_RUNTIME" = "cuda" ]; then \
       pip install --no-cache-dir onnxruntime-gpu; \
+    elif [ "$ONNX_RUNTIME" = "openvino" ]; then \
+      pip install --no-cache-dir onnxruntime-openvino; \
+    elif [ "$ONNX_RUNTIME" = "rocm" ]; then \
+      pip install --no-cache-dir onnxruntime-rocm; \
     fi
 
 # ---------------------------------------------------------------------------

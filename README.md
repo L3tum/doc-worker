@@ -33,13 +33,23 @@ INBOX/*.pdf
 docker build -t doc-worker .
 ```
 
-**CUDA GPU (requires NVIDIA GPU):**
+**CUDA GPU (NVIDIA):**
 
 ```bash
 docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker .
 ```
 
-This builds on `nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04` and installs `onnxruntime-gpu` instead of the CPU-only `onnxruntime`.
+**OpenVINO (Intel GPU/CPU):**
+
+```bash
+docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker .
+```
+
+**ROCm (AMD GPU):**
+
+```bash
+docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker .
+```
 
 ### 2. Run with Docker Compose
 
@@ -68,7 +78,7 @@ services:
       - docling
 ```
 
-For **GPU acceleration**, also set `OCR_RUNTIME=cuda` and enable the NVIDIA runtime:
+For **GPU acceleration**, set `OCR_RUNTIME` to match your build and enable the appropriate GPU passthrough:
 
 ```yaml
     environment:
@@ -103,7 +113,7 @@ All settings are environment variables:
 | `DOCLING_DIR` | `/work/docling` | Docling sidecar output |
 | `PAPERLESS_CONSUME` | `/paperless-consume` | Paperless-ngx consume directory |
 | `OCR_LANG` | `deu` | OCR language (single language, see note below) |
-| `OCR_RUNTIME` | `cpu` | Inference backend: `cpu` or `cuda` |
+| `OCR_RUNTIME` | `cpu` | Inference backend: `cpu`, `cuda`, `openvino`, or `rocm` |
 | `POLL_INTERVAL` | `5` | Seconds between inbox polls |
 | `DOCLING_BASE_URL` | `http://docling:5001` | Docling API endpoint |
 | `DOCLING_MODE` | `best_effort` | Docling behavior: `off`, `best_effort`, or `required` (see below) |
@@ -116,7 +126,57 @@ All settings are environment variables:
 
 | Argument | Default | Description |
 |---|---|---|
-| `ONNX_RUNTIME` | `cpu` | ONNX Runtime variant: `cpu` (default, smaller image) or `cuda` (CUDA 13.3.0 + onnxruntime-gpu) |
+| `ONNX_RUNTIME` | `cpu` | ONNX Runtime variant (see [Runtime Backends](#runtime-backends)) |
+
+## Runtime Backends
+
+The worker supports four ONNX Runtime backends, selected via the `ONNX_RUNTIME` build arg and `OCR_RUNTIME` runtime env var:
+
+| Backend | Build Arg | Env Var | Hardware | Package | Image Size |
+|---|---|---|---|---|---|
+| **CPU** | `cpu` | `cpu` | Any CPU | `onnxruntime` | ~1.2 GB |
+| **CUDA** | `cuda` | `cuda` | NVIDIA GPU | `onnxruntime-gpu` | ~4.5 GB |
+| **OpenVINO** | `openvino` | `openvino` | Intel GPU/CPU | `onnxruntime-openvino` | ~2.5 GB |
+| **ROCm** | `rocm` | `rocm` | AMD GPU | `onnxruntime-rocm` | ~3.8 GB |
+
+The worker **auto-detects** provider availability at startup. If the requested provider is not available, it falls back to CPU with a warning.
+
+### CUDA (NVIDIA)
+
+Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host. Uses CUDA 13.3.0.
+
+```yaml
+environment:
+  - OCR_RUNTIME=cuda
+deploy:
+  resources:
+    reservations:
+      devices:
+        - driver: nvidia
+          count: 1
+          capabilities: [gpu]
+```
+
+### OpenVINO (Intel)
+
+Works with Intel integrated GPUs (iGPU), discrete GPUs (Arc), and CPUs with AVX-512. No special Docker runtime needed.
+
+```yaml
+environment:
+  - OCR_RUNTIME=openvino
+```
+
+### ROCm (AMD)
+
+Requires AMD GPU with ROCm support. May need additional device passthrough.
+
+```yaml
+environment:
+  - OCR_RUNTIME=rocm
+devices:
+  - /dev/kfd
+  - /dev/dri
+```
 
 ## Important Notes
 
@@ -162,12 +222,6 @@ environment:
 ```
 
 When Docling runs, it generates Markdown (`.md`) and JSON (`.json`) sidecar files in `/work/docling/<filename>/`.
-
-### GPU Runtime
-
-- The worker **auto-detects** CUDA availability at startup. If `OCR_RUNTIME=cuda` is set but CUDA is not available, it falls back to CPU gracefully.
-- The `ONNX_RUNTIME` build arg must match the runtime `OCR_RUNTIME` setting. Building with `cpu` and setting `OCR_RUNTIME=cuda` at runtime will not work (the GPU libraries won't be present).
-- GPU acceleration requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) installed on the host.
 
 ## Volume Mounts
 
