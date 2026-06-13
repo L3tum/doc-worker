@@ -12,7 +12,7 @@
 #
 # The ONNX_RUNTIME build arg controls the ONNX Runtime package installed:
 #   cpu   — onnxruntime (CPU-only, smaller image)
-#   cuda  — onnxruntime-gpu (CUDA 12.6.2, requires NVIDIA GPU at runtime)
+#   cuda  — onnxruntime-gpu (CUDA 13.3.0, requires NVIDIA GPU at runtime)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -23,8 +23,14 @@ ARG ONNX_RUNTIME=cpu
 # CPU base (default)
 FROM python:3.12-slim-bookworm AS base-cpu
 
-# CUDA base (GPU)
-FROM nvidia/cuda:12.6.2-runtime-ubuntu24.04 AS base-cuda
+# CUDA base (GPU) — install Python 3.12 on top of CUDA 13.3.0
+FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS base-cuda
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip
 
 # Pick the correct base
 FROM base-${ONNX_RUNTIME} AS base
