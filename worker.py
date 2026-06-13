@@ -223,7 +223,48 @@ def process_pdf(input_path: Path) -> None:
         raise
 
 
+def recover_processing_folder() -> int:
+    """On startup, recover any files left in the processing folder from a crash.
+
+    Moves PDFs back to the inbox so they get re-processed, and cleans up
+    any partial OCR outputs and orphaned sidecar directories.
+
+    Returns the number of files recovered.
+    """
+    recovered = 0
+
+    # Move any base PDFs back to inbox
+    for pdf in PROCESSING.glob("*.pdf"):
+        # Skip intermediate OCR outputs — those get cleaned up below
+        if pdf.name.endswith(".ocr.pdf"):
+            continue
+
+        target = INBOX / pdf.name
+        # Avoid overwriting an inbox file that may have already been processed
+        if target.exists():
+            # Stamp it with a recovery suffix so it still gets picked up
+            stem = pdf.stem
+            suffix = pdf.suffix
+            target = INBOX / f"{stem}.recovered{suffix}"
+        pdf.rename(target)
+        print(f"Recovered {pdf.name} -> {target.name}", flush=True)
+        recovered += 1
+
+    # Clean up partial OCR outputs
+    for ocr_pdf in PROCESSING.glob("*.ocr.pdf"):
+        ocr_pdf.unlink()
+        print(f"Cleaned up partial OCR output: {ocr_pdf.name}", flush=True)
+
+    if recovered:
+        print(f"Recovered {recovered} file(s) from processing folder", flush=True)
+
+    return recovered
+
+
 def main() -> None:
+    # --- Crash recovery: pick up files left from a previous run ---
+    recover_processing_folder()
+
     if DOCLING_MODE == "best_effort":
         try:
             wait_for_docling()
