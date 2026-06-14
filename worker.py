@@ -163,7 +163,7 @@ def _configure_rapidocr_runtime() -> None:
     Auto-detection: if the requested provider is not available, falls back
     to CPU with a warning.
     """
-    global _rapidocr_configured, OCR_RUNTIME
+    global _rapidocr_configured, OCR_RUNTIME, _rapidocr_params
     if _rapidocr_configured:
         return
     _rapidocr_configured = True
@@ -212,32 +212,19 @@ def _configure_rapidocr_runtime() -> None:
 
     log(f"INFO: RapidOCR runtime = {OCR_RUNTIME} ({target_provider})")
 
-    # Build params dict for RapidOCR
-    # RapidOCR 3.x uses EngineConfig.onnxruntime.use_cuda for GPU.
-    # For OpenVINO/ROCm we pass the providers list directly.
-    runtime_params: dict[str, Any] = {}
+    # Build flat dot-notation params for RapidOCR 3.x.
+    # RapidOCR's ParseParams.update_batch() expects keys like
+    # "EngineConfig.onnxruntime.use_cuda", NOT nested dicts.
+    _rapidocr_params: dict[str, Any] = {}
 
     if OCR_RUNTIME == "cuda":
-        runtime_params = {
-            "EngineConfig": {
-                "onnxruntime": {
-                    "use_cuda": True,
-                }
-            }
-        }
-    elif OCR_RUNTIME in ("openvino", "rocm"):
-        runtime_params = {
-            "EngineConfig": {
-                "onnxruntime": {
-                    "providers": [target_provider, "CPUExecutionProvider"],
-                }
-            }
+        _rapidocr_params = {
+            "EngineConfig.onnxruntime.use_cuda": True,
         }
 
     # Monkey-patch RapidOCR.__init__ to inject our runtime params.
     # The ocrmypdf_rapidocr plugin calls RapidOCR(config_path=..., params=...)
     # so our patched __init__ must accept `params` as a kwarg name.
-    # We store runtime_params in a separate name to avoid shadowing.
     _orig_init = rapidocr.RapidOCR.__init__
 
     def _patched_init(
@@ -245,19 +232,18 @@ def _configure_rapidocr_runtime() -> None:
         config_path: str | None = None,
         params: dict[str, Any] | None = None,
     ) -> None:
-        merged = dict(runtime_params)
+        # Merge our flat dot-notation runtime params with any user-provided params.
+        # Both dicts use flat dot-notation keys, so a simple dict merge works.
+        merged = dict(_rapidocr_params)
         if params:
-            for key, value in params.items():
-                if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-                    merged[key].update(value)
-                else:
-                    merged[key] = value
+            merged.update(params)
         _orig_init(self, config_path=config_path, params=merged if merged else None)
 
     rapidocr.RapidOCR.__init__ = _patched_init
 
 
 _rapidocr_configured = False
+_rapidocr_params: dict[str, Any] = {}
 
 
 def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
