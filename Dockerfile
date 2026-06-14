@@ -1,42 +1,107 @@
-FROM python:3.12-slim-bookworm
+# =============================================================================
+# Doc-Worker — Dockerfile
+# =============================================================================
+# Multi-stage: CPU (default) or GPU build.
+#
+# Usage:
+#   CPU (default):
+#     docker build -t doc-worker .
+#
+#   CUDA GPU (NVIDIA):
+#     docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker .
+#
+#   OpenVINO (Intel GPU/CPU):
+#     docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker .
+#
+#   ROCm (AMD GPU):
+#     docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker .
+#
+# The ONNX_RUNTIME build arg controls the ONNX Runtime package installed:
+#   cpu       — onnxruntime (CPU-only, smallest image)
+#   cuda      — onnxruntime-gpu (CUDA 13.3.0, NVIDIA GPU)
+#   openvino  — onnxruntime-openvino (Intel GPU/CPU via OpenVINO)
+#   rocm      — onnxruntime-rocm (AMD GPU via ROCm)
+# =============================================================================
 
-# Ensure unbuffered Python output for real-time Docker logs
-ENV PYTHONUNBUFFERED=1
-# Disable pip cache to reduce image size
-ENV PIP_NO_CACHE_DIR=1
-# Set working directory
-ENV HOME=/opt/doc-worker
+# ---------------------------------------------------------------------------
+# Select base image based on runtime
+# ---------------------------------------------------------------------------
+ARG ONNX_RUNTIME=cpu
 
-# Install system dependencies for OCRmyPDF
-# Note: tesseract-ocr is required for deskew/clean/optimization features,
-# even when using the RapidOCR plugin (which only replaces the OCR engine).
+# CPU base (default)
+FROM python:3.12-slim-bookworm AS base-cpu
+
+# CUDA base (NVIDIA GPU) — install Python 3.12 on top of CUDA 13.3.0
+FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS base-cuda
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ghostscript \
-    qpdf \
-    unpaper \
-    pngquant \
-    jbig2dec \
-    libgl1 \
-    tesseract-ocr \
-    tesseract-ocr-deu \
-    tesseract-ocr-eng \
+    python3.12 python3.12-venv python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip
+
+# OpenVINO base (Intel GPU/CPU)
+FROM python:3.12-slim-bookworm AS base-openvino
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    intel-openvino-runtime \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY requirements.txt /opt/doc-worker/requirements.txt
-RUN pip install --no-cache-dir -r /opt/doc-worker/requirements.txt
+# ROCm base (AMD GPU)
+FROM python:3.12-slim-bookworm AS base-rocm
 
-# Pre-download RapidOCR models for the target language(s)
-# This triggers the download of language-specific recognition models at build time,
-# avoiding slow first-run downloads at container startup.
-RUN python -c "from PIL import Image; Image.new('RGB', (200, 50), 'white').save('/tmp/test.png')" \
-    && ocrmypdf --plugin ocrmypdf_rapidocr -l deu --image-dpi 300 -f /tmp/test.png /tmp/test_ocr.pdf \
-    && rm -f /tmp/test.png /tmp/test_ocr.pdf \
-    && echo "RapidOCR models preloaded successfully."
+# Pick the correct base
+FROM base-${ONNX_RUNTIME} AS base
 
-# Copy worker script
-COPY worker.py /usr/local/bin/worker.py
-RUN chmod +x /usr/local/bin/worker.py
+ARG ONNX_RUNTIME=cpu
 
-# Run the worker
-ENTRYPOINT ["python", "/usr/local/bin/worker.py"]
+# ---------------------------------------------------------------------------
+# System packages
+# ---------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    poppler-utils \
+    ghostscript \
+    fonts-dejavu \
+    fonts-noto-cjk \
+    # OCRmyPDF helpers (deskew, clean, optimize)
+    qpdf unpaper pngquant jbig2dec libgl1 tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Python dependencies
+# ---------------------------------------------------------------------------
+COPY requirements.txt /app/requirements.txt
+
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Swap in GPU runtime if requested
+RUN if [ "$ONNX_RUNTIME" = "cuda" ]; then \
+      pip install --no-cache-dir onnxruntime-gpu; \
+    elif [ "$ONNX_RUNTIME" = "openvino" ]; then \
+      pip install --no-cache-dir onnxruntime-openvino; \
+    elif [ "$ONNX_RUNTIME" = "rocm" ]; then \
+      pip install --no-cache-dir onnxruntime-rocm; \
+    fi
+
+# ---------------------------------------------------------------------------
+# Application code
+# ---------------------------------------------------------------------------
+WORKDIR /app
+COPY . .
+
+# ---------------------------------------------------------------------------
+# Pre-download RapidOCR models (avoids first-run download delay / offline fail)
+# Specify language 'deu' so the Latin recognition model is downloaded
+# instead of the default Chinese model.
+# ---------------------------------------------------------------------------
+RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(use_lang='deu')" 2>&1 || true
+
+# ---------------------------------------------------------------------------
+# Runtime metadata label
+# ---------------------------------------------------------------------------
+LABEL onnx-runtime="${ONNX_RUNTIME}"
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+CMD ["python", "-u", "worker.py"]

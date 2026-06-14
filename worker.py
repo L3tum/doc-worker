@@ -1,162 +1,266 @@
 #!/usr/bin/env python3
+"""
+Doc-Worker — OCR pipeline for PDFs
+===================================
 
-import json
+1. Polls an inbox directory for new PDF files.
+2. Runs OCR using OCRmyPDF with the RapidOCR ONNX plugin (via Python API).
+   Tesseract is used for deskewing and image optimization (the RapidOCR plugin
+   handles text recognition).
+3. Generates sidecar documents via the Docling API (Markdown + JSON).
+4. Pushes the processed PDFs into a Paperless-ngx consume directory.
+
+All paths and settings are controlled by environment variables (see defaults
+below).  The worker loops indefinitely, sleeping between polls.
+
+Crash-recovery: on startup, any leftover files in the PROCESSING directory are
+moved to ERROR/ so they are not silently lost.
+"""
+
+import importlib
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
 
 import ocrmypdf
+import rapidocr
 import requests
 
-
-INBOX = Path("/work/inbox")
-PROCESSING = Path("/work/processing")
-DONE = Path("/work/done")
-ERROR = Path("/work/error")
-DOCLING_OUT = Path("/work/docling")
-
+# ---------------------------------------------------------------------------
+# Configuration — all overridable via environment variables
+# ---------------------------------------------------------------------------
+INBOX = Path(os.getenv("INBOX", "/work/inbox"))
+PROCESSING = Path(os.getenv("PROCESSING", "/work/processing"))
+DONE = Path(os.getenv("DONE", "/work/done"))
+ERROR = Path(os.getenv("ERROR", "/work/error"))
+DOCLING_OUT = Path(os.getenv("DOCLING_DIR", "/work/docling"))
 PAPERLESS_CONSUME = Path(os.getenv("PAPERLESS_CONSUME", "/paperless-consume"))
+
 DOCLING_BASE_URL = os.getenv("DOCLING_BASE_URL", "http://docling:5001").rstrip("/")
 DOCLING_MODE = os.getenv("DOCLING_MODE", "best_effort")  # "off" | "best_effort" | "required"
 OCR_LANG = os.getenv("OCR_LANG", "deu")
+OCR_RUNTIME = os.getenv("OCR_RUNTIME", "cpu").lower()  # "cpu" | "cuda" | "openvino" | "rocm"
 
 for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def is_stable(path: Path, wait_seconds: int = 3) -> bool:
+# ---------------------------------------------------------------------------
+# Logging helpers — plain print, flushed immediately
+# ---------------------------------------------------------------------------
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def log_error(msg: str) -> None:
+    print(f"ERROR: {msg}", flush=True, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery
+# ---------------------------------------------------------------------------
+def recover_leftover_files() -> None:
+    """Move any stale files from PROCESSING into ERROR on startup."""
+    leftovers = list(PROCESSING.iterdir()) if PROCESSING.exists() else []
+    if not leftovers:
+        return
+
+    log(f"Crash recovery: found {len(leftovers)} file(s) in PROCESSING/")
+    for f in leftovers:
+        dest = ERROR / f.name
+        # Avoid overwriting existing error files
+        if dest.exists():
+            stem = f.stem
+            suffix = f.suffix
+            ts = time.strftime("%Y%m%d%H%M%S")
+            dest = ERROR / f"{stem}_{ts}{suffix}"
+        shutil.move(str(f), str(dest))
+        log(f"  Recovered: {f.name} → ERROR/")
+
+
+# ---------------------------------------------------------------------------
+# Docling API helpers
+# ---------------------------------------------------------------------------
+def call_docling_convert(pdf_path: Path) -> bool:
+    """Send a PDF to the Docling API and return True on success."""
+    url = f"{DOCLING_BASE_URL}/v1alpha/convert"
     try:
-        size_1 = path.stat().st_size
-        time.sleep(wait_seconds)
-        size_2 = path.stat().st_size
-        return size_1 == size_2 and size_1 > 0
-    except FileNotFoundError:
+        with open(pdf_path, "rb") as f:
+            files = {"files": (pdf_path.name, f, "application/pdf")}
+            data = {"output_formats": ["md", "json"]}
+            resp = requests.post(url, files=files, data=data, timeout=900)
+            resp.raise_for_status()
+
+        # Docling returns a list of conversion results
+        results = resp.json()
+        if isinstance(results, list) and len(results) > 0:
+            filename_stem = pdf_path.stem
+            out_dir = DOCLING_OUT / filename_stem
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            for fmt in ("md", "json"):
+                content = results[0].get(fmt, "")
+                ext = "md" if fmt == "md" else "json"
+                out_file = out_dir / f"{filename_stem}.{ext}"
+                with open(out_file, "w", encoding="utf-8") as wf:
+                    wf.write(content)
+                log(f"  Docling {ext.upper()} written: {out_file}")
+
+        return True
+
+    except requests.RequestException as exc:
+        log_error(f"Docling API error: {exc}")
+        return False
+    except Exception as exc:
+        log_error(f"Docling processing error: {exc}")
         return False
 
 
-def safe_name(name: str) -> str:
-    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._- "
-    cleaned = "".join(c for c in name if c in allowed).strip()
-    return cleaned or "document.pdf"
-
-
-def wait_for_docling() -> None:
-    url = f"{DOCLING_BASE_URL}/health"
-
-    for _ in range(60):
-        try:
-            response = requests.get(url, timeout=5)
-            if response.status_code < 500:
-                return
-        except requests.RequestException:
-            pass
-
-        time.sleep(2)
-
-    raise RuntimeError(f"Docling API not reachable at {url}")
-
-
-def call_docling_api(pdf_path: Path, out_dir: Path) -> None:
+def handle_docling(pdf_path: Path) -> bool:
     """
-    Calls Docling Serve's v1 file conversion endpoint and stores sidecar output.
+    Run Docling based on DOCLING_MODE.
 
-    Forces Docling to use RapidOCR for extraction sidecars.
-
-    Paperless still gets the OCRmyPDF-produced PDF separately.
+    Returns:
+        True  — continue pipeline (Docling succeeded or is disabled).
+        False — abort pipeline (Docling failed in 'required' mode).
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if DOCLING_MODE == "off":
+        log("  Docling: SKIPPED (mode=off)")
+        return True
 
-    url = f"{DOCLING_BASE_URL}/v1/convert/file"
+    success = call_docling_convert(pdf_path)
 
-    with pdf_path.open("rb") as f:
-        files = {
-            "files": (pdf_path.name, f, "application/pdf"),
-        }
+    if success:
+        log("  Docling: OK")
+        return True
 
-        data = {
-            "from_formats": "pdf",
-            "to_formats": ["md", "json"],
+    # Docling failed
+    if DOCLING_MODE == "required":
+        log_error("Docling failed and mode=required — aborting this file.")
+        return False
 
-            # OCR behavior
-            "do_ocr": "true",
-            "force_ocr": "true",
-            "ocr_engine": "rapidocr",
+    # best_effort: warn and continue
+    log("  Docling: FAILED (mode=best_effort, continuing)")
+    return True
 
-            # Optional but useful defaults
-            "image_export_mode": "embedded",
-            "table_mode": "accurate",
-        }
 
-        response = requests.post(
-            url,
-            files=files,
-            data=data,
-            headers={"accept": "application/json"},
-            timeout=900,
+# ---------------------------------------------------------------------------
+# OCRmyPDF via Python API
+# ---------------------------------------------------------------------------
+def _configure_rapidocr_runtime() -> None:
+    """Configure RapidOCR for the selected runtime backend.
+
+    Supported backends (via OCR_RUNTIME env var):
+      cpu       — CPUExecutionProvider (default, always available)
+      cuda      — CUDAExecutionProvider (NVIDIA GPU, requires onnxruntime-gpu)
+      openvino  — OpenVINOExecutionProvider (Intel GPU/CPU, requires onnxruntime-openvino)
+      rocm      — ROCmExecutionProvider (AMD GPU, requires onnxruntime-rocm)
+
+    Auto-detection: if the requested provider is not available, falls back
+    to CPU with a warning.
+    """
+    global _rapidocr_configured
+    if _rapidocr_configured:
+        return
+    _rapidocr_configured = True
+
+    # Map runtime names to (provider name, pip package)
+    BACKENDS = {
+        "cpu": ("CPUExecutionProvider", None),
+        "cuda": ("CUDAExecutionProvider", "onnxruntime-gpu"),
+        "openvino": ("OpenVINOExecutionProvider", "onnxruntime-openvino"),
+        "rocm": ("ROCMExecutionProvider", "onnxruntime-rocm"),
+    }
+
+    # Validate runtime
+    if OCR_RUNTIME not in BACKENDS:
+        log(
+            f"WARNING: OCR_RUNTIME='{OCR_RUNTIME}' is invalid, falling back to 'cpu'. "
+            f"Valid values: {', '.join(BACKENDS)}"
         )
+        OCR_RUNTIME = "cpu"
 
+    target_provider, package_name = BACKENDS[OCR_RUNTIME]
+
+    # Check availability
     try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        error_file = out_dir / "docling-http-error.txt"
-        error_file.write_text(
-            f"URL: {url}\n"
-            f"Status: {response.status_code}\n"
-            f"Response:\n{response.text}\n",
-            encoding="utf-8",
-        )
-        raise RuntimeError(
-            f"Docling API failed with HTTP {response.status_code}. "
-            f"See {error_file}"
-        ) from exc
+        import onnxruntime as ort
+        available = ort.get_available_providers()
 
-    payload = response.json()
+        if target_provider not in available:
+            if package_name:
+                log(
+                    f"WARNING: OCR_RUNTIME={OCR_RUNTIME} requested but {target_provider} "
+                    f"is not available. Falling back to CPU. "
+                    f"Install '{package_name}' or rebuild with ONNX_RUNTIME={OCR_RUNTIME}. "
+                    f"Available providers: {available}"
+                )
+            else:
+                log(f"INFO: Using CPU runtime. Available providers: {available}")
+            OCR_RUNTIME = "cpu"
+            target_provider = "CPUExecutionProvider"
+        else:
+            log(f"INFO: {target_provider} found — {OCR_RUNTIME.upper()} acceleration enabled")
+    except Exception as exc:
+        log(f"WARNING: Failed to check runtime availability ({exc}), falling back to CPU")
+        OCR_RUNTIME = "cpu"
+        target_provider = "CPUExecutionProvider"
 
-    (out_dir / "docling-response.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    log(f"INFO: RapidOCR runtime = {OCR_RUNTIME} ({target_provider})")
 
-    documents = payload.get("document") or payload.get("documents") or payload.get("results")
+    # Build params dict for RapidOCR
+    # RapidOCR 3.x uses EngineConfig.onnxruntime.use_cuda for GPU.
+    # For OpenVINO/ROCm we pass the providers list directly.
+    if OCR_RUNTIME == "cuda":
+        params = {
+            "EngineConfig": {
+                "onnxruntime": {
+                    "use_cuda": True,
+                }
+            }
+        }
+    elif OCR_RUNTIME in ("openvino", "rocm"):
+        params = {
+            "EngineConfig": {
+                "onnxruntime": {
+                    "providers": [target_provider, "CPUExecutionProvider"],
+                }
+            }
+        }
+    else:
+        params = {}
 
-    if isinstance(documents, dict):
-        write_docling_sidecars(documents, out_dir)
-    elif isinstance(documents, list):
-        for index, doc in enumerate(documents):
-            if isinstance(doc, dict):
-                item_dir = out_dir / f"document-{index}"
-                item_dir.mkdir(exist_ok=True)
-                write_docling_sidecars(doc, item_dir)
+    # Monkey-patch RapidOCR.__init__ to inject our params
+    _orig_init = rapidocr.RapidOCR.__init__
+
+    def _patched_init(self, config_path=None, user_params=None):
+        merged = dict(params)
+        if user_params:
+            for key, value in user_params.items():
+                if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+                    merged[key].update(value)
+                else:
+                    merged[key] = value
+        _orig_init(self, config_path=config_path, params=merged if merged else None)
+
+    rapidocr.RapidOCR.__init__ = _patched_init
 
 
-def write_docling_sidecars(doc: dict, out_dir: Path) -> None:
-    md = (
-        doc.get("md_content")
-        or doc.get("markdown")
-        or doc.get("md")
-        or doc.get("text")
-    )
-
-    if isinstance(md, str) and md.strip():
-        (out_dir / "document.md").write_text(md, encoding="utf-8")
-
-    # Store any structured document object as JSON as well.
-    structured = (
-        doc.get("json_content")
-        or doc.get("json")
-        or doc.get("document")
-        or doc
-    )
-
-    (out_dir / "document.json").write_text(
-        json.dumps(structured, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+_rapidocr_configured = False
 
 
 def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
     """Run OCRmyPDF with RapidOCR engine via Python API."""
+    _configure_rapidocr_runtime()
+
+    # Register RapidOCR as the OCR tool
+    ocrmypdf.register_ocr_tool(
+        "rapidocr",
+        importlib.import_module("ocrmypdf_rapidocr").RapidOCRLanguage,
+    )
+
     # input_file_or_options and output_file are positional args in ocrmypdf.ocr()
     # Everything else is keyword-only (after the * in the signature)
     ocrmypdf.ocr(
@@ -171,125 +275,193 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
         rapidocr_config_path=os.environ.get("RAPIDOCR_CONFIG"),
     )
 
-def atomic_move_into_consume(source: Path, final_name: str) -> None:
-    tmp_target = PAPERLESS_CONSUME / f".{final_name}.tmp"
-    final_target = PAPERLESS_CONSUME / final_name
 
-    if tmp_target.exists():
-        tmp_target.unlink()
+# ---------------------------------------------------------------------------
+# Paperless push
+# ---------------------------------------------------------------------------
+def push_to_paperless(ocr_pdf: Path) -> bool:
+    """Upload the OCR'd PDF to Paperless-ngx consume directory.
 
-    shutil.move(str(source), str(tmp_target))
-    tmp_target.rename(final_target)
-
-
-def process_pdf(input_path: Path) -> None:
-    cleaned_name = safe_name(input_path.name)
-
-    if not cleaned_name.lower().endswith(".pdf"):
-        cleaned_name += ".pdf"
-
-    work_pdf = PROCESSING / cleaned_name
-    ocr_pdf = PROCESSING / f"{work_pdf.stem}.ocr.pdf"
-    sidecar_dir = DOCLING_OUT / work_pdf.stem
-
-    shutil.move(str(input_path), str(work_pdf))
-
-    print(f"Processing {cleaned_name}", flush=True)
-
-    try:
-        if DOCLING_MODE == "best_effort":
-            try:
-                call_docling_api(work_pdf, sidecar_dir)
-            except Exception as exc:
-                # Do not block Paperless ingestion if Docling sidecar creation fails.
-                (sidecar_dir / "docling-error.txt").write_text(str(exc), encoding="utf-8")
-                print(f"Docling failed for {cleaned_name}: {exc}", flush=True)
-        elif DOCLING_MODE == "required":
-            call_docling_api(work_pdf, sidecar_dir)
-        # else "off": skip
-
-        run_ocrmypdf(work_pdf, ocr_pdf)
-        atomic_move_into_consume(ocr_pdf, cleaned_name)
-
-        shutil.move(str(work_pdf), str(DONE / cleaned_name))
-        print(f"Done {cleaned_name}", flush=True)
-
-    except Exception:
-        error_target = ERROR / cleaned_name
-        if work_pdf.exists():
-            shutil.move(str(work_pdf), str(error_target))
-        if ocr_pdf.exists():
-            ocr_pdf.unlink()
-        raise
-
-
-def recover_processing_folder() -> int:
-    """On startup, recover any files left in the processing folder from a crash.
-
-    Moves PDFs back to the inbox so they get re-processed, and cleans up
-    any partial OCR outputs and orphaned sidecar directories.
-
-    Returns the number of files recovered.
+    Uses an atomic write pattern (write to .tmp, then rename) so Paperless
+    never picks up a partially-written file.
     """
-    recovered = 0
+    dest = PAPERLESS_CONSUME / ocr_pdf.name
+    tmp_dest = PAPERLESS_CONSUME / f"{ocr_pdf.name}.tmp"
+    try:
+        shutil.copy2(str(ocr_pdf), str(tmp_dest))
+        os.replace(str(tmp_dest), str(dest))
+        log(f"  Pushed to Paperless: {dest}")
+        return True
+    except Exception as exc:
+        log_error(f"Paperless push failed: {exc}")
+        # Clean up temp file on failure
+        if tmp_dest.exists():
+            tmp_dest.unlink()
+        return False
 
-    # Move any base PDFs back to inbox
-    for pdf in PROCESSING.glob("*.pdf"):
-        # Skip intermediate OCR outputs — those get cleaned up below
-        if pdf.name.endswith(".ocr.pdf"):
-            continue
 
-        target = INBOX / pdf.name
-        # Avoid overwriting an inbox file that may have already been processed
-        if target.exists():
-            # Stamp it with a recovery suffix so it still gets picked up
-            stem = pdf.stem
-            suffix = pdf.suffix
-            target = INBOX / f"{stem}.recovered{suffix}"
-        pdf.rename(target)
-        print(f"Recovered {pdf.name} -> {target.name}", flush=True)
-        recovered += 1
+# ---------------------------------------------------------------------------
+# Docling health check
+# ---------------------------------------------------------------------------
+def wait_for_docling(timeout: int = 120) -> None:
+    """Wait for Docling API to become available before processing."""
+    log(f"Waiting for Docling at {DOCLING_BASE_URL}...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            resp = requests.get(f"{DOCLING_BASE_URL}/health", timeout=5)
+            if resp.status_code == 200:
+                log("Docling is ready.")
+                return
+        except Exception:
+            pass
+        time.sleep(2)
+    log(f"WARNING: Docling did not become ready within {timeout}s — continuing anyway.")
 
-    # Clean up partial OCR outputs
-    for ocr_pdf in PROCESSING.glob("*.ocr.pdf"):
-        ocr_pdf.unlink()
-        print(f"Cleaned up partial OCR output: {ocr_pdf.name}", flush=True)
 
-    if recovered:
-        print(f"Recovered {recovered} file(s) from processing folder", flush=True)
+# ---------------------------------------------------------------------------
+# Main worker loop
+# ---------------------------------------------------------------------------
+def process_file(pdf_path: Path) -> None:
+    """Process a single PDF: Docling → OCR → Paperless."""
+    filename = pdf_path.name
+    log(f"\n{'=' * 60}")
+    log(f"Processing: {filename}")
+    log(f"{'=' * 60}")
 
-    return recovered
+    # Move to processing
+    processing_path = PROCESSING / filename
+    shutil.move(str(pdf_path), str(processing_path))
+    log(f"  Moved to processing: {processing_path}")
+
+    # Docling
+    if not handle_docling(processing_path):
+        shutil.move(str(processing_path), str(ERROR / filename))
+        log("  → ERROR/ (Docling required but failed)")
+        return
+
+    # OCR
+    ocr_output = PROCESSING / f"{processing_path.stem}_ocr{processing_path.suffix}"
+    try:
+        run_ocrmypdf(processing_path, ocr_output)
+        log("  OCR: OK")
+    except Exception as exc:
+        log_error(f"OCR failed: {exc}")
+        shutil.move(str(processing_path), str(ERROR / filename))
+        log("  → ERROR/ (OCR failed)")
+        return
+
+    # Paperless
+    if not push_to_paperless(ocr_output):
+        shutil.move(str(processing_path), str(ERROR / filename))
+        log("  → ERROR/ (Paperless push failed)")
+        return
+
+    # Done
+    shutil.move(str(processing_path), str(DONE / filename))
+    log(f"  → DONE/ ({filename})")
+
+
+def wait_for_stable_file(pdf_path: Path, stability_timeout: int | None = None) -> bool:
+    """Wait until the file size stops changing (upload finished).
+
+    Polls the file size for up to *stability_timeout* seconds (default from
+    STABILITY_TIMEOUT env-var, fallback 10 s).  If the size stays the same for
+    the full period the file is considered stable.
+    """
+    if stability_timeout is None:
+        stability_timeout = int(os.getenv("STABILITY_TIMEOUT", "10"))
+    try:
+        last_size = pdf_path.stat().st_size
+        start = time.time()
+        while time.time() - start < stability_timeout:
+            time.sleep(1)
+            current_size = pdf_path.stat().st_size
+            if current_size != last_size:
+                last_size = current_size
+                start = time.time()  # reset timer on change
+                continue
+        # If we exited because size stayed constant → stable;
+        # if timer expired → still process (warn).
+        log(f"  Stable: {pdf_path.name}")
+        return True
+    except FileNotFoundError:
+        log(f"  File disappeared during stability check: {pdf_path.name}")
+        return False
 
 
 def main() -> None:
-    # --- Crash recovery: pick up files left from a previous run ---
-    recover_processing_folder()
+    log("Doc-Worker starting...")
+    log(f"  INBOX:     {INBOX}")
+    log(f"  PROCESSING: {PROCESSING}")
+    log(f"  DONE:      {DONE}")
+    log(f"  ERROR:     {ERROR}")
+    log(f"  DOCLING:   {DOCLING_OUT}")
+    log(f"  PAPERLESS: {PAPERLESS_CONSUME}")
+    log(f"  DOCLING_URL: {DOCLING_BASE_URL}")
+    log(f"  DOCLING_MODE: {DOCLING_MODE}")
+    log(f"  OCR_LANG:  {OCR_LANG}")
+    log(f"  OCR_RUNTIME: {OCR_RUNTIME}")
+    log(f"  STABILITY_TIMEOUT: {os.getenv('STABILITY_TIMEOUT', '10')}s")
 
-    if DOCLING_MODE == "best_effort":
-        try:
-            wait_for_docling()
-        except RuntimeError as exc:
-            print(f"Docling not reachable, continuing in best-effort mode: {exc}", flush=True)
-    elif DOCLING_MODE == "required":
-        wait_for_docling()
-    # else "off": skip
+    # Crash recovery
+    recover_leftover_files()
+
+    # Wait for Docling to become available (if configured)
+    if DOCLING_BASE_URL and DOCLING_MODE != "off":
+        docling_timeout = int(os.getenv("DOCLING_TIMEOUT", "900"))
+        wait_for_docling(docling_timeout)
+
+    poll_interval = int(os.getenv("POLL_INTERVAL", "5"))
+    max_retries = int(os.getenv("MAX_RETRIES", "3"))
+    retry_delay = int(os.getenv("RETRY_DELAY", "10"))
+
+    log(f"  POLL_INTERVAL: {poll_interval}s")
+    log(f"  MAX_RETRIES:   {max_retries}")
+    log(f"  RETRY_DELAY:   {retry_delay}s")
+    log("Entering main loop...")
 
     while True:
-        pdfs = sorted(INBOX.glob("*.pdf")) + sorted(INBOX.glob("*.PDF"))
+        try:
+            # Find new PDFs in inbox (match both lower- and upper-case extensions)
+            pdf_files = sorted(
+                {f for p in ("*.pdf", "*.PDF") for f in INBOX.glob(p)},
+                key=lambda p: p.name.lower(),
+            )
 
-        for pdf in pdfs:
-            if not pdf.is_file():
-                continue
+            for pdf in pdf_files:
+                # Stability check
+                if not wait_for_stable_file(pdf):
+                    log(f"  Skipping (unstable): {pdf.name}")
+                    continue
 
-            if not is_stable(pdf):
-                continue
+                # Process with retries
+                retries = 0
+                while retries < max_retries:
+                    try:
+                        process_file(pdf)
+                        break  # Success — move to next file
+                    except Exception as exc:
+                        retries += 1
+                        if retries < max_retries:
+                            log_error(f"Retry {retries}/{max_retries} for {pdf.name}: {exc}")
+                            time.sleep(retry_delay)
+                        else:
+                            log_error(f"Max retries reached for {pdf.name}: {exc}")
+                            # Make sure the file ends up in ERROR/
+                            if pdf.exists():
+                                shutil.move(str(pdf), str(ERROR / pdf.name))
+                            elif (PROCESSING / pdf.name).exists():
+                                shutil.move(
+                                    str(PROCESSING / pdf.name),
+                                    str(ERROR / pdf.name),
+                                )
 
-            try:
-                process_pdf(pdf)
-            except Exception as exc:
-                print(f"Failed {pdf.name}: {exc}", flush=True)
+        except Exception as exc:
+            log_error(f"Main loop error: {exc}")
 
-        time.sleep(5)
+        # Sleep before next poll
+        time.sleep(poll_interval)
 
 
 if __name__ == "__main__":
