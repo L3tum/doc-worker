@@ -17,7 +17,6 @@ Crash-recovery: on startup, any leftover files in the PROCESSING directory are
 moved to ERROR/ so they are not silently lost.
 """
 
-import importlib
 import os
 import shutil
 import sys
@@ -255,14 +254,9 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
     """Run OCRmyPDF with RapidOCR engine via Python API."""
     _configure_rapidocr_runtime()
 
-    # Register RapidOCR as the OCR tool
-    ocrmypdf.register_ocr_tool(
-        "rapidocr",
-        importlib.import_module("ocrmypdf_rapidocr").RapidOCRLanguage,
-    )
-
     # input_file_or_options and output_file are positional args in ocrmypdf.ocr()
     # Everything else is keyword-only (after the * in the signature)
+    # The plugin is auto-registered via the `plugins` parameter (pluggy).
     ocrmypdf.ocr(
         input_pdf,
         output_pdf,
