@@ -52,6 +52,10 @@ FROM base-${ONNX_RUNTIME} AS base
 
 ARG ONNX_RUNTIME=cpu
 
+# Ubuntu 24.04 (CUDA base) enforces PEP 668 — allow pip to install system-wide.
+# Safe here: this is a container, not a host system.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
 # ---------------------------------------------------------------------------
 # System packages
 # ---------------------------------------------------------------------------
