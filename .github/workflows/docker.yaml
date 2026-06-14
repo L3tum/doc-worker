@@ -32,30 +32,18 @@ jobs:
       - name: Validate syntax
         run: python -c "import ast; [ast.parse(open(f).read()) for f in __import__('glob').glob('*.py')]"
 
-  build-docker:
-    needs: [test]
-    if: github.event_name != 'release'
-    name: Build Docker Image
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: false
-
   publish-latest-cpu:
     needs: [test]
-    if: github.event_name == 'release' && github.event.action == 'published' && github.server_url != 'https://github.com'
+    if: github.server_url != 'https://github.com'
     uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
     runs-on: ubuntu-latest
+    with:
+      PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
     secrets:
       PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
   publish-cuda:
     needs: [test]
-    if: github.event_name == 'release' && github.event.action == 'published' && github.server_url != 'https://github.com'
+    if: github.server_url != 'https://github.com'
     uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
     runs-on: ubuntu-latest
     with:
@@ -64,11 +52,12 @@ jobs:
           "ONNX_RUNTIME": "cuda"
         }
       PUSH_LATEST: false
+      PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
     secrets:
       PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
   publish-openvino:
     needs: [test]
-    if: github.event_name == 'release' && github.event.action == 'published' && github.server_url != 'https://github.com'
+    if: github.server_url != 'https://github.com'
     uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
     runs-on: ubuntu-latest
     with:
@@ -77,11 +66,12 @@ jobs:
           "ONNX_RUNTIME": "openvino"
         }
       PUSH_LATEST: false
+      PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
     secrets:
       PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
   publish-rocm:
     needs: [test]
-    if: github.event_name == 'release' && github.event.action == 'published' && github.server_url != 'https://github.com'
+    if: github.server_url != 'https://github.com'
     uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
     runs-on: ubuntu-latest
     with:
@@ -90,6 +80,7 @@ jobs:
           "ONNX_RUNTIME": "rocm"
         }
       PUSH_LATEST: false
+      PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
     secrets:
       PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
 
