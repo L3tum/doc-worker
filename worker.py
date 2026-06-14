@@ -18,7 +18,6 @@ moved to ERROR/ so they are not silently lost.
 """
 
 import importlib
-import json
 import os
 import shutil
 import sys
@@ -338,7 +337,7 @@ def process_file(pdf_path: Path) -> None:
     # Docling
     if not handle_docling(processing_path):
         shutil.move(str(processing_path), str(ERROR / filename))
-        log(f"  → ERROR/ (Docling required but failed)")
+        log("  → ERROR/ (Docling required but failed)")
         return
 
     # OCR
@@ -349,13 +348,13 @@ def process_file(pdf_path: Path) -> None:
     except Exception as exc:
         log_error(f"OCR failed: {exc}")
         shutil.move(str(processing_path), str(ERROR / filename))
-        log(f"  → ERROR/ (OCR failed)")
+        log("  → ERROR/ (OCR failed)")
         return
 
     # Paperless
     if not push_to_paperless(ocr_output):
         shutil.move(str(processing_path), str(ERROR / filename))
-        log(f"  → ERROR/ (Paperless push failed)")
+        log("  → ERROR/ (Paperless push failed)")
         return
 
     # Done
