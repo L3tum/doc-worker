@@ -240,7 +240,11 @@ def _configure_rapidocr_runtime() -> None:
     # We store runtime_params in a separate name to avoid shadowing.
     _orig_init = rapidocr.RapidOCR.__init__
 
-    def _patched_init(self, config_path=None, params=None):
+    def _patched_init(
+        self: Any,
+        config_path: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> None:
         merged = dict(runtime_params)
         if params:
             for key, value in params.items():
