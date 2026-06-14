@@ -347,18 +347,25 @@ def process_file(pdf_path: Path) -> None:
         log("  OCR: OK")
     except Exception as exc:
         log_error(f"OCR failed: {exc}")
+        if ocr_output.exists():
+            ocr_output.unlink()
         shutil.move(str(processing_path), str(ERROR / filename))
         log("  → ERROR/ (OCR failed)")
         return
 
     # Paperless
     if not push_to_paperless(ocr_output):
+        if ocr_output.exists():
+            ocr_output.unlink()
         shutil.move(str(processing_path), str(ERROR / filename))
         log("  → ERROR/ (Paperless push failed)")
         return
 
     # Done
     shutil.move(str(processing_path), str(DONE / filename))
+    # Clean up intermediate OCR output file
+    if ocr_output.exists():
+        ocr_output.unlink()
     log(f"  → DONE/ ({filename})")
 
 
@@ -439,7 +446,14 @@ def main() -> None:
                 retries = 0
                 while retries < max_retries:
                     try:
-                        process_file(pdf)
+                        # If a previous attempt already moved the file to PROCESSING,
+                        # retry with that path instead of the original INBOX path.
+                        current_path = (
+                            PROCESSING / pdf.name
+                            if (PROCESSING / pdf.name).exists()
+                            else pdf
+                        )
+                        process_file(current_path)
                         break  # Success — move to next file
                     except Exception as exc:
                         retries += 1
