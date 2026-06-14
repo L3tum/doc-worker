@@ -29,6 +29,11 @@ jobs:
           pip install ruff
           ruff check worker.py
 
+      - name: Type check with mypy
+        run: |
+          pip install mypy
+          mypy worker.py
+
       - name: Validate syntax
         run: python -c "import ast; [ast.parse(open(f).read()) for f in __import__('glob').glob('*.py')]"
 

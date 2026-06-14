@@ -17,11 +17,14 @@ Crash-recovery: on startup, any leftover files in the PROCESSING directory are
 moved to ERROR/ so they are not silently lost.
 """
 
+from __future__ import annotations
+
 import os
 import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import ocrmypdf
 import rapidocr
@@ -212,6 +215,8 @@ def _configure_rapidocr_runtime() -> None:
     # Build params dict for RapidOCR
     # RapidOCR 3.x uses EngineConfig.onnxruntime.use_cuda for GPU.
     # For OpenVINO/ROCm we pass the providers list directly.
+    runtime_params: dict[str, Any] = {}
+
     if OCR_RUNTIME == "cuda":
         runtime_params = {
             "EngineConfig": {
@@ -228,8 +233,6 @@ def _configure_rapidocr_runtime() -> None:
                 }
             }
         }
-    else:
-        runtime_params = {}
 
     # Monkey-patch RapidOCR.__init__ to inject our runtime params.
     # The ocrmypdf_rapidocr plugin calls RapidOCR(config_path=..., params=...)
