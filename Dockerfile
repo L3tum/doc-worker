@@ -41,11 +41,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/pip3 /usr/bin/pip
 
 # OpenVINO base (Intel GPU/CPU)
+# OpenVINO EP is provided by pip (onnxruntime-openvino), no system package needed.
 FROM python:3.12-slim-bookworm AS base-openvino
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    intel-openvino-runtime \
-    && rm -rf /var/lib/apt/lists/*
 
 # ROCm base (AMD GPU)
 FROM python:3.12-slim-bookworm AS base-rocm
