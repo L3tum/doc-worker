@@ -161,7 +161,7 @@ def _configure_rapidocr_runtime() -> None:
     Auto-detection: if the requested provider is not available, falls back
     to CPU with a warning.
     """
-    global _rapidocr_configured
+    global _rapidocr_configured, OCR_RUNTIME
     if _rapidocr_configured:
         return
     _rapidocr_configured = True
