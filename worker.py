@@ -213,7 +213,7 @@ def _configure_rapidocr_runtime() -> None:
     # RapidOCR 3.x uses EngineConfig.onnxruntime.use_cuda for GPU.
     # For OpenVINO/ROCm we pass the providers list directly.
     if OCR_RUNTIME == "cuda":
-        params = {
+        runtime_params = {
             "EngineConfig": {
                 "onnxruntime": {
                     "use_cuda": True,
@@ -221,7 +221,7 @@ def _configure_rapidocr_runtime() -> None:
             }
         }
     elif OCR_RUNTIME in ("openvino", "rocm"):
-        params = {
+        runtime_params = {
             "EngineConfig": {
                 "onnxruntime": {
                     "providers": [target_provider, "CPUExecutionProvider"],
@@ -229,15 +229,18 @@ def _configure_rapidocr_runtime() -> None:
             }
         }
     else:
-        params = {}
+        runtime_params = {}
 
-    # Monkey-patch RapidOCR.__init__ to inject our params
+    # Monkey-patch RapidOCR.__init__ to inject our runtime params.
+    # The ocrmypdf_rapidocr plugin calls RapidOCR(config_path=..., params=...)
+    # so our patched __init__ must accept `params` as a kwarg name.
+    # We store runtime_params in a separate name to avoid shadowing.
     _orig_init = rapidocr.RapidOCR.__init__
 
-    def _patched_init(self, config_path=None, user_params=None):
-        merged = dict(params)
-        if user_params:
-            for key, value in user_params.items():
+    def _patched_init(self, config_path=None, params=None):
+        merged = dict(runtime_params)
+        if params:
+            for key, value in params.items():
                 if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
                     merged[key].update(value)
                 else:
