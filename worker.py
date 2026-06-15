@@ -24,7 +24,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import ocrmypdf
 import rapidocr
@@ -171,7 +171,7 @@ def _patch_rapidocr_provider_config() -> None:
     original_get_ep_list = ProviderConfig.get_ep_list
 
     def patched_get_ep_list(self: Any) -> list[Any]:
-        ep_list = original_get_ep_list(self)
+        ep_list: list[Any] = cast(list[Any], original_get_ep_list(self))
         requested_provider = os.environ.get("RAPIDOCR_ONNXRUNTIME_PROVIDER")
         if not requested_provider or requested_provider == "CPUExecutionProvider":
             return ep_list
