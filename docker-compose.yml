@@ -5,7 +5,7 @@ services:
       args:
         # Runtime selection: "cpu" (default), "cuda", "openvino", or "rocm"
         #   cpu       — CPU-only (:latest/:cpu, smallest image, no GPU needed)
-        #   cuda      — NVIDIA GPU (:cuda, CUDA 13.3.0 + onnxruntime-gpu)
+        #   cuda      — NVIDIA GPU (:cuda, CUDA 12.8.1 + cuDNN + onnxruntime-gpu)
         #   openvino  — Intel GPU/CPU (:openvino, experimental)
         #   rocm      — AMD GPU (:rocm, experimental)
         ONNX_RUNTIME: cpu

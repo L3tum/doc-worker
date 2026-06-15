@@ -18,7 +18,7 @@
 #
 # The ONNX_RUNTIME build arg controls the ONNX Runtime package installed:
 #   cpu       — onnxruntime (CPU-only, smallest image)
-#   cuda      — onnxruntime-gpu (CUDA 13.3.0, NVIDIA GPU)
+#   cuda      — onnxruntime-gpu (CUDA 12.8.1 + cuDNN, NVIDIA GPU)
 #   openvino  — onnxruntime-openvino (Intel GPU/CPU via OpenVINO)
 #   rocm      — onnxruntime-rocm (AMD GPU via ROCm)
 # =============================================================================
@@ -31,8 +31,8 @@ ARG ONNX_RUNTIME=cpu
 # CPU base (default)
 FROM python:3.12-slim-bookworm AS base-cpu
 
-# CUDA base (NVIDIA GPU) — install Python 3.12 on top of CUDA 13.3.0
-FROM nvidia/cuda:13.3.0-cudnn-runtime-ubuntu24.04 AS base-cuda
+# CUDA base (NVIDIA GPU) — ONNX Runtime PyPI GPU wheels require CUDA 12.x + cuDNN 9.x.
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS base-cuda
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 python3.12-venv python3-pip \
@@ -92,10 +92,10 @@ COPY . .
 
 # ---------------------------------------------------------------------------
 # Pre-download RapidOCR models (avoids first-run download delay / offline fail)
-# Specify language 'deu' so the Latin recognition model is downloaded
-# instead of the default Chinese model.
+# Use the OCRmyPDF plugin helper so model selection matches runtime behavior:
+# German maps to RapidOCR's Latin recognition model.
 # ---------------------------------------------------------------------------
-RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(use_lang='deu')" 2>&1 || true
+RUN python -c "from ocrmypdf_rapidocr.engine import get_rapidocr_engine; get_rapidocr_engine('deu', None)"
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label

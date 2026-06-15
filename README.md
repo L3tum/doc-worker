@@ -151,7 +151,7 @@ Implementation notes:
 
 ### CUDA (NVIDIA)
 
-Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host. Uses CUDA 13.3.0.
+Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host. Uses CUDA 12.8.1 with cuDNN because current ONNX Runtime GPU PyPI wheels require CUDA 12.x and cuDNN 9.x.
 
 ```yaml
 environment:
