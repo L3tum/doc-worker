@@ -92,10 +92,10 @@ COPY . .
 
 # ---------------------------------------------------------------------------
 # Pre-download RapidOCR models (avoids first-run download delay / offline fail)
-# Specify language 'deu' so the Latin recognition model is downloaded
-# instead of the default Chinese model.
+# Use the OCRmyPDF plugin helper so model selection matches runtime behavior:
+# German maps to RapidOCR's Latin recognition model.
 # ---------------------------------------------------------------------------
-RUN python -c "from rapidocr_onnxruntime import RapidOCR; RapidOCR(use_lang='deu')" 2>&1 || true
+RUN python -c "from ocrmypdf_rapidocr.engine import get_rapidocr_engine; get_rapidocr_engine('deu', None)"
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label
