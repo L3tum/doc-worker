@@ -25,30 +25,32 @@ INBOX/*.pdf
 
 ## Quick Start
 
-### 1. Build the image
+### 1. Build or pull the image
 
-**CPU (default):**
+Published image tags are planned as:
 
-```bash
-docker build -t doc-worker .
-```
+| Tag | Backend |
+|---|---|
+| `:latest` | CPU default |
+| `:cpu` | CPU explicit |
+| `:cuda` | NVIDIA CUDA |
+| `:openvino` | OpenVINO *(experimental)* |
+| `:rocm` | ROCm *(experimental)* |
 
-**CUDA GPU (NVIDIA):**
-
-```bash
-docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker .
-```
-
-**OpenVINO (Intel GPU/CPU):**
+Build locally with matching tags:
 
 ```bash
-docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker .
-```
+# CPU (default)
+docker build -t doc-worker:cpu -t doc-worker:latest .
 
-**ROCm (AMD GPU):**
+# CUDA GPU (NVIDIA)
+docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker:cuda .
 
-```bash
-docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker .
+# OpenVINO (Intel GPU/CPU, experimental)
+docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker:openvino .
+
+# ROCm (AMD GPU, experimental)
+docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker:rocm .
 ```
 
 ### 2. Run with Docker Compose
@@ -130,16 +132,22 @@ All settings are environment variables:
 
 ## Runtime Backends
 
-The worker supports four ONNX Runtime backends, selected via the `ONNX_RUNTIME` build arg and `OCR_RUNTIME` runtime env var:
+The worker supports four image/runtime variants, selected via the `ONNX_RUNTIME` build arg and `OCR_RUNTIME` runtime env var:
 
-| Backend | Build Arg | Env Var | Hardware | Package | Image Size |
-|---|---|---|---|---|---|
-| **CPU** | `cpu` | `cpu` | Any CPU | `onnxruntime` | ~1.2 GB |
-| **CUDA** | `cuda` | `cuda` | NVIDIA GPU | `onnxruntime-gpu` | ~4.5 GB |
-| **OpenVINO** | `openvino` | `openvino` | Intel GPU/CPU | `onnxruntime-openvino` | ~2.5 GB |
-| **ROCm** | `rocm` | `rocm` | AMD GPU | `onnxruntime-rocm` | ~3.8 GB |
+| Backend | Image Tag | Build Arg | Env Var | Hardware | Package | Status |
+|---|---|---|---|---|---|---|
+| **CPU** | `:latest`, `:cpu` | `cpu` | `cpu` | Any CPU | `onnxruntime` | Supported default |
+| **CUDA** | `:cuda` | `cuda` | `cuda` | NVIDIA GPU | `onnxruntime-gpu` | Supported via RapidOCR `use_cuda` |
+| **OpenVINO** | `:openvino` | `openvino` | `openvino` | Intel GPU/CPU | `onnxruntime-openvino` | **Experimental** |
+| **ROCm** | `:rocm` | `rocm` | `rocm` | AMD GPU | `onnxruntime-rocm` | **Experimental** |
 
-The worker **auto-detects** provider availability at startup. If the requested provider is not available, it falls back to CPU with a warning.
+The worker **auto-detects** ONNX Runtime provider availability at startup. If the requested provider is not available, it falls back to CPU with a warning.
+
+Implementation notes:
+
+- CPU uses ONNX Runtime's `CPUExecutionProvider`.
+- CUDA uses RapidOCR's supported `EngineConfig.onnxruntime.use_cuda` setting.
+- OpenVINO and ROCm are experimental because RapidOCR's ONNX Runtime wrapper does not currently expose first-class config toggles for `OpenVINOExecutionProvider` or `ROCMExecutionProvider`. The worker sets `RAPIDOCR_ONNXRUNTIME_PROVIDER` internally and patches RapidOCR provider ordering so ONNX Runtime receives the requested provider before CPU fallback.
 
 ### CUDA (NVIDIA)
 
@@ -157,20 +165,22 @@ deploy:
           capabilities: [gpu]
 ```
 
-### OpenVINO (Intel)
+### OpenVINO (Intel, experimental)
 
-Works with Intel integrated GPUs (iGPU), discrete GPUs (Arc), and CPUs with AVX-512. No special Docker runtime needed.
+Targets ONNX Runtime's `OpenVINOExecutionProvider`. Works with supported Intel integrated GPUs (iGPU), discrete GPUs (Arc), and CPUs. No special Docker runtime is usually needed, but device access may vary by host.
 
 ```yaml
+image: doc-worker:openvino
 environment:
   - OCR_RUNTIME=openvino
 ```
 
-### ROCm (AMD)
+### ROCm (AMD, experimental)
 
-Requires AMD GPU with ROCm support. May need additional device passthrough.
+Targets ONNX Runtime's `ROCMExecutionProvider`. Requires an AMD GPU with ROCm support and host/device passthrough.
 
 ```yaml
+image: doc-worker:rocm
 environment:
   - OCR_RUNTIME=rocm
 devices:

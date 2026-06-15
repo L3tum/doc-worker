@@ -4,17 +4,17 @@
 # Multi-stage: CPU (default) or GPU build.
 #
 # Usage:
-#   CPU (default):
-#     docker build -t doc-worker .
+#   CPU (default, tags :latest/:cpu):
+#     docker build -t doc-worker:latest -t doc-worker:cpu .
 #
-#   CUDA GPU (NVIDIA):
-#     docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker .
+#   CUDA GPU (NVIDIA, tag :cuda):
+#     docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker:cuda .
 #
-#   OpenVINO (Intel GPU/CPU):
-#     docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker .
+#   OpenVINO (Intel GPU/CPU, experimental, tag :openvino):
+#     docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker:openvino .
 #
-#   ROCm (AMD GPU):
-#     docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker .
+#   ROCm (AMD GPU, experimental, tag :rocm):
+#     docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker:rocm .
 #
 # The ONNX_RUNTIME build arg controls the ONNX Runtime package installed:
 #   cpu       — onnxruntime (CPU-only, smallest image)
