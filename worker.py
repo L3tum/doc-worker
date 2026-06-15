@@ -151,6 +151,46 @@ def handle_docling(pdf_path: Path) -> bool:
 # ---------------------------------------------------------------------------
 # OCRmyPDF via Python API
 # ---------------------------------------------------------------------------
+def _patch_rapidocr_provider_config() -> None:
+    """Experimentally prepend an ONNX Runtime provider in RapidOCR.
+
+    RapidOCR's ONNX Runtime backend currently exposes config toggles for only
+    some execution providers. OpenVINO and ROCm may still be available from the
+    installed onnxruntime package, so this patch lets us pass that provider to
+    InferenceSession while keeping CPU as a fallback.
+    """
+    try:
+        from rapidocr.inference_engine.onnxruntime.provider_config import ProviderConfig
+    except Exception as exc:
+        log(f"WARNING: Could not patch RapidOCR provider config: {exc}")
+        return
+
+    if getattr(ProviderConfig, "_doc_worker_provider_patch", False):
+        return
+
+    original_get_ep_list = ProviderConfig.get_ep_list
+
+    def patched_get_ep_list(self: Any) -> list[Any]:
+        ep_list = original_get_ep_list(self)
+        requested_provider = os.environ.get("RAPIDOCR_ONNXRUNTIME_PROVIDER")
+        if not requested_provider or requested_provider == "CPUExecutionProvider":
+            return ep_list
+
+        if requested_provider not in self.had_providers:
+            log(
+                f"WARNING: Experimental provider {requested_provider} is not available. "
+                f"Using RapidOCR defaults: {self.had_providers}"
+            )
+            return ep_list
+
+        filtered = [ep for ep in ep_list if ep[0] != requested_provider]
+        log(f"INFO: Prepending experimental ONNX Runtime provider: {requested_provider}")
+        return [(requested_provider, {})] + filtered
+
+    ProviderConfig.get_ep_list = patched_get_ep_list
+    ProviderConfig._doc_worker_provider_patch = True
+
+
 def _configure_rapidocr_runtime() -> None:
     """Configure RapidOCR for the selected runtime backend.
 
@@ -215,12 +255,20 @@ def _configure_rapidocr_runtime() -> None:
     # Build flat dot-notation params for RapidOCR 3.x.
     # RapidOCR's ParseParams.update_batch() expects keys like
     # "EngineConfig.onnxruntime.use_cuda", NOT nested dicts.
-    _rapidocr_params: dict[str, Any] = {}
+    _rapidocr_params = {}
 
     if OCR_RUNTIME == "cuda":
+        # CUDA is directly supported by RapidOCR's ONNX Runtime provider config.
         _rapidocr_params = {
             "EngineConfig.onnxruntime.use_cuda": True,
         }
+    elif OCR_RUNTIME in ("openvino", "rocm"):
+        # Experimental: RapidOCR's ONNX Runtime provider config does not expose
+        # OpenVINO/ROCm toggles, even when onnxruntime lists those providers.
+        # Store the requested provider in an env var and patch ProviderConfig so
+        # ONNX Runtime receives e.g. ["ROCMExecutionProvider", "CPUExecutionProvider"].
+        os.environ["RAPIDOCR_ONNXRUNTIME_PROVIDER"] = target_provider
+        _patch_rapidocr_provider_config()
 
     # Monkey-patch RapidOCR.__init__ to inject our runtime params.
     # The ocrmypdf_rapidocr plugin calls RapidOCR(config_path=..., params=...)

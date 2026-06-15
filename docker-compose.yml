@@ -4,10 +4,10 @@ services:
       context: .
       args:
         # Runtime selection: "cpu" (default), "cuda", "openvino", or "rocm"
-        #   cpu       — CPU-only (smallest image, no GPU needed)
-        #   cuda      — NVIDIA GPU (CUDA 13.3.0 + onnxruntime-gpu)
-        #   openvino  — Intel GPU/CPU (OpenVINO + onnxruntime-openvino)
-        #   rocm      — AMD GPU (ROCm + onnxruntime-rocm)
+        #   cpu       — CPU-only (:latest/:cpu, smallest image, no GPU needed)
+        #   cuda      — NVIDIA GPU (:cuda, CUDA 13.3.0 + onnxruntime-gpu)
+        #   openvino  — Intel GPU/CPU (:openvino, experimental)
+        #   rocm      — AMD GPU (:rocm, experimental)
         ONNX_RUNTIME: cpu
     # image: doc-worker       # use this if you pre-built the image
     container_name: doc-worker
