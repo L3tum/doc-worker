@@ -64,8 +64,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
     fonts-dejavu \
     fonts-noto-cjk \
-    # OCRmyPDF helpers (deskew, clean, optimize)
-    qpdf unpaper pngquant jbig2dec libgl1 tesseract-ocr \
+    # PDF processing helpers
+    qpdf libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
