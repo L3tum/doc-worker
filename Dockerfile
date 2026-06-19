@@ -64,8 +64,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
     fonts-dejavu \
     fonts-noto-cjk \
-    # PDF processing helpers
-    qpdf libgl1 \
+    # PDF processing helpers — tesseract-ocr required by OCRmyPDF at import time
+    qpdf libgl1 tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
