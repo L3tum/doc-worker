@@ -98,16 +98,11 @@ COPY . .
 # Use the OCRmyPDF plugin helper so model selection matches runtime behavior:
 # German maps to RapidOCR's Latin recognition model.
 #
-# Only run for CPU builds — GPU runtimes (CUDA/OpenVINO/ROCm) require their
-# respective libraries (libcudart.so, OpenVINO libs, ROCm libs) at import time,
-# which are not available during the Docker build. GPU builds will download
-# models on first use instead.
+# Force CPU runtime during pre-download so this works on all build variants
+# (CUDA/OpenVINO/ROCm libs are not available at Docker build time).
 # ---------------------------------------------------------------------------
-RUN if [ "$ONNX_RUNTIME" = "cpu" ]; then \
-      python -c "from ocrmypdf_rapidocr.engine import get_rapidocr_engine; get_rapidocr_engine('deu', None)"; \
-    else \
-      echo "Skipping RapidOCR model pre-download for $ONNX_RUNTIME build (GPU libs not available at build time)"; \
-    fi
+RUN OCR_RUNTIME=cpu python -c \
+      "from ocrmypdf_rapidocr.engine import get_rapidocr_engine; get_rapidocr_engine('deu', None)"
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label
