@@ -64,8 +64,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
     fonts-dejavu \
     fonts-noto-cjk \
-    # OCRmyPDF helpers (deskew, clean, optimize)
-    qpdf unpaper pngquant jbig2dec libgl1 tesseract-ocr \
+    # PDF processing helpers — tesseract-ocr required by OCRmyPDF at import time
+    qpdf libgl1 tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -76,8 +76,11 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Swap in GPU runtime if requested
+# NOTE: onnxruntime-gpu >=1.27 requires CUDA 13 (libcudart.so.13), but our
+# base image (nvidia/cuda:12.8.1) only provides CUDA 12. Pin to <1.27 to keep
+# CUDA 12 compatibility. See: https://github.com/microsoft/onnxruntime/releases
 RUN if [ "$ONNX_RUNTIME" = "cuda" ]; then \
-      pip install --no-cache-dir onnxruntime-gpu; \
+      pip install --no-cache-dir 'onnxruntime-gpu<1.27'; \
     elif [ "$ONNX_RUNTIME" = "openvino" ]; then \
       pip install --no-cache-dir onnxruntime-openvino; \
     elif [ "$ONNX_RUNTIME" = "rocm" ]; then \
@@ -94,8 +97,12 @@ COPY . .
 # Pre-download RapidOCR models (avoids first-run download delay / offline fail)
 # Use the OCRmyPDF plugin helper so model selection matches runtime behavior:
 # German maps to RapidOCR's Latin recognition model.
+#
+# Force CPU runtime during pre-download so this works on all build variants
+# (CUDA/OpenVINO/ROCm libs are not available at Docker build time).
 # ---------------------------------------------------------------------------
-RUN python -c "from ocrmypdf_rapidocr.engine import get_rapidocr_engine; get_rapidocr_engine('deu', None)"
+RUN OCR_RUNTIME=cpu python -c \
+      "from ocrmypdf_rapidocr.engine import get_rapidocr_engine; get_rapidocr_engine('deu', None)"
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label

@@ -5,8 +5,6 @@ Doc-Worker — OCR pipeline for PDFs
 
 1. Polls an inbox directory for new PDF files.
 2. Runs OCR using OCRmyPDF with the RapidOCR ONNX plugin (via Python API).
-   Tesseract is used for deskewing and image optimization (the RapidOCR plugin
-   handles text recognition).
 3. Generates sidecar documents via the Docling API (Markdown + JSON).
 4. Pushes the processed PDFs into a Paperless-ngx consume directory.
 
@@ -307,9 +305,6 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
         plugins=["ocrmypdf_rapidocr"],
         language=OCR_LANG,
         force_ocr=True,
-        deskew=True,
-        clean=True,
-        optimize=1,
         rapidocr_config_path=os.environ.get("RAPIDOCR_CONFIG"),
     )
 
