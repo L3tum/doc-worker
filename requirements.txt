@@ -1,5 +1,16 @@
+# Core OCR (existing — replaced by PaddleOCR in Phase 4)
 ocrmypdf==17.4.1
 ocrmypdf-rapidocr==1.0.1
 rapidocr
 onnxruntime
+
+# API server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# HTTP client
 requests
+
+# PaddleOCR (Phase 4 integration)
+# paddlepaddle
+# paddleocr

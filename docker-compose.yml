@@ -21,10 +21,12 @@ services:
       - ./work/docling:/work/docling
       # Paperless consume directory (mount the same path Paperless uses)
       - ./paperless-consume:/paperless-consume
+    ports:
+      # API server port (for on-demand processing)
+      - "8000:8000"
     environment:
-      # Docling API
-      - DOCLING_BASE_URL=http://docling:12000
-      - DOCLING_TIMEOUT=900          # 15 minutes for large documents
+      # Mode: "combined" (default), "folder", or "api"
+      # - MODE=combined
 
       # OCR settings
       - OCR_LANG=deu
@@ -35,12 +37,27 @@ services:
       # and fall back to CPU if not.
       - OCR_RUNTIME=cpu
 
+      # Processing mode: "auto" (default), "pp_ocr", or "paddle_vl"
+      # - PROCESSING_MODE=auto
+
       # Polling
       - POLL_INTERVAL=5
 
       # Retry
       - MAX_RETRIES=3
       - RETRY_DELAY=10
+
+      # File size limit (MB)
+      - MAX_FILE_SIZE_MB=100
+
+      # API settings
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - API_ENABLED=true
+
+      # Logging
+      - LOG_LEVEL=INFO
+      - LOG_JSON=true
 
       # GPU passthrough (uncomment when using ONNX_RUNTIME=cuda)
       # deploy:
@@ -51,20 +68,23 @@ services:
       #           count: 1
       #           capabilities: [gpu]
 
-    depends_on:
-      docling:
-        condition: service_started
+    # Docling is optional (legacy). Remove depends_on when fully migrated.
+    # depends_on:
+    #   docling:
+    #     condition: service_started
     networks:
       - doc-worker-net
 
-  docling:
-    image: ghcr.io/ds4sd/docling-api:latest
-    container_name: docling
-    restart: unless-stopped
-    ports:
-      - "12000:12000"
-    networks:
-      - doc-worker-net
+  # Docling API (legacy — being replaced by PaddleOCR-VL integration)
+  # Uncomment when DOCLING_MODE is not "off"
+  # docling:
+  #   image: ghcr.io/ds4sd/docling-api:latest
+  #   container_name: docling
+  #   restart: unless-stopped
+  #   ports:
+  #     - "12000:12000"
+  #   networks:
+  #     - doc-worker-net
 
 networks:
   doc-worker-net:

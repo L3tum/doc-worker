@@ -1,33 +1,57 @@
 # Doc-Worker
 
-A Docker-based OCR pipeline worker that:
+A Docker-based OCR pipeline worker with a unified sequential processing engine supporting two ingestion methods:
 
-1. **Polls** an inbox directory for new PDF files.
-2. **Runs OCR** using [OCRmyPDF](https://github.com/jbarlow83/OCRmyPDF) with the [RapidOCR](https://github.com/RapidAI/RapidOCR) ONNX plugin via Python API. Tesseract is used for deskewing and image optimization (the RapidOCR plugin handles text recognition).
-3. **Generates sidecar documents** via the [Docling](https://github.com/DS4SD/docling) API (Markdown + JSON).
-4. **Pushes** the processed PDFs into a [Paperless-ngx](https://paperless-ngx.com/) consume directory.
+1. **Folder Watcher** — polls an inbox directory for new PDFs, processes them sequentially, and moves them through lifecycle directories.
+2. **API Hook** — an HTTP endpoint that accepts document submissions on-demand and returns structured output (OCR'd PDF + Markdown sidecar).
+
+Both ingestion methods share the same processing pipeline, ensuring consistency and simplifying maintenance.
 
 ## Architecture
 
 ```
-INBOX/*.pdf
-  │
-  ├─ Stability check (waits for upload to finish)
-  │
-  ├─ PROCESSING/
-  │   ├─ Docling API  →  sidecar JSON
-  │   ├─ ocrmypdf.ocr() + RapidOCR  →  searchable PDF
-  │   └─ Push → Paperless consume/
-  │
-  ├─ DONE/       (successfully processed)
-  └─ ERROR/      (failed processing, for inspection)
+┌─────────────────────────────────────────────────────────────┐
+│                      doc-worker Container                    │
+│                                                             │
+│  ┌──────────────┐    ┌──────────────┐                       │
+│  │ Folder Watcher│    │  API Hook    │                       │
+│  │  (poller)    │    │  (FastAPI)   │                       │
+│  └──────┬───────┘    └──────┬───────┘                       │
+│         │                   │                                │
+│         └────────┬──────────┘                                │
+│                  ▼                                            │
+│           ┌──────────────┐                                   │
+│           │  Orchestrator │  ← FSM state management,          │
+│           │   (pipeline)  │    stage dispatch, retry logic    │
+│           └──────┬───────┘                                   │
+│                  │                                             │
+│         ┌────────┼─────────────────────────────┐              │
+│         ▼        ▼                              ▼             │
+│   ┌──────────┐ ┌──────────┐  ...       ┌────────────┐        │
+│   │ Validate │ │ OCR      │            │ Lifecycle  │        │
+│   │ & Triage │ │ Pipeline │            │ & Cleanup  │        │
+│   └──────────┘ └──────────┘            └────────────┘        │
+│                                                               │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │            server:companion (shared backend)          │    │
+│  │  • PaddleOCR model loading & inference                │    │
+│  │  • File I/O abstraction (disk / in-memory)           │    │
+│  │  • Logging, metrics, health checks                    │    │
+│  │  • Configuration management                           │    │
+│  └──────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+### Pipeline Stages
+
+1. **Validate & Triage** — file type check, size limit, document classification (text/scanned/hybrid PDF)
+2. **OCR Processing** — runs OCRmyPDF + RapidOCR (current) or PaddleOCR (Phase 4)
+3. **Output Assembly** — persists OCR'd PDF, Markdown sidecar, JSON metadata, pushes to Paperless
+4. **Lifecycle Management** — moves files through DONE/ or ERROR/, cleans up intermediates
 
 ## Quick Start
 
 ### 1. Build or pull the image
-
-Published image tags are planned as:
 
 | Tag | Backend |
 |---|---|
@@ -37,92 +61,63 @@ Published image tags are planned as:
 | `:openvino` | OpenVINO *(experimental)* |
 | `:rocm` | ROCm *(experimental)* |
 
-Build locally with matching tags:
-
 ```bash
 # CPU (default)
 docker build -t doc-worker:cpu -t doc-worker:latest .
 
 # CUDA GPU (NVIDIA)
 docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker:cuda .
-
-# OpenVINO (Intel GPU/CPU, experimental)
-docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker:openvino .
-
-# ROCm (AMD GPU, experimental)
-docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker:rocm .
 ```
 
 ### 2. Run with Docker Compose
 
-See [`docker-compose.yml`](docker-compose.yml) for a complete example. The minimal setup:
-
-```yaml
-services:
-  doc-worker:
-    image: doc-worker
-    volumes:
-      - ./inbox:/work/inbox
-      - ./processing:/work/processing
-      - ./done:/work/done
-      - ./error:/work/error
-      - ./docling:/work/docling
-      - ./paperless-consume:/paperless-consume
-    environment:
-      - DOCLING_BASE_URL=http://docling:5001
-      - DOCLING_MODE=best_effort
-      - OCR_LANG=deu
-      - OCR_RUNTIME=cpu
-      - POLL_INTERVAL=5
-      - MAX_RETRIES=3
-      - RETRY_DELAY=10
-    depends_on:
-      - docling
-```
-
-For **GPU acceleration**, set `OCR_RUNTIME` to match your build and enable the appropriate GPU passthrough:
-
-```yaml
-    environment:
-      - OCR_RUNTIME=cuda
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-```
-
-### 3. Drop PDFs into the inbox
-
 ```bash
-cp new-document.pdf ./inbox/
+docker compose up -d
 ```
 
-The worker will pick it up within `POLL_INTERVAL` seconds.
+See [`docker-compose.yml`](docker-compose.yml) for the full configuration.
+
+### 3. Use the pipeline
+
+**Folder mode** — drop PDFs into the inbox:
+```bash
+cp new-document.pdf ./work/inbox/
+```
+
+**API mode** — submit via HTTP:
+```bash
+curl -X POST http://localhost:8000/api/v1/convert \
+  -F "file=@new-document.pdf" \
+  -F "mode=auto"
+```
+
+**Combined mode** (default) — both folder watching and API are active simultaneously.
 
 ## Configuration
 
-All settings are environment variables:
+### Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `INBOX` | `/work/inbox` | Directory to poll for new PDFs |
+| `INBOX` | `/work/inbox` | Directory to poll for new files |
 | `PROCESSING` | `/work/processing` | Staging area during processing |
 | `DONE` | `/work/done` | Successfully processed files |
-| `ERROR` | `/work/error` | Failed files (for inspection) |
-| `DOCLING_DIR` | `/work/docling` | Docling sidecar output |
+| `ERROR` | `/work/error` | Failed files |
+| `DOCLING_DIR` | `/work/docling` | Sidecar output directory |
 | `PAPERLESS_CONSUME` | `/paperless-consume` | Paperless-ngx consume directory |
-| `OCR_LANG` | `deu` | OCR language (single language, see note below) |
-| `OCR_RUNTIME` | `cpu` | Inference backend: `cpu`, `cuda`, `openvino`, or `rocm` |
+| `OCR_LANG` | `deu` | OCR language |
+| `OCR_RUNTIME` | `cpu` | Backend: `cpu`, `cuda`, `openvino`, `rocm` |
+| `PROCESSING_MODE` | `auto` | OCR mode: `auto`, `pp_ocr`, `paddle_vl` |
 | `POLL_INTERVAL` | `5` | Seconds between inbox polls |
-| `DOCLING_BASE_URL` | `http://docling:5001` | Docling API endpoint |
-| `DOCLING_MODE` | `best_effort` | Docling behavior: `off`, `best_effort`, or `required` (see below) |
-| `DOCLING_TIMEOUT` | `900` | Timeout for Docling API calls (seconds, hardcoded) |
-| `RAPIDOCR_CONFIG` | *(none)* | Optional path to a custom RapidOCR YAML config. If omitted, RapidOCR uses its built-in defaults. |
-| `MAX_RETRIES` | `3` | Max OCR retry attempts |
-| `RETRY_DELAY` | `10` | Seconds between OCR retries |
+| `MAX_RETRIES` | `3` | Max retry attempts per job |
+| `RETRY_DELAY` | `10` | Base seconds between retries (exponential backoff) |
+| `MAX_FILE_SIZE_MB` | `100` | Maximum file size in MB |
+| `MAX_CONCURRENT_JOBS` | `1` | Max concurrent pipeline jobs |
+| `API_HOST` | `0.0.0.0` | API server bind address |
+| `API_PORT` | `8000` | API server port |
+| `API_ENABLED` | `true` | Enable API server |
+| `LOG_LEVEL` | `INFO` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `LOG_JSON` | `true` | Use structured JSON logging |
 
 ### Build Arguments
 
@@ -130,28 +125,67 @@ All settings are environment variables:
 |---|---|---|
 | `ONNX_RUNTIME` | `cpu` | ONNX Runtime variant (see [Runtime Backends](#runtime-backends)) |
 
+## API Reference
+
+### Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/convert` | Submit a document for OCR processing |
+| `GET` | `/health` | Health check |
+| `GET` | `/ready` | Readiness check (model loaded + orchestrator running) |
+| `GET` | `/metrics` | Processing metrics |
+
+### Convert Endpoint
+
+```
+POST /api/v1/convert
+Content-Type: multipart/form-data
+
+Parameters:
+  file: UploadFile (required) — PDF or image to process
+  mode: str (optional, default "auto") — processing mode
+
+Response (200):
+{
+  "job_id": "abc123",
+  "filename": "document.pdf",
+  "document_type": "scanned_pdf",
+  "processing_mode": "full_ocr",
+  "elapsed_seconds": 12.34,
+  "pdf": {
+    "filename": "document_ocr.pdf",
+    "size": 123456,
+    "data": "<base64-encoded PDF>"
+  },
+  "markdown": {
+    "filename": "document.md",
+    "content": "# Extracted text..."
+  },
+  "metadata": { ... },
+  "manifest": { ... }
+}
+```
+
+### Error Responses
+
+| Status | Condition |
+|---|---|
+| `400` | Unsupported file type or file too large |
+| `429` | Too many concurrent jobs |
+| `500` | Processing failed |
+| `503` | Orchestrator not initialized |
+
 ## Runtime Backends
 
-The worker supports four image/runtime variants, selected via the `ONNX_RUNTIME` build arg and `OCR_RUNTIME` runtime env var:
-
-| Backend | Image Tag | Build Arg | Env Var | Hardware | Package | Status |
-|---|---|---|---|---|---|---|
-| **CPU** | `:latest`, `:cpu` | `cpu` | `cpu` | Any CPU | `onnxruntime` | Supported default |
-| **CUDA** | `:cuda` | `cuda` | `cuda` | NVIDIA GPU | `onnxruntime-gpu` | Supported via RapidOCR `use_cuda` |
-| **OpenVINO** | `:openvino` | `openvino` | `openvino` | Intel GPU/CPU | `onnxruntime-openvino` | **Experimental** |
-| **ROCm** | `:rocm` | `rocm` | `rocm` | AMD GPU | `onnxruntime-rocm` | **Experimental** |
-
-The worker **auto-detects** ONNX Runtime provider availability at startup. If the requested provider is not available, it falls back to CPU with a warning.
-
-Implementation notes:
-
-- CPU uses ONNX Runtime's `CPUExecutionProvider`.
-- CUDA uses RapidOCR's supported `EngineConfig.onnxruntime.use_cuda` setting.
-- OpenVINO and ROCm are experimental because RapidOCR's ONNX Runtime wrapper does not currently expose first-class config toggles for `OpenVINOExecutionProvider` or `ROCMExecutionProvider`. The worker sets `RAPIDOCR_ONNXRUNTIME_PROVIDER` internally and patches RapidOCR provider ordering so ONNX Runtime receives the requested provider before CPU fallback.
+| Backend | Image Tag | Build Arg | Env Var | Hardware | Status |
+|---|---|---|---|---|---|
+| **CPU** | `:latest`, `:cpu` | `cpu` | `cpu` | Any CPU | Supported default |
+| **CUDA** | `:cuda` | `cuda` | `cuda` | NVIDIA GPU | Supported |
+| **OpenVINO** | `:openvino` | `openvino` | `openvino` | Intel GPU/CPU | Experimental |
+| **ROCm** | `:rocm` | `rocm` | `rocm` | AMD GPU | Experimental |
 
 ### CUDA (NVIDIA)
-
-Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host. Uses CUDA 12.8.1 with cuDNN because current ONNX Runtime GPU PyPI wheels require CUDA 12.x and cuDNN 9.x.
 
 ```yaml
 environment:
@@ -167,8 +201,6 @@ deploy:
 
 ### OpenVINO (Intel, experimental)
 
-Targets ONNX Runtime's `OpenVINOExecutionProvider`. Works with supported Intel integrated GPUs (iGPU), discrete GPUs (Arc), and CPUs. No special Docker runtime is usually needed, but device access may vary by host.
-
 ```yaml
 image: doc-worker:openvino
 environment:
@@ -176,8 +208,6 @@ environment:
 ```
 
 ### ROCm (AMD, experimental)
-
-Targets ONNX Runtime's `ROCMExecutionProvider`. Requires an AMD GPU with ROCm support and host/device passthrough.
 
 ```yaml
 image: doc-worker:rocm
@@ -188,11 +218,29 @@ devices:
   - /dev/dri
 ```
 
-## Important Notes
+## Volume Mounts
 
-### OCR Language
+| Path | Purpose | Required |
+|---|---|---|
+| `/work/inbox` | Input directory for new files | Yes (folder mode) |
+| `/work/processing` | Temporary staging area | Yes |
+| `/work/done` | Archive of processed files | Yes |
+| `/work/error` | Failed files for inspection | Yes |
+| `/work/docling` | Sidecar output (Markdown, JSON) | Optional |
+| `/paperless-consume` | Paperless-ngx consume directory | Yes |
 
-The `ocrmypdf-rapidocr` plugin currently **does not support multi-language selection** (e.g. `deu+eng`). The `+` separator is a Tesseract convention that RapidOCR does not understand. Set `OCR_LANG` to a **single language code**:
+## Error Handling
+
+- **Unstable files**: Skipped if file size changes during stability check.
+- **Stage failures (transient)**: Retried up to `MAX_RETRIES` with exponential backoff.
+- **Stage failures (permanent)**: Job marked as failed, file moved to `ERROR/`.
+- **Invalid input**: Failed immediately with descriptive error; no retries.
+- **Concurrent limit exceeded**: Jobs queued (folder) or rejected with HTTP 429 (API).
+- **Crash recovery**: On restart, leftover files in `PROCESSING/` are moved to `ERROR/`.
+
+## OCR Language
+
+The `ocrmypdf-rapidocr` plugin supports single-language codes:
 
 | Language | Code |
 |---|---|
@@ -204,56 +252,19 @@ The `ocrmypdf-rapidocr` plugin currently **does not support multi-language selec
 | Portuguese | `por` |
 | Dutch | `nld` |
 | Polish | `pol` |
-| Czech | `ces` |
 | Chinese (Simplified) | `ch_sim` |
-| Chinese (Traditional) | `ch_tra` |
 | Japanese | `jpn` |
 | Korean | `kor` |
 
-### Pre-downloaded Models
+## Migration Notes
 
-The Docker image ships with **Latin language models** pre-downloaded. If you use a non-Latin language (e.g. Chinese, Japanese, Korean), the first run will download the corresponding models automatically.
+### From v1 (worker.py) to v2 (main.py)
 
-### Docling Modes
-
-The `DOCLING_MODE` environment variable controls how Docling sidecar generation is handled:
-
-| Mode | Behavior |
-|---|---|
-| `best_effort` (default) | Attempt Docling conversion. If it fails, log a warning and continue with OCR + Paperless. |
-| `off` | Skip Docling entirely. No sidecar files are generated. Useful when Docling is not available or not needed. |
-| `required` | Attempt Docling conversion. If it fails, move the file to `/work/error` (treat Docling as a hard requirement). |
-
-**To disable Docling:**
-
-```yaml
-environment:
-  - DOCLING_MODE=off
-```
-
-When Docling runs, it generates Markdown (`.md`) and JSON (`.json`) sidecar files in `/work/docling/<filename>/`.
-
-## Volume Mounts
-
-| Path | Purpose | Required |
-|---|---|
-| `/work/inbox` | Input directory for new PDFs | Yes |
-| `/work/processing` | Temporary staging area | Yes |
-| `/work/done` | Archive of successfully processed files | Yes |
-| `/work/error` | Failed files for inspection | Yes |
-| `/work/docling` | Docling sidecar output (JSON) | Optional |
-| `/paperless-consume` | Paperless-ngx consume directory | Yes |
-
-## Error Handling
-
-- **Unstable files**: If a file's size changes during the stability check (default 30 s), it is skipped and retried on the next poll.
-- **Docling failures**: Logged but non-fatal. The pipeline continues with OCR and Paperless ingestion.
-- **OCR failures**: Retried up to `MAX_RETRIES` times with `RETRY_DELAY` seconds between attempts. On final failure, the file is moved to `/work/error`.
-- **Paperless push failures**: The file is moved to `/work/error` for manual inspection.
-
-## Health Check
-
-The container includes a `HEALTHCHECK` that verifies the worker process is still running. Use `docker inspect` or your orchestrator's health monitoring to check status.
+- **Entry point**: `worker.py` → `main.py`
+- **Default mode**: Combined (folder + API). Use `--mode folder` for folder-only behavior.
+- **Docling**: The external Docling service is deprecated. Sidecar generation is handled by the integrated PaddleOCR-VL model (Phase 4).
+- **Configuration**: All existing environment variables are supported. New variables added for API and pipeline control.
+- **Backward compatibility**: The folder watcher behavior is identical to v1. The API is an addition, not a replacement.
 
 ## License
 

@@ -21,6 +21,11 @@
 #   cuda      — onnxruntime-gpu (CUDA 12.8.1 + cuDNN, NVIDIA GPU)
 #   openvino  — onnxruntime-openvino (Intel GPU/CPU via OpenVINO)
 #   rocm      — onnxruntime-rocm (AMD GPU via ROCm)
+#
+# Modes (via CMD or --mode flag):
+#   combined  — folder watcher + API server (default)
+#   folder    — folder watcher only
+#   api       — API server only
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -110,6 +115,11 @@ RUN OCR_RUNTIME=cpu python -c \
 LABEL onnx-runtime="${ONNX_RUNTIME}"
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Expose API port
 # ---------------------------------------------------------------------------
-CMD ["python", "-u", "worker.py"]
+EXPOSE 8000
+
+# ---------------------------------------------------------------------------
+# Entrypoint — unified pipeline (combined mode: folder + API)
+# ---------------------------------------------------------------------------
+CMD ["python", "-u", "main.py", "--mode", "combined"]
