@@ -223,12 +223,21 @@ def _extract_text_from_pdf(content: bytes) -> str:
         try:
             from pypdf import PdfReader as _PdfReader
         except ImportError:
-            from PyPDF2 import PdfReader as _PdfReader
+            try:
+                from PyPDF2 import PdfReader as _PdfReader
+            except ImportError:
+                _PdfReader = None  # type: ignore[assignment]
 
         import io
 
+        if _PdfReader is None:
+            get_logger("doc-worker.stages.ocr").warning(
+                "pypdf/PyPDF2 not installed, cannot extract text from PDF"
+            )
+            return ""
+
         reader = _PdfReader(io.BytesIO(content))
-        text_parts = []
+        text_parts: list[str] = []
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
@@ -236,11 +245,6 @@ def _extract_text_from_pdf(content: bytes) -> str:
 
         return "\n\n".join(text_parts)
 
-    except ImportError:
-        get_logger("doc-worker.stages.ocr").warning(
-            "pypdf/PyPDF2 not installed, cannot extract text from PDF"
-        )
-        return ""
     except Exception as exc:
         get_logger("doc-worker.stages.ocr").warning(f"Text extraction failed: {exc}")
         return ""
