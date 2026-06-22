@@ -11,7 +11,6 @@ Verifies the document is processable and determines the processing path:
 
 from __future__ import annotations
 
-import struct
 from pathlib import Path
 
 from server.companion import FileIO, get_config, get_logger

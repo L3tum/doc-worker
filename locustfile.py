@@ -14,11 +14,7 @@ Command-line usage (headless):
 
 from __future__ import annotations
 
-import os
-import random
-
-from locust import HttpUser, task, between, events
-from pathlib import Path
+from locust import HttpUser, task, between
 
 # Generate a minimal PDF for testing
 MINIMAL_PDF = b"""%PDF-1.4

@@ -11,9 +11,7 @@ Also generates a processing manifest.
 
 from __future__ import annotations
 
-import hashlib
 import json
-import time
 from pathlib import Path
 
 from server.companion import FileIO, get_config, get_logger

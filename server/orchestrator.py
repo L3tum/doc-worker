@@ -11,13 +11,12 @@ with configurable backoff, and emits structured logs at each transition.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from collections import deque
-from typing import Any, Callable, Type
+from typing import Callable
 
 from server.companion import (
-    get_config, get_logger, get_metrics, log_with_context,
+    get_config, get_logger, get_metrics,
 )
 from server.models import Job, JobContext, JobState
 

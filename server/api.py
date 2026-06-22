@@ -14,8 +14,6 @@ Phase 4: Updated to support PaddleOCR-VL processing modes.
 from __future__ import annotations
 
 import base64
-import json
-import time
 from pathlib import Path
 from typing import Any
 

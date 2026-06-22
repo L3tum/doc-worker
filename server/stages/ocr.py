@@ -13,8 +13,6 @@ OCRmyPDF is used as a wrapper to embed text layers into PDFs.
 
 from __future__ import annotations
 
-import json
-import os
 import tempfile
 from pathlib import Path
 

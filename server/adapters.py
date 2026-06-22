@@ -12,14 +12,12 @@ and submit them to the orchestrator.
 
 from __future__ import annotations
 
-import os
 import shutil
 import time
-from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from server.companion import get_config, get_logger, log_with_context
+from server.companion import get_config, get_logger
 from server.models import DocumentInput, Job
 
 if TYPE_CHECKING:

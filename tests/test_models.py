@@ -5,7 +5,6 @@ Tests for server.models — data models and enums.
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 from server.models import (
     DocumentInput, DocumentType, Job, JobContext, JobState,
@@ -117,7 +116,6 @@ class TestJob:
 
     def test_transition(self):
         job = Job()
-        initial_state = job.state
 
         job.transition(JobState.VALIDATING)
         assert job.state == JobState.VALIDATING

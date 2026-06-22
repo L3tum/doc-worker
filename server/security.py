@@ -18,13 +18,11 @@ import hashlib
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-import starlette.middleware.base
 
 
 # ---------------------------------------------------------------------------

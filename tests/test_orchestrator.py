@@ -4,11 +4,10 @@ Tests for server.orchestrator — FSM pipeline orchestrator.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
 
 import pytest
 
-from server.models import DocumentInput, Job, JobContext, JobState
+from server.models import DocumentInput, Job, JobState
 from server.orchestrator import (
     Orchestrator, StageError, StageValidationError,
 )
