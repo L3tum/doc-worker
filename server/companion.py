@@ -421,8 +421,8 @@ class ModelManager:
             )
 
             # Move model to device
-            if "gpu" in device.lower():
-                self._vl_model = self._vl_model.cuda()
+            if self._vl_model is not None and "gpu" in device.lower():
+                self._vl_model.cuda()
 
             self._logger.info(
                 f"PaddleOCR-VL loaded (model={self.config.PADDLE_VL_MODEL}, "
@@ -684,10 +684,11 @@ class ModelManager:
         heading_pattern = r"^(#{1,6}\s+.+)$"
         for i, line in enumerate(response.split("\n")):
             if re.match(heading_pattern, line):
+                match_result = re.match(r"^(#+)", line)
                 layout.append(
                     {
                         "type": "heading",
-                        "level": len(re.match(r"^(#+)", line).group()),
+                        "level": len(match_result.group()) if match_result else 1,
                         "text": line.lstrip("# ").strip(),
                         "line": i,
                     }
