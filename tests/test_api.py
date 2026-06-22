@@ -153,7 +153,7 @@ class TestConvertEndpoint:
         import server.api as api_module
 
         api_module._orchestrator = None
-        """Test 503 when orchestrator is not initialized."""
+
         with patch("server.api.init_companion"):
             with patch("server.api.apply_security_hardening"):
                 with patch("server.api.get_config", return_value=mock_config):
