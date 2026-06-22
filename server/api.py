@@ -21,7 +21,11 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 from server.companion import (
-    get_config, get_health, get_logger, get_metrics, init_companion,
+    get_config,
+    get_health,
+    get_logger,
+    get_metrics,
+    init_companion,
 )
 from server.models import DocumentInput, Job
 from server.orchestrator import Orchestrator
@@ -61,6 +65,7 @@ def set_orchestrator(orch: Orchestrator) -> None:
 # Startup
 # ---------------------------------------------------------------------------
 
+
 @app.on_event("startup")
 async def startup() -> None:
     """Initialize the companion module on startup."""
@@ -79,6 +84,7 @@ async def startup() -> None:
 # ---------------------------------------------------------------------------
 # Health & Readiness
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
@@ -106,10 +112,7 @@ async def ready() -> dict[str, Any]:
     except HTTPException:
         pass
 
-    ready = (
-        health_status.ready
-        and orchestrator is not None
-    )
+    ready = health_status.ready and orchestrator is not None
 
     return JSONResponse(
         status_code=200 if ready else 503,
@@ -118,8 +121,9 @@ async def ready() -> dict[str, Any]:
             "model_loaded": health_status.model_loaded,
             "pp_ocr_loaded": getattr(health_status, "pp_ocr_loaded", False),
             "vl_model_loaded": getattr(health_status, "vl_model_loaded", False),
-            "orchestrator_running": orchestrator is not None
-                and orchestrator._running if orchestrator else False,
+            "orchestrator_running": orchestrator is not None and orchestrator._running
+            if orchestrator
+            else False,
         },
     )
 
@@ -136,6 +140,7 @@ async def metrics() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Convert Endpoint
 # ---------------------------------------------------------------------------
+
 
 @app.post("/api/v1/convert")
 async def convert(

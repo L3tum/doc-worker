@@ -39,9 +39,13 @@ DOCLING_OUT = Path(os.getenv("DOCLING_DIR", "/work/docling"))
 PAPERLESS_CONSUME = Path(os.getenv("PAPERLESS_CONSUME", "/paperless-consume"))
 
 DOCLING_BASE_URL = os.getenv("DOCLING_BASE_URL", "http://docling:5001").rstrip("/")
-DOCLING_MODE = os.getenv("DOCLING_MODE", "best_effort")  # "off" | "best_effort" | "required"
+DOCLING_MODE = os.getenv(
+    "DOCLING_MODE", "best_effort"
+)  # "off" | "best_effort" | "required"
 OCR_LANG = os.getenv("OCR_LANG", "deu")
-OCR_RUNTIME = os.getenv("OCR_RUNTIME", "cpu").lower()  # "cpu" | "cuda" | "openvino" | "rocm"
+OCR_RUNTIME = os.getenv(
+    "OCR_RUNTIME", "cpu"
+).lower()  # "cpu" | "cuda" | "openvino" | "rocm"
 
 for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
     path.mkdir(parents=True, exist_ok=True)
@@ -182,7 +186,9 @@ def _patch_rapidocr_provider_config() -> None:
             return ep_list
 
         filtered = [ep for ep in ep_list if ep[0] != requested_provider]
-        log(f"INFO: Prepending experimental ONNX Runtime provider: {requested_provider}")
+        log(
+            f"INFO: Prepending experimental ONNX Runtime provider: {requested_provider}"
+        )
         return [(requested_provider, {})] + filtered
 
     ProviderConfig.get_ep_list = patched_get_ep_list
@@ -227,6 +233,7 @@ def _configure_rapidocr_runtime() -> None:
     # Check availability
     try:
         import onnxruntime as ort
+
         available = ort.get_available_providers()
 
         if target_provider not in available:
@@ -242,9 +249,13 @@ def _configure_rapidocr_runtime() -> None:
             OCR_RUNTIME = "cpu"
             target_provider = "CPUExecutionProvider"
         else:
-            log(f"INFO: {target_provider} found — {OCR_RUNTIME.upper()} acceleration enabled")
+            log(
+                f"INFO: {target_provider} found — {OCR_RUNTIME.upper()} acceleration enabled"
+            )
     except Exception as exc:
-        log(f"WARNING: Failed to check runtime availability ({exc}), falling back to CPU")
+        log(
+            f"WARNING: Failed to check runtime availability ({exc}), falling back to CPU"
+        )
         OCR_RUNTIME = "cpu"
         target_provider = "CPUExecutionProvider"
 
@@ -491,7 +502,9 @@ def main() -> None:
                     except Exception as exc:
                         retries += 1
                         if retries < max_retries:
-                            log_error(f"Retry {retries}/{max_retries} for {pdf.name}: {exc}")
+                            log_error(
+                                f"Retry {retries}/{max_retries} for {pdf.name}: {exc}"
+                            )
                             time.sleep(retry_delay)
                         else:
                             log_error(f"Max retries reached for {pdf.name}: {exc}")

@@ -5,10 +5,15 @@ Tests for server.companion — configuration, logging, metrics, file I/O.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 from server.companion import (
-    Config, FileIO, HealthStatus, JsonFormatter, Metrics,
+    Config,
+    FileIO,
+    HealthStatus,
+    JsonFormatter,
+    Metrics,
 )
 
 
@@ -89,6 +94,7 @@ class TestFileIO:
     def test_read_no_data_raises(self):
         """Test that reading with no data raises ValueError."""
         import pytest
+
         with pytest.raises(ValueError, match="No input data available"):
             FileIO.read(None, None)
 
@@ -206,11 +212,15 @@ class TestJsonFormatter:
 
     def test_format_basic(self):
         formatter = JsonFormatter()
-        record = formatter.makeLogRecord({
-            "msg": "Test message",
-            "level": "INFO",
-            "name": "test.logger",
-        })
+        record = logging.LogRecord(
+            name="test.logger",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="Test message",
+            args=(),
+            exc_info=None,
+        )
 
         output = formatter.format(record)
         log_entry = json.loads(output)
@@ -222,14 +232,19 @@ class TestJsonFormatter:
 
     def test_format_with_extra_fields(self):
         formatter = JsonFormatter()
-        record = formatter.makeLogRecord({
-            "msg": "Test message",
-            "level": "INFO",
-            "name": "test.logger",
-            "job_id": "abc123",
-            "stage": "ocr",
-            "filename": "test.pdf",
-        })
+        record = logging.LogRecord(
+            name="test.logger",
+            level=logging.INFO,
+            pathname="",
+            lineno=0,
+            msg="Test message",
+            args=(),
+            exc_info=None,
+        )
+        # Add extra fields as attributes on the record
+        record.job_id = "abc123"
+        record.stage = "ocr"
+        record.filename = "test.pdf"
 
         output = formatter.format(record)
         log_entry = json.loads(output)

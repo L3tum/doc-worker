@@ -15,6 +15,7 @@ import pytest
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def temp_dir():
     """Create a temporary directory for test files."""
@@ -53,17 +54,79 @@ startxref
 def sample_png_bytes():
     """Return minimal valid PNG bytes for testing."""
     # 1x1 red pixel PNG
-    return bytes([
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,  # PNG signature
-        0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,  # IHDR chunk
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
-        0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41,  # IDAT chunk
-        0x54, 0x08, 0xD7, 0x63, 0xF8, 0xFF, 0xFF, 0xFF,
-        0x00, 0x05, 0xFE, 0x02, 0xFE, 0xA7, 0x9E, 0x9D,
-        0x89, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E,  # IEND chunk
-        0x44, 0xAE, 0x42, 0x60, 0x82,
-    ])
+    return bytes(
+        [
+            0x89,
+            0x50,
+            0x4E,
+            0x47,
+            0x0D,
+            0x0A,
+            0x1A,
+            0x0A,  # PNG signature
+            0x00,
+            0x00,
+            0x00,
+            0x0D,
+            0x49,
+            0x48,
+            0x44,
+            0x52,  # IHDR chunk
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+            0x08,
+            0x02,
+            0x00,
+            0x00,
+            0x00,
+            0x90,
+            0x77,
+            0x53,
+            0xDE,
+            0x00,
+            0x00,
+            0x00,
+            0x0C,
+            0x49,
+            0x44,
+            0x41,  # IDAT chunk
+            0x54,
+            0x08,
+            0xD7,
+            0x63,
+            0xF8,
+            0xFF,
+            0xFF,
+            0xFF,
+            0x00,
+            0x05,
+            0xFE,
+            0x02,
+            0xFE,
+            0xA7,
+            0x9E,
+            0x9D,
+            0x89,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x49,
+            0x45,
+            0x4E,  # IEND chunk
+            0x44,
+            0xAE,
+            0x42,
+            0x60,
+            0x82,
+        ]
+    )
 
 
 @pytest.fixture
@@ -111,7 +174,13 @@ def mock_model_manager():
     def mock_run_ocr(input_data, ctx):
         return {
             "text": "Hello World",
-            "text_blocks": [{"text": "Hello World", "bbox": [[0, 0], [100, 0], [100, 20], [0, 20]], "confidence": 0.95}],
+            "text_blocks": [
+                {
+                    "text": "Hello World",
+                    "bbox": [[0, 0], [100, 0], [100, 20], [0, 20]],
+                    "confidence": 0.95,
+                }
+            ],
             "block_count": 1,
             "avg_confidence": 0.95,
             "model": "pp_ocr",
@@ -120,7 +189,9 @@ def mock_model_manager():
     def mock_run_vl(input_data, ctx):
         return {
             "markdown": "# Hello World\n\nThis is a test document.",
-            "layout": [{"type": "heading", "level": 1, "text": "Hello World", "line": 0}],
+            "layout": [
+                {"type": "heading", "level": 1, "text": "Hello World", "line": 0}
+            ],
             "tables": [],
             "formulas": [],
             "text": "Hello World This is a test document.",
@@ -137,6 +208,7 @@ def mock_model_manager():
 def reset_companion_singletons():
     """Reset companion module singletons between tests."""
     import server.companion as companion
+
     companion._config = None
     companion._metrics = None
     companion._model_manager = None

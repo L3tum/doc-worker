@@ -4,12 +4,13 @@ Tests for server.orchestrator — FSM pipeline orchestrator.
 
 from __future__ import annotations
 
-
 import pytest
 
 from server.models import DocumentInput, Job, JobState
 from server.orchestrator import (
-    Orchestrator, StageError, StageValidationError,
+    Orchestrator,
+    StageError,
+    StageValidationError,
 )
 
 
@@ -48,6 +49,30 @@ class TestOrchestrator:
         )
         return Job(input=doc)
 
+    def _make_full_pipeline(self, validate_fn=None, ocr_fn=None, output_fn=None):
+        """Create a full pipeline with validate → ocr → output stages."""
+
+        def pass_through(job, ctx):
+            return ctx
+
+        stages = []
+        if validate_fn is not None:
+            stages.append(("validate", validate_fn))
+        else:
+            stages.append(("validate", pass_through))
+
+        if ocr_fn is not None:
+            stages.append(("ocr", ocr_fn))
+        else:
+            stages.append(("ocr", pass_through))
+
+        if output_fn is not None:
+            stages.append(("output", output_fn))
+        else:
+            stages.append(("output", pass_through))
+
+        return stages
+
     def test_initial_state(self):
         """Test orchestrator initial state."""
         orch = Orchestrator(stages=[])
@@ -81,9 +106,13 @@ class TestOrchestrator:
             processed_jobs.append(job.job_id)
             return ctx
 
+        # Use full pipeline to follow FSM transitions
         orch = Orchestrator(
-            stages=[("test_stage", mock_stage)],
+            stages=self._make_full_pipeline(
+                validate_fn=mock_stage,
+            ),
             max_concurrent=1,
+            retry_delay=0,
         )
         orch.start()
 
@@ -102,17 +131,19 @@ class TestOrchestrator:
 
     def test_stage_failure(self, temp_dir, sample_pdf_bytes):
         """Test that stage failure marks job as failed."""
+
         def failing_stage(job, ctx):
-            raise StageError("Test failure", stage="test")
+            raise StageError("Test failure", stage="ocr")
 
         orch = Orchestrator(
-            stages=[("failing", failing_stage)],
+            stages=self._make_full_pipeline(ocr_fn=failing_stage),
             max_concurrent=1,
-            max_retries=0,  # No retries
+            retry_delay=0,
         )
         orch.start()
 
         job = self._make_job(temp_dir, sample_pdf_bytes)
+        job.max_retries = 0
         orch.enqueue(job)
 
         result = orch.process_next()
@@ -122,13 +153,14 @@ class TestOrchestrator:
 
     def test_validation_error_no_retry(self, temp_dir, sample_pdf_bytes):
         """Test that validation errors fail immediately."""
+
         def validation_stage(job, ctx):
             raise StageValidationError("Invalid file", stage="validate")
 
         orch = Orchestrator(
-            stages=[("validate", validation_stage)],
+            stages=self._make_full_pipeline(validate_fn=validation_stage),
             max_concurrent=1,
-            max_retries=3,
+            retry_delay=0,
         )
         orch.start()
 
@@ -148,14 +180,13 @@ class TestOrchestrator:
             nonlocal attempt_count
             attempt_count += 1
             if attempt_count < 3:
-                raise StageError("Transient error", stage="flaky")
+                raise StageError("Transient error", stage="ocr")
             return ctx
 
         orch = Orchestrator(
-            stages=[("flaky", flaky_stage)],
+            stages=self._make_full_pipeline(ocr_fn=flaky_stage),
             max_concurrent=1,
-            max_retries=3,
-            retry_delay=0,  # No delay for testing
+            retry_delay=0,
         )
         orch.start()
 
@@ -169,13 +200,49 @@ class TestOrchestrator:
 
     def test_exhaust_retries(self, temp_dir, sample_pdf_bytes):
         """Test that job fails after exhausting retries."""
+
         def always_failing_stage(job, ctx):
-            raise StageError("Permanent error", stage="fail")
+            raise StageError("Permanent error", stage="ocr")
 
         orch = Orchestrator(
-            stages=[("fail", always_failing_stage)],
+            stages=self._make_full_pipeline(ocr_fn=always_failing_stage),
             max_concurrent=1,
-            max_retries=2,
+            retry_delay=0,
+        )
+        orch.start()
+
+        job = self._make_job(temp_dir, sample_pdf_bytes)
+        job.max_retries = 2
+        orch.enqueue(job)
+
+        result = orch.process_next()
+
+        assert result.state == JobState.FAILED
+        assert "retries" in result.context.errors[0]
+
+    def test_multiple_stages(self, temp_dir, sample_pdf_bytes):
+        """Test that multiple stages are executed in order."""
+        stage_order = []
+
+        def stage_validate(job, ctx):
+            stage_order.append("validate")
+            return ctx
+
+        def stage_ocr(job, ctx):
+            stage_order.append("ocr")
+            return ctx
+
+        def stage_output(job, ctx):
+            stage_order.append("output")
+            return ctx
+
+        orch = Orchestrator(
+            stages=[
+                ("validate", stage_validate),
+                ("ocr", stage_ocr),
+                ("output", stage_output),
+            ],
+            max_concurrent=1,
             retry_delay=0,
         )
         orch.start()
@@ -185,38 +252,8 @@ class TestOrchestrator:
 
         result = orch.process_next()
 
-        assert result.state == JobState.FAILED
-        assert "2 retries" in result.context.errors[0]
-
-    def test_multiple_stages(self, temp_dir, sample_pdf_bytes):
-        """Test that multiple stages are executed in order."""
-        stage_order = []
-
-        def stage1(job, ctx):
-            stage_order.append("stage1")
-            return ctx
-
-        def stage2(job, ctx):
-            stage_order.append("stage2")
-            return ctx
-
-        def stage3(job, ctx):
-            stage_order.append("stage3")
-            return ctx
-
-        orch = Orchestrator(
-            stages=[("s1", stage1), ("s2", stage2), ("s3", stage3)],
-            max_concurrent=1,
-        )
-        orch.start()
-
-        job = self._make_job(temp_dir, sample_pdf_bytes)
-        orch.enqueue(job)
-
-        result = orch.process_next()
-
         assert result.state == JobState.COMPLETED
-        assert stage_order == ["stage1", "stage2", "stage3"]
+        assert stage_order == ["validate", "ocr", "output"]
 
     def test_state_transitions(self):
         """Test valid state transitions."""

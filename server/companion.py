@@ -31,6 +31,7 @@ from server.models import JobContext
 # Configuration
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Config:
     """Validated configuration from environment variables."""
@@ -53,11 +54,11 @@ class Config:
     # PaddleOCR settings
     PADDLE_OCR_USE_ANGLE: bool = True
     PADDLE_OCR_USE_DLL: bool = False  # Differential evolution for layout
-    PADDLE_OCR_USE_DB: bool = True    # Detection algorithm
-    PADDLE_OCR_USE_REC: bool = True   # Recognition
-    PADDLE_OCR_LANG: str = "ch"       # ch | en | french | german | japan | korean
+    PADDLE_OCR_USE_DB: bool = True  # Detection algorithm
+    PADDLE_OCR_USE_REC: bool = True  # Recognition
+    PADDLE_OCR_LANG: str = "ch"  # ch | en | french | german | japan | korean
     PADDLE_VL_MODEL: str = "PaddleOCR-VL-1.5B"  # Default VL model
-    PADDLE_DEVICE: str = ""           # auto | cpu | gpu | xpu
+    PADDLE_DEVICE: str = ""  # auto | cpu | gpu | xpu
 
     # Pipeline settings
     POLL_INTERVAL: int = 5
@@ -82,8 +83,14 @@ class Config:
         config = cls()
 
         # Directory paths
-        for attr in ("INBOX", "PROCESSING", "DONE", "ERROR",
-                      "OUTPUT_DIR", "PAPERLESS_CONSUME"):
+        for attr in (
+            "INBOX",
+            "PROCESSING",
+            "DONE",
+            "ERROR",
+            "OUTPUT_DIR",
+            "PAPERLESS_CONSUME",
+        ):
             val = os.getenv(attr)
             if val:
                 setattr(config, attr, Path(val))
@@ -96,10 +103,18 @@ class Config:
         config.PROCESSING_MODE = os.getenv("PROCESSING_MODE", "auto")
 
         # PaddleOCR settings
-        config.PADDLE_OCR_USE_ANGLE = os.getenv("PADDLE_OCR_USE_ANGLE", "true").lower() == "true"
-        config.PADDLE_OCR_USE_DLL = os.getenv("PADDLE_OCR_USE_DLL", "false").lower() == "true"
-        config.PADDLE_OCR_USE_DB = os.getenv("PADDLE_OCR_USE_DB", "true").lower() == "true"
-        config.PADDLE_OCR_USE_REC = os.getenv("PADDLE_OCR_USE_REC", "true").lower() == "true"
+        config.PADDLE_OCR_USE_ANGLE = (
+            os.getenv("PADDLE_OCR_USE_ANGLE", "true").lower() == "true"
+        )
+        config.PADDLE_OCR_USE_DLL = (
+            os.getenv("PADDLE_OCR_USE_DLL", "false").lower() == "true"
+        )
+        config.PADDLE_OCR_USE_DB = (
+            os.getenv("PADDLE_OCR_USE_DB", "true").lower() == "true"
+        )
+        config.PADDLE_OCR_USE_REC = (
+            os.getenv("PADDLE_OCR_USE_REC", "true").lower() == "true"
+        )
         config.PADDLE_OCR_LANG = os.getenv("PADDLE_OCR_LANG", "ch")
         config.PADDLE_VL_MODEL = os.getenv("PADDLE_VL_MODEL", "PaddleOCR-VL-1.5B")
         config.PADDLE_DEVICE = os.getenv("PADDLE_DEVICE", "auto")
@@ -125,8 +140,14 @@ class Config:
 
     def ensure_directories(self) -> None:
         """Create all required directories."""
-        for path in (self.INBOX, self.PROCESSING, self.DONE,
-                      self.ERROR, self.OUTPUT_DIR, self.PAPERLESS_CONSUME):
+        for path in (
+            self.INBOX,
+            self.PROCESSING,
+            self.DONE,
+            self.ERROR,
+            self.OUTPUT_DIR,
+            self.PAPERLESS_CONSUME,
+        ):
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -150,9 +171,9 @@ def get_logger(name: str = "doc-worker") -> logging.Logger:
     if get_config().LOG_JSON:
         handler.setFormatter(JsonFormatter())
     else:
-        handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-        ))
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
 
     _logger.addHandler(handler)
     return _logger
@@ -183,9 +204,13 @@ class JsonFormatter(logging.Formatter):
 
 
 def log_with_context(
-    logger: logging.Logger, level: int, msg: str,
-    job_id: str | None = None, stage: str | None = None,
-    source: str | None = None, filename: str | None = None,
+    logger: logging.Logger,
+    level: int,
+    msg: str,
+    job_id: str | None = None,
+    stage: str | None = None,
+    source: str | None = None,
+    filename: str | None = None,
 ) -> None:
     """Log with structured context fields."""
     extra = {}
@@ -203,6 +228,7 @@ def log_with_context(
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Metrics:
@@ -242,6 +268,7 @@ class Metrics:
 # ---------------------------------------------------------------------------
 # Model Lifecycle — PaddleOCR-VL Integration
 # ---------------------------------------------------------------------------
+
 
 class ModelManager:
     """Manages PaddleOCR model lifecycle.
@@ -304,7 +331,9 @@ class ModelManager:
 
             self._loaded = True
             load_time = time.time() - start
-            self._logger.info(f"All models loaded in {load_time:.2f}s: {self._model_type}")
+            self._logger.info(
+                f"All models loaded in {load_time:.2f}s: {self._model_type}"
+            )
 
             # Record metrics
             metrics = get_metrics()
@@ -420,6 +449,7 @@ class ModelManager:
         # Auto-detect
         try:
             import paddle
+
             if paddle.is_compiled_with_cuda():
                 return "gpu"
         except Exception:
@@ -450,7 +480,9 @@ class ModelManager:
             self._logger.error(f"PP-OCR failed: {exc}")
             raise
 
-    def run_vl_understanding(self, input_data: bytes | Path, ctx: JobContext) -> dict[str, Any]:
+    def run_vl_understanding(
+        self, input_data: bytes | Path, ctx: JobContext
+    ) -> dict[str, Any]:
         """Run PaddleOCR-VL document understanding.
 
         Produces:
@@ -470,7 +502,9 @@ class ModelManager:
             self.load()
 
         if self._vl_model is None or self._vl_processor is None:
-            self._logger.warning("PaddleOCR-VL not available, falling back to PP-OCR only")
+            self._logger.warning(
+                "PaddleOCR-VL not available, falling back to PP-OCR only"
+            )
             return self.run_ocr(input_data, ctx)
 
         start = time.time()
@@ -493,6 +527,7 @@ class ModelManager:
 
         # Write to temp file if bytes
         import tempfile
+
         tmp_path = None
         if isinstance(input_data, bytes):
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
@@ -515,11 +550,13 @@ class ModelManager:
                     text = line[1][0]  # recognized text
                     confidence = line[1][1]  # confidence score
 
-                    text_blocks.append({
-                        "text": text,
-                        "bbox": bbox,
-                        "confidence": confidence,
-                    })
+                    text_blocks.append(
+                        {
+                            "text": text,
+                            "bbox": bbox,
+                            "confidence": confidence,
+                        }
+                    )
                     full_text.append(text)
 
             return {
@@ -528,7 +565,8 @@ class ModelManager:
                 "block_count": len(text_blocks),
                 "avg_confidence": (
                     sum(b["confidence"] for b in text_blocks) / len(text_blocks)
-                    if text_blocks else 0.0
+                    if text_blocks
+                    else 0.0
                 ),
                 "model": "pp_ocr",
             }
@@ -585,8 +623,10 @@ class ModelManager:
 
             # Move to device
             device = next(self._vl_model.parameters()).device
-            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                      for k, v in inputs.items()}
+            inputs = {
+                k: v.to(device) if isinstance(v, torch.Tensor) else v
+                for k, v in inputs.items()
+            }
 
             # Generate
             with torch.no_grad():
@@ -625,42 +665,48 @@ class ModelManager:
         import re
 
         markdown = response
-        plain_text = re.sub(r'[#*\-\[\]`_~>]', '', response).strip()
+        plain_text = re.sub(r"[#*\-\[\]`_~>]", "", response).strip()
 
         # Extract tables
         tables = []
-        table_pattern = r'\|.*\|\n\|[-\s|:]+\|.*(?:\n\|.*\|)*'
+        table_pattern = r"\|.*\|\n\|[-\s|:]+\|.*(?:\n\|.*\|)*"
         for match in re.finditer(table_pattern, response):
             tables.append(match.group())
 
         # Extract formulas (LaTeX)
         formulas = []
-        formula_pattern = r'(?:(?:\$)(.*?)(?:\$)|(?:\$\$)(.*?)(?:\$\$))'
+        formula_pattern = r"(?:(?:\$)(.*?)(?:\$)|(?:\$\$)(.*?)(?:\$\$))"
         for match in re.finditer(formula_pattern, response):
             formulas.append(match.group(1) or match.group(2))
 
         # Extract layout blocks
         layout = []
-        heading_pattern = r'^(#{1,6}\s+.+)$'
-        for i, line in enumerate(response.split('\n')):
+        heading_pattern = r"^(#{1,6}\s+.+)$"
+        for i, line in enumerate(response.split("\n")):
             if re.match(heading_pattern, line):
-                layout.append({
-                    "type": "heading",
-                    "level": len(re.match(r'^(#+)', line).group()),
-                    "text": line.lstrip('# ').strip(),
-                    "line": i,
-                })
-            elif line.strip().startswith('|') and '|' in line:
-                layout.append({
-                    "type": "table",
-                    "line": i,
-                })
-            elif line.strip().startswith('- ') or line.strip().startswith('* '):
-                layout.append({
-                    "type": "list_item",
-                    "text": line.strip()[2:],
-                    "line": i,
-                })
+                layout.append(
+                    {
+                        "type": "heading",
+                        "level": len(re.match(r"^(#+)", line).group()),
+                        "text": line.lstrip("# ").strip(),
+                        "line": i,
+                    }
+                )
+            elif line.strip().startswith("|") and "|" in line:
+                layout.append(
+                    {
+                        "type": "table",
+                        "line": i,
+                    }
+                )
+            elif line.strip().startswith("- ") or line.strip().startswith("* "):
+                layout.append(
+                    {
+                        "type": "list_item",
+                        "text": line.strip()[2:],
+                        "line": i,
+                    }
+                )
 
         return {
             "markdown": markdown,
@@ -682,9 +728,11 @@ class ModelManager:
 
             # Force garbage collection for GPU memory
             import gc
+
             gc.collect()
             try:
                 import torch
+
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
@@ -694,6 +742,7 @@ class ModelManager:
 # ---------------------------------------------------------------------------
 # File I/O Abstraction
 # ---------------------------------------------------------------------------
+
 
 class FileIO:
     """Unified file I/O abstraction supporting disk and memory."""
@@ -735,6 +784,7 @@ class FileIO:
 # ---------------------------------------------------------------------------
 # Health Checks
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class HealthStatus:
@@ -803,7 +853,13 @@ def init_companion() -> None:
     config.ensure_directories()
     logger = get_logger()
     logger.info("server:companion initialized")
-    logger.info(f"Config: INBOX={config.INBOX}, PROCESSING={config.PROCESSING}, "
-                f"DONE={config.DONE}, ERROR={config.ERROR}")
-    logger.info(f"OCR_RUNTIME={config.OCR_RUNTIME}, PROCESSING_MODE={config.PROCESSING_MODE}")
-    logger.info(f"PADDLE_OCR_LANG={config.PADDLE_OCR_LANG}, PADDLE_VL_MODEL={config.PADDLE_VL_MODEL}")
+    logger.info(
+        f"Config: INBOX={config.INBOX}, PROCESSING={config.PROCESSING}, "
+        f"DONE={config.DONE}, ERROR={config.ERROR}"
+    )
+    logger.info(
+        f"OCR_RUNTIME={config.OCR_RUNTIME}, PROCESSING_MODE={config.PROCESSING_MODE}"
+    )
+    logger.info(
+        f"PADDLE_OCR_LANG={config.PADDLE_OCR_LANG}, PADDLE_VL_MODEL={config.PADDLE_VL_MODEL}"
+    )

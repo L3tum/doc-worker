@@ -44,11 +44,12 @@ def client(mock_config, mock_model_manager):
 
     set_orchestrator(orch)
 
-    # Patch get_config and get_model_manager
-    with patch("server.api.get_config", return_value=mock_config):
-        with patch("server.api.get_model_manager", return_value=mock_model_manager):
-            with TestClient(app) as test_client:
-                yield test_client
+    # Patch both init_companion and security hardening to avoid /work access
+    with patch("server.api.init_companion"):
+        with patch("server.api.apply_security_hardening"):
+            with patch("server.api.get_config", return_value=mock_config):
+                with TestClient(app) as test_client:
+                    yield test_client
 
 
 class TestHealthEndpoint:
@@ -146,16 +147,25 @@ class TestConvertEndpoint:
         data = response.json()
         assert "File too large" in data["detail"]
 
-    def test_convert_no_orchestrator(self):
+    def test_convert_no_orchestrator(self, mock_config):
         """Test 503 when orchestrator is not initialized."""
-        # Create a fresh client without setting orchestrator
-        with TestClient(app) as test_client:
-            response = test_client.post(
-                "/api/v1/convert",
-                files={"file": ("test.pdf", b"%PDF-1.4", "application/pdf")},
-            )
+        # Clear the global orchestrator set by previous tests
+        import server.api as api_module
 
-            assert response.status_code == 503
+        api_module._orchestrator = None
+        """Test 503 when orchestrator is not initialized."""
+        with patch("server.api.init_companion"):
+            with patch("server.api.apply_security_hardening"):
+                with patch("server.api.get_config", return_value=mock_config):
+                    with TestClient(app, raise_server_exceptions=False) as test_client:
+                        response = test_client.post(
+                            "/api/v1/convert",
+                            files={
+                                "file": ("test.pdf", b"%PDF-1.4", "application/pdf")
+                            },
+                        )
+
+                        assert response.status_code == 503
 
     def test_convert_mode_parameter(self, client, sample_pdf_bytes):
         """Test that mode parameter is passed through."""

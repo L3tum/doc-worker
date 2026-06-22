@@ -17,7 +17,10 @@ import tempfile
 from pathlib import Path
 
 from server.companion import (
-    FileIO, get_config, get_logger, get_model_manager,
+    FileIO,
+    get_config,
+    get_logger,
+    get_model_manager,
 )
 from server.models import Job, JobContext, ProcessingMode
 from server.orchestrator import StageError
@@ -130,9 +133,7 @@ def _run_paddle_ocr_pipeline(
             markdown = ocr_result.get("text", "")
 
         # Step 3: Embed text layer into PDF
-        ocr_pdf = _embed_text_layer(
-            tmp_in_path, tmp_out, ocr_result, config
-        )
+        ocr_pdf = _embed_text_layer(tmp_in_path, tmp_out, ocr_result, config)
 
         # Step 4: Build metadata
         metadata = {

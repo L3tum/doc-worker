@@ -65,9 +65,7 @@ def lifecycle(job: Job, ctx: JobContext) -> JobContext:
         )
 
 
-def _manage_folder_lifecycle(
-    job: Job, ctx: JobContext, config
-) -> JobContext:
+def _manage_folder_lifecycle(job: Job, ctx: JobContext, config) -> JobContext:
     """Manage lifecycle for folder-sourced jobs."""
     filename = job.input.filename
     inbox_path = config.INBOX / filename
@@ -93,9 +91,7 @@ def _manage_folder_lifecycle(
                 dest = config.ERROR / f"{stem}_{ts}{suffix}"
             shutil.move(str(current_path), str(dest))
             ctx.extra["final_path"] = str(dest)
-            get_logger("doc-worker.stages.lifecycle").info(
-                f"  → ERROR/ ({filename})"
-            )
+            get_logger("doc-worker.stages.lifecycle").info(f"  → ERROR/ ({filename})")
 
     else:
         # Success — move to DONE/
@@ -108,9 +104,7 @@ def _manage_folder_lifecycle(
                 dest = config.DONE / f"{stem}_{ts}{suffix}"
             shutil.move(str(current_path), str(dest))
             ctx.extra["final_path"] = str(dest)
-            get_logger("doc-worker.stages.lifecycle").info(
-                f"  → DONE/ ({filename})"
-            )
+            get_logger("doc-worker.stages.lifecycle").info(f"  → DONE/ ({filename})")
 
     # Clean up intermediate files
     _cleanup_intermediate(config.PROCESSING, filename)

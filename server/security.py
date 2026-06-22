@@ -29,6 +29,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 # Rate Limiting Middleware
 # ---------------------------------------------------------------------------
 
+
 class RateLimiter:
     """Simple in-memory rate limiter.
 
@@ -59,9 +60,7 @@ class RateLimiter:
         window_start = now - self.window_seconds
 
         # Clean old entries
-        self._requests[key] = [
-            t for t in self._requests[key] if t > window_start
-        ]
+        self._requests[key] = [t for t in self._requests[key] if t > window_start]
 
         if len(self._requests[key]) >= self.max_requests:
             return False
@@ -75,7 +74,8 @@ class RateLimiter:
         window_start = now - self.window_seconds
 
         keys_to_remove = [
-            key for key, times in self._requests.items()
+            key
+            for key, times in self._requests.items()
             if not any(t > window_start for t in times)
         ]
         for key in keys_to_remove:
@@ -165,7 +165,9 @@ def validate_file_size(size: int, max_size: int = MAX_FILE_SIZE) -> None:
     """
     if size > max_size:
         max_mb = max_size / (1024 * 1024)
-        raise ValueError(f"File too large: {size / (1024 * 1024):.1f}MB > {max_mb:.0f}MB")
+        raise ValueError(
+            f"File too large: {size / (1024 * 1024):.1f}MB > {max_mb:.0f}MB"
+        )
 
 
 def compute_content_hash(data: bytes) -> str:
@@ -208,6 +210,7 @@ async def secure_headers_middleware(request: Request, call_next):
 # CORS Configuration
 # ---------------------------------------------------------------------------
 
+
 def configure_cors(app: FastAPI, allowed_origins: list[str] | None = None) -> None:
     """Configure CORS for the FastAPI app.
 
@@ -228,6 +231,7 @@ def configure_cors(app: FastAPI, allowed_origins: list[str] | None = None) -> No
 # Trusted Host Middleware
 # ---------------------------------------------------------------------------
 
+
 def configure_trusted_hosts(
     app: FastAPI, allowed_hosts: list[str] | None = None
 ) -> None:
@@ -247,6 +251,7 @@ def configure_trusted_hosts(
 # ---------------------------------------------------------------------------
 # Apply Security Hardening
 # ---------------------------------------------------------------------------
+
 
 def apply_security_hardening(
     app: FastAPI,

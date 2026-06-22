@@ -16,7 +16,9 @@ from collections import deque
 from typing import Callable
 
 from server.companion import (
-    get_config, get_logger, get_metrics,
+    get_config,
+    get_logger,
+    get_metrics,
 )
 from server.models import Job, JobContext, JobState
 
@@ -53,6 +55,7 @@ class StageValidationError(StageError):
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
+
 
 class Orchestrator:
     """FSM-based pipeline orchestrator.
@@ -108,10 +111,7 @@ class Orchestrator:
     @property
     def can_accept(self) -> bool:
         """Whether the orchestrator can accept new jobs."""
-        return (
-            self._running
-            and self.active_count < self.max_concurrent
-        )
+        return self._running and self.active_count < self.max_concurrent
 
     def start(self) -> None:
         """Start the orchestrator."""
@@ -209,8 +209,7 @@ class Orchestrator:
         # All stages completed
         self._transition(job, JobState.COMPLETED)
         self._logger.info(
-            f"Job {job.job_id} completed successfully in "
-            f"{job.elapsed_seconds:.1f}s"
+            f"Job {job.job_id} completed successfully in {job.elapsed_seconds:.1f}s"
         )
 
     def _run_stage_with_retry(
@@ -226,8 +225,7 @@ class Orchestrator:
                 duration = time.time() - start
                 get_metrics().record_stage_timing(stage_name, duration)
                 self._logger.debug(
-                    f"Stage '{stage_name}' for job {job.job_id}: "
-                    f"OK ({duration:.2f}s)"
+                    f"Stage '{stage_name}' for job {job.job_id}: OK ({duration:.2f}s)"
                 )
                 return
 
@@ -238,9 +236,7 @@ class Orchestrator:
                     f"{job.job_id}: {exc}"
                 )
                 job.transition(JobState.FAILED)
-                job.context.errors.append(
-                    f"[{stage_name}] Validation: {exc}"
-                )
+                job.context.errors.append(f"[{stage_name}] Validation: {exc}")
                 return
 
             except StageError as exc:
@@ -298,9 +294,7 @@ class Orchestrator:
             )
             return
         job.transition(new_state)
-        self._logger.info(
-            f"Job {job.job_id}: {job.state} → {new_state}"
-        )
+        self._logger.info(f"Job {job.job_id}: {job.state} → {new_state}")
 
     @staticmethod
     def _next_state(stage_name: str) -> JobState:

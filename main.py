@@ -27,7 +27,9 @@ import uvicorn
 from server.adapters import FolderWatcherAdapter, recover_leftover_files
 from server.api import app, set_orchestrator
 from server.companion import (
-    get_config, get_logger, init_companion,
+    get_config,
+    get_logger,
+    init_companion,
 )
 from server.orchestrator import Orchestrator
 from server.stages import lifecycle, ocr, output, validate
@@ -36,6 +38,7 @@ from server.stages import lifecycle, ocr, output, validate
 # ---------------------------------------------------------------------------
 # Pipeline setup
 # ---------------------------------------------------------------------------
+
 
 def build_orchestrator() -> Orchestrator:
     """Build the orchestrator with all pipeline stages."""
@@ -51,6 +54,7 @@ def build_orchestrator() -> Orchestrator:
 # ---------------------------------------------------------------------------
 # Folder watcher mode
 # ---------------------------------------------------------------------------
+
 
 def run_folder_mode(orchestrator: Orchestrator) -> None:
     """Run the folder watcher with periodic processing."""
@@ -89,6 +93,7 @@ def run_folder_mode(orchestrator: Orchestrator) -> None:
 # API mode
 # ---------------------------------------------------------------------------
 
+
 def run_api_mode(orchestrator: Orchestrator) -> None:
     """Run the API server."""
     config = get_config()
@@ -110,6 +115,7 @@ def run_api_mode(orchestrator: Orchestrator) -> None:
 # ---------------------------------------------------------------------------
 # Combined mode (folder + API)
 # ---------------------------------------------------------------------------
+
 
 def run_combined_mode(orchestrator: Orchestrator) -> None:
     """Run both folder watcher and API server concurrently."""
@@ -173,6 +179,7 @@ def _signal_handler(signum, frame):
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Doc-Worker OCR Pipeline")

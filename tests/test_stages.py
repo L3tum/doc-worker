@@ -21,17 +21,21 @@ class TestValidate:
         if source == "folder":
             file_path = temp_dir / filename
             file_path.write_bytes(content)
-            return Job(input=DocumentInput(
-                filename=filename,
-                source=source,
-                path=file_path,
-            ))
+            return Job(
+                input=DocumentInput(
+                    filename=filename,
+                    source=source,
+                    path=file_path,
+                )
+            )
         else:
-            return Job(input=DocumentInput(
-                filename=filename,
-                source=source,
-                data=content,
-            ))
+            return Job(
+                input=DocumentInput(
+                    filename=filename,
+                    source=source,
+                    data=content,
+                )
+            )
 
     def test_valid_pdf(self, temp_dir, sample_pdf_bytes):
         """Test validation of a valid PDF."""

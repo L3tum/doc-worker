@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 # Protocol
 # ---------------------------------------------------------------------------
 
+
 class IngestionAdapter(Protocol):
     """Interface for document ingestion sources."""
 
@@ -44,6 +45,7 @@ class IngestionAdapter(Protocol):
 # Folder Watcher Adapter
 # ---------------------------------------------------------------------------
 
+
 class FolderWatcherAdapter:
     """Polls INBOX/ for new files and submits them to the orchestrator.
 
@@ -52,8 +54,20 @@ class FolderWatcherAdapter:
     - Images: .png, .jpg, .jpeg, .tiff, .webp (and uppercase variants)
     """
 
-    SUPPORTED_EXTENSIONS = {".pdf", ".PDF", ".png", ".PNG", ".jpg", ".JPG",
-                            ".jpeg", ".JPEG", ".tiff", ".TIFF", ".webp", ".WEBP"}
+    SUPPORTED_EXTENSIONS = {
+        ".pdf",
+        ".PDF",
+        ".png",
+        ".PNG",
+        ".jpg",
+        ".JPG",
+        ".jpeg",
+        ".JPEG",
+        ".tiff",
+        ".TIFF",
+        ".webp",
+        ".WEBP",
+    }
 
     def __init__(self, orchestrator: Orchestrator):
         self.orchestrator = orchestrator
@@ -100,13 +114,9 @@ class FolderWatcherAdapter:
 
             try:
                 job = self.submit(document)
-                self._logger.info(
-                    f"Submitted {filepath.name} as job {job.job_id}"
-                )
+                self._logger.info(f"Submitted {filepath.name} as job {job.job_id}")
             except RuntimeError as exc:
-                self._logger.error(
-                    f"Failed to submit {filepath.name}: {exc}"
-                )
+                self._logger.error(f"Failed to submit {filepath.name}: {exc}")
 
     def _find_new_files(self) -> list[Path]:
         """Find new files in the inbox directory."""
@@ -152,6 +162,7 @@ class FolderWatcherAdapter:
 # ---------------------------------------------------------------------------
 # Crash Recovery
 # ---------------------------------------------------------------------------
+
 
 def recover_leftover_files(config=None) -> None:
     """Move stale files from PROCESSING/ to ERROR/ on startup.

@@ -44,9 +44,9 @@ class DocumentType(str, Enum):
 class ProcessingMode(str, Enum):
     """OCR processing strategies."""
 
-    SKIP = "skip"           # text PDF — extract directly
-    FULL_OCR = "full_ocr"   # scanned — run full OCR pipeline
-    OVERLAY = "overlay"     # hybrid — overlay text layer
+    SKIP = "skip"  # text PDF — extract directly
+    FULL_OCR = "full_ocr"  # scanned — run full OCR pipeline
+    OVERLAY = "overlay"  # hybrid — overlay text layer
 
 
 @dataclass
@@ -59,8 +59,8 @@ class DocumentInput:
 
     filename: str
     source: str  # "folder" | "api"
-    path: Path | None = None       # filesystem-backed
-    data: bytes | None = None      # in-memory buffer
+    path: Path | None = None  # filesystem-backed
+    data: bytes | None = None  # in-memory buffer
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -108,10 +108,10 @@ class Job:
     """
 
     job_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    input: DocumentInput = field(default_factory=lambda: DocumentInput(
-        filename="", source=""
-    ))
-    context: JobContext = field(default_factory=JobContext)
+    input: DocumentInput = field(
+        default_factory=lambda: DocumentInput(filename="", source="")
+    )
+    context: JobContext = field(default_factory=lambda: JobContext(job_id=""))
     state: JobState = JobState.QUEUED
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)

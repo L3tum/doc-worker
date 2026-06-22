@@ -66,9 +66,7 @@ def output(job: Job, ctx: JobContext) -> JobContext:
         )
 
 
-def _persist_folder_outputs(
-    job: Job, ctx: JobContext, config, stem: str
-) -> JobContext:
+def _persist_folder_outputs(job: Job, ctx: JobContext, config, stem: str) -> JobContext:
     """Persist outputs for folder-sourced jobs."""
     logger = get_logger("doc-worker.stages.output")
 
@@ -113,7 +111,9 @@ def _persist_folder_outputs(
     if ctx.outputs.ocr_pdf and ctx.extra.get("ocr_pdf_path"):
         ocr_path = Path(ctx.extra["ocr_pdf_path"])
         if _push_to_paperless(ocr_path, config):
-            logger.info(f"  Pushed to Paperless: {config.PAPERLESS_CONSUME / ocr_path.name}")
+            logger.info(
+                f"  Pushed to Paperless: {config.PAPERLESS_CONSUME / ocr_path.name}"
+            )
 
     return ctx
 

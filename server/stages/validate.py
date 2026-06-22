@@ -15,7 +15,10 @@ from pathlib import Path
 
 from server.companion import FileIO, get_config, get_logger
 from server.models import (
-    DocumentType, Job, JobContext, ProcessingMode,
+    DocumentType,
+    Job,
+    JobContext,
+    ProcessingMode,
 )
 from server.orchestrator import StageValidationError
 
@@ -93,9 +96,7 @@ def _classify_pdf(content: bytes) -> DocumentType:
 
     # Simple heuristic: search for text-related PDF operators
     # BT...ET blocks contain text, Tj and TJ operators render text
-    has_text_operators = (
-        b"Tj" in content or b"TJ" in content or b"' " in content
-    )
+    has_text_operators = b"Tj" in content or b"TJ" in content or b"' " in content
 
     # Check for /Text in resource dictionaries (indicates text content)
     has_text_resources = b"/Text" in content

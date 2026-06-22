@@ -7,8 +7,13 @@ from __future__ import annotations
 import time
 
 from server.models import (
-    DocumentInput, DocumentType, Job, JobContext, JobState,
-    ProcessingMode, StageOutput,
+    DocumentInput,
+    DocumentType,
+    Job,
+    JobContext,
+    JobState,
+    ProcessingMode,
+    StageOutput,
 )
 
 
