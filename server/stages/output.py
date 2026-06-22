@@ -74,26 +74,26 @@ def _persist_folder_outputs(
     """Persist outputs for folder-sourced jobs."""
     logger = get_logger("doc-worker.stages.output")
 
-    # Write OCR'd PDF to PROCESSING/
+    # Create per-document output directory
+    out_dir = config.OUTPUT_DIR / stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Write OCR'd PDF to PROCESSING/ (will be moved by lifecycle stage)
     if ctx.outputs.ocr_pdf:
         ocr_path = config.PROCESSING / f"{stem}_ocr.pdf"
         FileIO.write(ocr_path, ctx.outputs.ocr_pdf)
         ctx.extra["ocr_pdf_path"] = str(ocr_path)
         logger.info(f"  OCR PDF written: {ocr_path}")
 
-    # Write Markdown sidecar to DOCLING_OUT/
+    # Write Markdown sidecar to OUTPUT_DIR/
     if ctx.outputs.markdown:
-        out_dir = config.DOCLING_OUT / stem
-        out_dir.mkdir(parents=True, exist_ok=True)
         md_path = out_dir / f"{stem}.md"
         FileIO.write_text(md_path, ctx.outputs.markdown)
         ctx.extra["markdown_path"] = str(md_path)
         logger.info(f"  Markdown written: {md_path}")
 
-    # Write JSON metadata to DOCLING_OUT/
+    # Write JSON metadata to OUTPUT_DIR/
     if ctx.outputs.json_metadata:
-        out_dir = config.DOCLING_OUT / stem
-        out_dir.mkdir(parents=True, exist_ok=True)
         json_path = out_dir / f"{stem}.json"
         FileIO.write_text(
             json_path,
@@ -101,6 +101,15 @@ def _persist_folder_outputs(
         )
         ctx.extra["json_path"] = str(json_path)
         logger.info(f"  JSON metadata written: {json_path}")
+
+    # Write processing manifest to OUTPUT_DIR/
+    if ctx.outputs.manifest:
+        manifest_path = out_dir / f"{stem}_manifest.json"
+        FileIO.write_text(
+            manifest_path,
+            json.dumps(ctx.outputs.manifest, indent=2, default=str),
+        )
+        logger.info(f"  Manifest written: {manifest_path}")
 
     # Push to Paperless
     if ctx.outputs.ocr_pdf and ctx.extra.get("ocr_pdf_path"):
@@ -120,7 +129,11 @@ def _bundle_api_outputs(job: Job, ctx: JobContext) -> JobContext:
 
 
 def _push_to_paperless(ocr_path: Path, config) -> bool:
-    """Upload OCR'd PDF to Paperless-ngx consume directory."""
+    """Upload OCR'd PDF to Paperless-ngx consume directory.
+
+    Uses an atomic write pattern (write to .tmp, then rename) so Paperless
+    never picks up a partially-written file.
+    """
     dest = config.PAPERLESS_CONSUME / ocr_path.name
     tmp_dest = config.PAPERLESS_CONSUME / f"{ocr_path.name}.tmp"
 

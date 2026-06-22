@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from server.companion import get_config, get_logger
-from server.models import Job, JobContext
+from server.models import Job, JobContext, JobState
 from server.orchestrator import StageError
 
 
@@ -140,7 +140,3 @@ def _cleanup_intermediate(processing_dir: Path, filename: str) -> None:
                 f.unlink()
             except OSError:
                 pass
-
-
-# Import JobState here to avoid circular imports
-from server.models import JobState  # noqa: E402

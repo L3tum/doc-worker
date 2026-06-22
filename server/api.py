@@ -7,6 +7,8 @@ HTTP endpoint for on-demand document processing:
 - GET /health — health check
 - GET /ready — readiness check
 - GET /metrics — processing metrics
+
+Phase 4: Updated to support PaddleOCR-VL processing modes.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from server.companion import (
 )
 from server.models import DocumentInput, Job
 from server.orchestrator import Orchestrator
+from server.security import apply_security_hardening
 
 # ---------------------------------------------------------------------------
 # App factory
@@ -32,8 +35,8 @@ from server.orchestrator import Orchestrator
 
 app = FastAPI(
     title="Doc-Worker API",
-    description="OCR processing pipeline API",
-    version="1.0.0",
+    description="OCR processing pipeline API with PaddleOCR-VL support",
+    version="2.0.0",
 )
 
 _orchestrator: Orchestrator | None = None
@@ -64,6 +67,14 @@ def set_orchestrator(orch: Orchestrator) -> None:
 async def startup() -> None:
     """Initialize the companion module on startup."""
     init_companion()
+
+    # Apply security hardening
+    apply_security_hardening(
+        app,
+        rate_limit_max=60,
+        rate_limit_window=60,
+    )
+
     get_logger("doc-worker.api").info("API server starting")
 
 
@@ -73,7 +84,10 @@ async def startup() -> None:
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    """Health check endpoint."""
+    """Health check endpoint.
+
+    Returns basic health status and uptime.
+    """
     health_status = get_health()
     return {
         "status": health_status.status,
@@ -83,7 +97,10 @@ async def health() -> dict[str, Any]:
 
 @app.get("/ready")
 async def ready() -> dict[str, Any]:
-    """Readiness check endpoint."""
+    """Readiness check endpoint.
+
+    Returns detailed readiness status including model loading state.
+    """
     health_status = get_health()
     orchestrator = None
     try:
@@ -101,6 +118,8 @@ async def ready() -> dict[str, Any]:
         content={
             "ready": ready,
             "model_loaded": health_status.model_loaded,
+            "pp_ocr_loaded": getattr(health_status, "pp_ocr_loaded", False),
+            "vl_model_loaded": getattr(health_status, "vl_model_loaded", False),
             "orchestrator_running": orchestrator is not None
                 and orchestrator._running if orchestrator else False,
         },
@@ -109,7 +128,10 @@ async def ready() -> dict[str, Any]:
 
 @app.get("/metrics")
 async def metrics() -> dict[str, Any]:
-    """Processing metrics endpoint."""
+    """Processing metrics endpoint.
+
+    Returns counters and timing information for all processed documents.
+    """
     return get_metrics().summary()
 
 
@@ -124,8 +146,16 @@ async def convert(
 ) -> dict[str, Any]:
     """Submit a document for OCR processing.
 
-    Accepts a PDF or image file, processes it through the OCR pipeline,
+    Accepts a PDF or image file, processes it through the PaddleOCR pipeline,
     and returns the OCR'd PDF along with a Markdown sidecar.
+
+    Processing modes:
+    - auto: Use PP-OCR for text, PaddleOCR-VL for complex documents
+    - pp_ocr: Use only PP-OCRv6 (fast, text-only)
+    - paddle_vl: Use PaddleOCR-VL for full document understanding
+
+    Returns:
+        Dict with job_id, processing results, and output files.
     """
     logger = get_logger("doc-worker.api")
 
@@ -150,7 +180,7 @@ async def convert(
             detail=f"File too large: {size_mb:.1f}MB > {config.MAX_FILE_SIZE_MB}MB",
         )
 
-    logger.info(f"API convert request: {file.filename} ({size_mb:.1f}MB)")
+    logger.info(f"API convert request: {file.filename} ({size_mb:.1f}MB, mode={mode})")
 
     # Create job
     document = DocumentInput(
@@ -178,7 +208,6 @@ async def convert(
         )
 
     # Process synchronously (for API, we want to return the result)
-    # In a future iteration, this could be async with a job status endpoint
     orchestrator._run_pipeline(job)
 
     if job.state.value == "failed":

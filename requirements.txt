@@ -1,16 +1,31 @@
-# Core OCR (existing — replaced by PaddleOCR in Phase 4)
-ocrmypdf==17.4.1
-ocrmypdf-rapidocr==1.0.1
-rapidocr
-onnxruntime
+# Core OCR — PaddleOCR (Phase 4)
+paddlepaddle>=2.6.0
+paddleocr>=2.7.0
+
+# PaddleOCR-VL (document understanding)
+transformers>=4.36.0
+modelscope>=1.12.0
+Pillow>=10.0.0
+
+# PDF processing
+ocrmypdf>=17.4.1
+pypdf>=4.0.0
+
+# ONNX Runtime (for PaddleOCR detection/recognition backends)
+onnxruntime>=1.17.0
 
 # API server
 fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 
 # HTTP client
-requests
+requests>=2.31.0
 
-# PaddleOCR (Phase 4 integration)
-# paddlepaddle
-# paddleocr
+# Testing (Phase 6)
+pytest>=7.4.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+httpx>=0.25.0
+
+# Load testing (Phase 6)
+locust>=2.20.0

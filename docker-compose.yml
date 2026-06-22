@@ -18,27 +18,32 @@ services:
       - ./work/processing:/work/processing
       - ./work/done:/work/done
       - ./work/error:/work/error
-      - ./work/docling:/work/docling
+      - ./work/output:/work/output
       # Paperless consume directory (mount the same path Paperless uses)
       - ./paperless-consume:/paperless-consume
+      # Model cache (optional — speeds up restarts)
+      - paddle-model-cache:/root/.cache/modelscope
     ports:
       # API server port (for on-demand processing)
       - "8000:8000"
     environment:
-      # Mode: "combined" (default), "folder", or "api"
-      # - MODE=combined
-
       # OCR settings
       - OCR_LANG=deu
 
       # Runtime selection: "cpu", "cuda", "openvino", or "rocm"
       # Must match the ONNX_RUNTIME build arg used when building the image.
-      # At runtime, the worker will auto-detect if the provider is available
-      # and fall back to CPU if not.
       - OCR_RUNTIME=cpu
 
       # Processing mode: "auto" (default), "pp_ocr", or "paddle_vl"
-      # - PROCESSING_MODE=auto
+      # - auto: Use PP-OCR for text, PaddleOCR-VL for complex documents
+      # - pp_ocr: Use only PP-OCRv6 (fast, text-only)
+      # - paddle_vl: Use PaddleOCR-VL for full document understanding
+      - PROCESSING_MODE=auto
+
+      # PaddleOCR settings
+      - PADDLE_OCR_LANG=ch
+      - PADDLE_VL_MODEL=PaddleOCR-VL-1.5B
+      - PADDLE_DEVICE=auto
 
       # Polling
       - POLL_INTERVAL=5
@@ -59,33 +64,22 @@ services:
       - LOG_LEVEL=INFO
       - LOG_JSON=true
 
-      # GPU passthrough (uncomment when using ONNX_RUNTIME=cuda)
-      # deploy:
-      #   resources:
-      #     reservations:
-      #       devices:
-      #         - driver: nvidia
-      #           count: 1
-      #           capabilities: [gpu]
+    # GPU passthrough (uncomment when using ONNX_RUNTIME=cuda)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
 
-    # Docling is optional (legacy). Remove depends_on when fully migrated.
-    # depends_on:
-    #   docling:
-    #     condition: service_started
     networks:
       - doc-worker-net
-
-  # Docling API (legacy — being replaced by PaddleOCR-VL integration)
-  # Uncomment when DOCLING_MODE is not "off"
-  # docling:
-  #   image: ghcr.io/ds4sd/docling-api:latest
-  #   container_name: docling
-  #   restart: unless-stopped
-  #   ports:
-  #     - "12000:12000"
-  #   networks:
-  #     - doc-worker-net
 
 networks:
   doc-worker-net:
     driver: bridge
+
+volumes:
+  paddle-model-cache:
+    driver: local

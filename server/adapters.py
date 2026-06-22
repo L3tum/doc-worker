@@ -47,7 +47,12 @@ class IngestionAdapter(Protocol):
 # ---------------------------------------------------------------------------
 
 class FolderWatcherAdapter:
-    """Polls INBOX/ for new PDF files and submits them to the orchestrator."""
+    """Polls INBOX/ for new files and submits them to the orchestrator.
+
+    Supports PDF and common image formats:
+    - PDF: .pdf, .PDF
+    - Images: .png, .jpg, .jpeg, .tiff, .webp (and uppercase variants)
+    """
 
     SUPPORTED_EXTENSIONS = {".pdf", ".PDF", ".png", ".PNG", ".jpg", ".JPG",
                             ".jpeg", ".JPEG", ".tiff", ".TIFF", ".webp", ".WEBP"}
@@ -117,7 +122,12 @@ class FolderWatcherAdapter:
         return sorted(files, key=lambda p: p.name.lower())
 
     def _wait_for_stable(self, filepath: Path) -> bool:
-        """Wait until the file size stops changing."""
+        """Wait until the file size stops changing.
+
+        Polls the file size for up to STABILITY_TIMEOUT seconds.
+        If the size stays the same for the full period, the file is
+        considered stable (upload complete).
+        """
         timeout = self.config.STABILITY_TIMEOUT
         try:
             last_size = filepath.stat().st_size
@@ -146,7 +156,11 @@ class FolderWatcherAdapter:
 # ---------------------------------------------------------------------------
 
 def recover_leftover_files(config=None) -> None:
-    """Move stale files from PROCESSING/ to ERROR/ on startup."""
+    """Move stale files from PROCESSING/ to ERROR/ on startup.
+
+    This ensures that files left behind by a previous crash are not
+    silently lost. They are moved to ERROR/ for inspection.
+    """
     if config is None:
         config = get_config()
 

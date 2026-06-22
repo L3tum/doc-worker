@@ -7,12 +7,13 @@ Runs the selected OCR model and produces structured output:
 - Markdown (structured text extraction)
 - JSON metadata (layout, tables, confidence scores)
 
-Currently uses OCRmyPDF + RapidOCR for backward compatibility.
-Will be updated in Phase 4 to use PaddleOCR directly.
+Phase 4: Uses PaddleOCR (PP-OCRv6 + PaddleOCR-VL) as the primary engine.
+OCRmyPDF is used as a wrapper to embed text layers into PDFs.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -50,7 +51,7 @@ def ocr(job: Job, ctx: JobContext) -> JobContext:
         if ctx.processing_mode == ProcessingMode.SKIP:
             # Text-based PDF — pass through, extract text directly
             ctx.outputs.ocr_pdf = content
-            ctx.outputs.markdown = _extract_text_simple(content, filename)
+            ctx.outputs.markdown = _extract_text_from_pdf(content)
             ctx.outputs.json_metadata = {
                 "processing_mode": "skip",
                 "document_type": ctx.document_type.value,
@@ -59,8 +60,8 @@ def ocr(job: Job, ctx: JobContext) -> JobContext:
             logger.info(f"OCR skipped (text PDF): {filename}")
 
         elif ctx.processing_mode in (ProcessingMode.FULL_OCR, ProcessingMode.OVERLAY):
-            # Run OCR pipeline
-            result = _run_ocr_pipeline(content, filename, config)
+            # Run PaddleOCR pipeline
+            result = _run_paddle_ocr_pipeline(content, filename, ctx, config)
             ctx.outputs.ocr_pdf = result.get("pdf")
             ctx.outputs.markdown = result.get("markdown")
             ctx.outputs.json_metadata = result.get("metadata")
@@ -85,73 +86,82 @@ def ocr(job: Job, ctx: JobContext) -> JobContext:
     return ctx
 
 
-def _run_ocr_pipeline(
-    content: bytes, filename: str, config
+def _run_paddle_ocr_pipeline(
+    content: bytes, filename: str, ctx: JobContext, config
 ) -> dict[str, object]:
-    """Run the OCR pipeline.
+    """Run the PaddleOCR pipeline.
 
-    Currently uses OCRmyPDF + RapidOCR via the existing worker.py logic.
-    Will be replaced with direct PaddleOCR in Phase 4.
+    Steps:
+    1. Run PP-OCR for text detection and recognition
+    2. Optionally run PaddleOCR-VL for document understanding
+    3. Embed text layer into PDF using OCRmyPDF or direct embedding
+    4. Generate markdown output
+
+    Returns:
+        Dict with pdf bytes, markdown string, and metadata dict.
     """
     logger = get_logger("doc-worker.stages.ocr")
+    model_mgr = get_model_manager()
 
-    # Write to temp file for OCRmyPDF
-    with tempfile.NamedTemporaryFile(
-        suffix=".pdf" if filename.lower().endswith(".pdf") else ".png",
-        delete=False
-    ) as tmp_in:
+    # Write input to temp file
+    suffix = ".pdf" if filename.lower().endswith(".pdf") else ".png"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_in:
         tmp_in.write(content)
         tmp_in_path = Path(tmp_in.name)
 
     tmp_out = tmp_in.with_suffix("_ocr.pdf")
 
     try:
-        # Import and run OCRmyPDF
-        # We import here to avoid import errors if ocrmypdf is not installed
-        # (e.g., during Phase 4 migration)
-        try:
-            import ocrmypdf
-        except ImportError:
-            logger.warning(
-                "ocrmypdf not installed — returning input as-is. "
-                "Install ocrmypdf or wait for Phase 4 PaddleOCR integration."
-            )
-            return {
-                "pdf": content,
-                "markdown": "",
-                "metadata": {
-                    "processing_mode": "passthrough",
-                    "reason": "ocrmypdf not installed",
-                    "filename": filename,
-                },
-            }
+        # Step 1: Run PP-OCR for text detection/recognition
+        logger.info("Running PP-OCR text detection...")
+        ocr_result = model_mgr.run_ocr(tmp_in_path, ctx)
 
-        # Configure RapidOCR runtime (from existing worker.py)
-        _configure_rapidocr_runtime()
+        # Step 2: Run PaddleOCR-VL for document understanding (if configured)
+        markdown = ""
+        vl_result = None
+        if config.PROCESSING_MODE in ("paddle_vl", "auto"):
+            logger.info("Running PaddleOCR-VL document understanding...")
+            try:
+                vl_result = model_mgr.run_vl_understanding(tmp_in_path, ctx)
+                markdown = vl_result.get("markdown", "")
+            except Exception as exc:
+                logger.warning(f"PaddleOCR-VL failed, using PP-OCR text only: {exc}")
+                markdown = ocr_result.get("text", "")
 
-        # Run OCR
-        ocrmypdf.ocr(
-            str(tmp_in_path),
-            str(tmp_out),
-            plugins=["ocrmypdf_rapidocr"],
-            language=config.OCR_LANG,
-            force_ocr=True,
-            rapidocr_config_path=os.environ.get("RAPIDOCR_CONFIG"),
+        if not markdown:
+            markdown = ocr_result.get("text", "")
+
+        # Step 3: Embed text layer into PDF
+        ocr_pdf = _embed_text_layer(
+            tmp_in_path, tmp_out, ocr_result, config
         )
 
-        # Read output
-        ocr_pdf = tmp_out.read_bytes() if tmp_out.exists() else content
+        # Step 4: Build metadata
+        metadata = {
+            "processing_mode": ctx.processing_mode.value,
+            "document_type": ctx.document_type.value,
+            "engine": "paddleocr",
+            "pp_ocr": {
+                "block_count": ocr_result.get("block_count", 0),
+                "avg_confidence": ocr_result.get("avg_confidence", 0.0),
+                "model": "pp_ocr",
+            },
+            "language": config.OCR_LANG,
+            "filename": filename,
+        }
+
+        if vl_result:
+            metadata["paddle_vl"] = {
+                "tables_count": len(vl_result.get("tables", [])),
+                "formulas_count": len(vl_result.get("formulas", [])),
+                "layout_blocks": len(vl_result.get("layout", [])),
+                "model": "paddle_vl",
+            }
 
         return {
             "pdf": ocr_pdf,
-            "markdown": "",  # Will be populated by PaddleOCR-VL in Phase 4
-            "metadata": {
-                "processing_mode": ctx.processing_mode.value,
-                "document_type": "scanned",
-                "engine": "ocrmypdf+rapidocr",
-                "language": config.OCR_LANG,
-                "filename": filename,
-            },
+            "markdown": markdown,
+            "metadata": metadata,
         }
 
     finally:
@@ -161,72 +171,74 @@ def _run_ocr_pipeline(
                 p.unlink()
 
 
-# ---------------------------------------------------------------------------
-# RapidOCR runtime configuration (ported from worker.py)
-# ---------------------------------------------------------------------------
+def _embed_text_layer(
+    input_path: Path, output_path: Path, ocr_result: dict, config
+) -> bytes:
+    """Embed the OCR text layer into the PDF.
 
-_rapidocr_configured = False
-_rapidocr_params: dict[str, object] = {}
-
-
-def _configure_rapidocr_runtime() -> None:
-    """Configure RapidOCR for the selected runtime backend."""
-    global _rapidocr_configured, _rapidocr_params
-    if _rapidocr_configured:
-        return
-    _rapidocr_configured = True
-
-    config = get_config()
-    runtime = config.OCR_RUNTIME
-
-    BACKENDS = {
-        "cpu": ("CPUExecutionProvider", None),
-        "cuda": ("CUDAExecutionProvider", "onnxruntime-gpu"),
-        "openvino": ("OpenVINOExecutionProvider", "onnxruntime-openvino"),
-        "rocm": ("ROCMExecutionProvider", "onnxruntime-rocm"),
-    }
-
-    if runtime not in BACKENDS:
-        runtime = "cpu"
-
-    target_provider, _ = BACKENDS[runtime]
-
-    try:
-        import onnxruntime as ort
-        available = ort.get_available_providers()
-        if target_provider not in available:
-            runtime = "cpu"
-            target_provider = "CPUExecutionProvider"
-    except Exception:
-        runtime = "cpu"
-        target_provider = "CPUExecutionProvider"
-
-    if runtime == "cuda":
-        _rapidocr_params = {"EngineConfig.onnxruntime.use_cuda": True}
-    elif runtime in ("openvino", "rocm"):
-        os.environ["RAPIDOCR_ONNXRUNTIME_PROVIDER"] = target_provider
-
-    # Patch RapidOCR if available
-    try:
-        import rapidocr
-        _orig_init = rapidocr.RapidOCR.__init__
-
-        def _patched_init(
-            self, config_path=None, params=None
-        ):
-            merged = dict(_rapidocr_params)
-            if params:
-                merged.update(params)
-            _orig_init(self, config_path=config_path, params=merged or None)
-
-        rapidocr.RapidOCR.__init__ = _patched_init
-    except ImportError:
-        pass
-
-
-def _extract_text_simple(content: bytes, filename: str) -> str:
-    """Simple text extraction for text-based PDFs.
-
-    Placeholder — will use PaddleOCR-VL in Phase 4.
+    Uses OCRmyPDF with the PaddleOCR engine if available,
+    otherwise falls back to direct text embedding.
     """
-    return ""
+    logger = get_logger("doc-worker.stages.ocr")
+
+    # Try OCRmyPDF first (it can use PaddleOCR as a backend)
+    try:
+        import ocrmypdf
+
+        ocrmypdf.ocr(
+            str(input_path),
+            str(output_path),
+            language=config.OCR_LANG,
+            force_ocr=True,
+            # Skip deskew, clean, and optimize for speed
+            skip_textual=True,  # Don't re-OCR pages that already have text
+            output_type="pdfa",  # PDF/A for archival
+        )
+
+        if output_path.exists():
+            return output_path.read_bytes()
+
+    except ImportError:
+        logger.warning("ocrmypdf not installed, using direct text embedding")
+    except Exception as exc:
+        logger.warning(f"ocrmypdf failed, using direct text embedding: {exc}")
+
+    # Fallback: return the original content with text metadata
+    # In a production environment, you'd want a proper PDF text embedding library
+    logger.warning(
+        "Returning original PDF without embedded text layer. "
+        "Install ocrmypdf for proper text embedding."
+    )
+    return input_path.read_bytes()
+
+
+def _extract_text_from_pdf(content: bytes) -> str:
+    """Extract text from a text-based PDF.
+
+    Uses PyPDF2/pypdf for text extraction.
+    """
+    try:
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            from PyPDF2 import PdfReader
+
+        import io
+
+        reader = PdfReader(io.BytesIO(content))
+        text_parts = []
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text_parts.append(page_text)
+
+        return "\n\n".join(text_parts)
+
+    except ImportError:
+        get_logger("doc-worker.stages.ocr").warning(
+            "pypdf/PyPDF2 not installed, cannot extract text from PDF"
+        )
+        return ""
+    except Exception as exc:
+        get_logger("doc-worker.stages.ocr").warning(f"Text extraction failed: {exc}")
+        return ""

@@ -1,57 +1,79 @@
 # Doc-Worker
 
-A Docker-based OCR pipeline worker with a unified sequential processing engine supporting two ingestion methods:
+A production-ready Docker-based OCR pipeline with **PaddleOCR-VL** document understanding, supporting dual ingestion methods:
 
-1. **Folder Watcher** — polls an inbox directory for new PDFs, processes them sequentially, and moves them through lifecycle directories.
-2. **API Hook** — an HTTP endpoint that accepts document submissions on-demand and returns structured output (OCR'd PDF + Markdown sidecar).
+1. **Folder Watcher** — polls an inbox directory for new files, processes them sequentially, and moves them through lifecycle directories.
+2. **API Hook** — an HTTP endpoint that accepts document submissions on-demand and returns structured output (OCR'd PDF + Markdown sidecar + JSON metadata).
 
 Both ingestion methods share the same processing pipeline, ensuring consistency and simplifying maintenance.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      doc-worker Container                    │
-│                                                             │
-│  ┌──────────────┐    ┌──────────────┐                       │
-│  │ Folder Watcher│    │  API Hook    │                       │
-│  │  (poller)    │    │  (FastAPI)   │                       │
-│  └──────┬───────┘    └──────┬───────┘                       │
-│         │                   │                                │
-│         └────────┬──────────┘                                │
-│                  ▼                                            │
-│           ┌──────────────┐                                   │
-│           │  Orchestrator │  ← FSM state management,          │
-│           │   (pipeline)  │    stage dispatch, retry logic    │
-│           └──────┬───────┘                                   │
-│                  │                                             │
-│         ┌────────┼─────────────────────────────┐              │
-│         ▼        ▼                              ▼             │
-│   ┌──────────┐ ┌──────────┐  ...       ┌────────────┐        │
-│   │ Validate │ │ OCR      │            │ Lifecycle  │        │
-│   │ & Triage │ │ Pipeline │            │ & Cleanup  │        │
-│   └──────────┘ └──────────┘            └────────────┘        │
-│                                                               │
-│  ┌──────────────────────────────────────────────────────┐    │
-│  │            server:companion (shared backend)          │    │
-│  │  • PaddleOCR model loading & inference                │    │
-│  │  • File I/O abstraction (disk / in-memory)           │    │
-│  │  • Logging, metrics, health checks                    │    │
-│  │  • Configuration management                           │    │
-│  └──────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                       doc-worker Container                       │
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────┐                          │
+│  │ Folder Watcher│    │  API Hook    │                          │
+│  │  (poller)    │    │  (FastAPI)   │                          │
+│  └──────┬───────┘    └──────┬───────┘                          │
+│         │                   │                                   │
+│         └────────┬──────────┘                                   │
+│                  ▼                                               │
+│           ┌──────────────┐                                      │
+│           │  Orchestrator │  ← FSM state management,             │
+│           │   (pipeline)  │    stage dispatch, retry logic       │
+│           └──────┬───────┘                                      │
+│                  │                                                │
+│         ┌────────┼──────────────────────────────┐                │
+│         ▼        ▼                               ▼               │
+│   ┌──────────┐ ┌──────────┐  ...          ┌────────────┐        │
+│   │ Validate │ │ OCR      │               │ Lifecycle  │        │
+│   │ & Triage │ │ Pipeline │               │ & Cleanup  │        │
+│   └──────────┘ └──────────┘               └────────────┘        │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │            server:companion (shared backend)              │   │
+│  │  • PaddleOCR model loading & inference                    │   │
+│  │  • PP-OCRv6 (text detection + recognition)                │   │
+│  │  • PaddleOCR-VL (document understanding)                  │   │
+│  │  • File I/O abstraction (disk / in-memory)               │   │
+│  │  • Logging, metrics, health checks                        │   │
+│  │  • Configuration management                               │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │            server:security (hardening)                    │   │
+│  │  • Rate limiting                                          │   │
+│  │  • Input validation & sanitization                        │   │
+│  │  • Secure headers                                         │   │
+│  │  • CORS configuration                                     │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Pipeline Stages
 
 1. **Validate & Triage** — file type check, size limit, document classification (text/scanned/hybrid PDF)
-2. **OCR Processing** — runs OCRmyPDF + RapidOCR (current) or PaddleOCR (Phase 4)
+2. **OCR Processing** — PP-OCRv6 for text detection/recognition + PaddleOCR-VL for document understanding
 3. **Output Assembly** — persists OCR'd PDF, Markdown sidecar, JSON metadata, pushes to Paperless
 4. **Lifecycle Management** — moves files through DONE/ or ERROR/, cleans up intermediates
 
+### OCR Engines
+
+| Engine | Purpose | Model |
+|---|---|---|
+| **PP-OCRv6** | Text detection + recognition | PaddleOCR detection (DB) + recognition (CRNN/SVTR) |
+| **PaddleOCR-VL** | Document understanding | PaddleOCR-VL-1.5B (vision-language model) |
+
+Processing modes:
+- `auto` — PP-OCR for text, PaddleOCR-VL for complex documents (default)
+- `pp_ocr` — PP-OCRv6 only (fast, text-only)
+- `paddle_vl` — PaddleOCR-VL for full document understanding
+
 ## Quick Start
 
-### 1. Build or pull the image
+### 1. Build the image
 
 | Tag | Backend |
 |---|---|
@@ -79,7 +101,7 @@ See [`docker-compose.yml`](docker-compose.yml) for the full configuration.
 
 ### 3. Use the pipeline
 
-**Folder mode** — drop PDFs into the inbox:
+**Folder mode** — drop files into the inbox:
 ```bash
 cp new-document.pdf ./work/inbox/
 ```
@@ -103,11 +125,14 @@ curl -X POST http://localhost:8000/api/v1/convert \
 | `PROCESSING` | `/work/processing` | Staging area during processing |
 | `DONE` | `/work/done` | Successfully processed files |
 | `ERROR` | `/work/error` | Failed files |
-| `DOCLING_DIR` | `/work/docling` | Sidecar output directory |
+| `OUTPUT_DIR` | `/work/output` | Sidecar output directory (Markdown, JSON) |
 | `PAPERLESS_CONSUME` | `/paperless-consume` | Paperless-ngx consume directory |
-| `OCR_LANG` | `deu` | OCR language |
+| `OCR_LANG` | `deu` | OCR language (for PP-OCR) |
 | `OCR_RUNTIME` | `cpu` | Backend: `cpu`, `cuda`, `openvino`, `rocm` |
 | `PROCESSING_MODE` | `auto` | OCR mode: `auto`, `pp_ocr`, `paddle_vl` |
+| `PADDLE_OCR_LANG` | `ch` | PaddleOCR language: `ch`, `en`, `german`, etc. |
+| `PADDLE_VL_MODEL` | `PaddleOCR-VL-1.5B` | PaddleOCR-VL model name |
+| `PADDLE_DEVICE` | `auto` | Device: `auto`, `cpu`, `gpu` |
 | `POLL_INTERVAL` | `5` | Seconds between inbox polls |
 | `MAX_RETRIES` | `3` | Max retry attempts per job |
 | `RETRY_DELAY` | `10` | Base seconds between retries (exponential backoff) |
@@ -133,7 +158,7 @@ curl -X POST http://localhost:8000/api/v1/convert \
 |---|---|---|
 | `POST` | `/api/v1/convert` | Submit a document for OCR processing |
 | `GET` | `/health` | Health check |
-| `GET` | `/ready` | Readiness check (model loaded + orchestrator running) |
+| `GET` | `/ready` | Readiness check (models loaded + orchestrator running) |
 | `GET` | `/metrics` | Processing metrics |
 
 ### Convert Endpoint
@@ -162,7 +187,17 @@ Response (200):
     "filename": "document.md",
     "content": "# Extracted text..."
   },
-  "metadata": { ... },
+  "metadata": {
+    "engine": "paddleocr",
+    "pp_ocr": {
+      "block_count": 15,
+      "avg_confidence": 0.95
+    },
+    "paddle_vl": {
+      "tables_count": 2,
+      "formulas_count": 0
+    }
+  },
   "manifest": { ... }
 }
 ```
@@ -172,7 +207,7 @@ Response (200):
 | Status | Condition |
 |---|---|
 | `400` | Unsupported file type or file too large |
-| `429` | Too many concurrent jobs |
+| `429` | Too many concurrent jobs or rate limited |
 | `500` | Processing failed |
 | `503` | Orchestrator not initialized |
 
@@ -199,25 +234,6 @@ deploy:
           capabilities: [gpu]
 ```
 
-### OpenVINO (Intel, experimental)
-
-```yaml
-image: doc-worker:openvino
-environment:
-  - OCR_RUNTIME=openvino
-```
-
-### ROCm (AMD, experimental)
-
-```yaml
-image: doc-worker:rocm
-environment:
-  - OCR_RUNTIME=rocm
-devices:
-  - /dev/kfd
-  - /dev/dri
-```
-
 ## Volume Mounts
 
 | Path | Purpose | Required |
@@ -226,7 +242,7 @@ devices:
 | `/work/processing` | Temporary staging area | Yes |
 | `/work/done` | Archive of processed files | Yes |
 | `/work/error` | Failed files for inspection | Yes |
-| `/work/docling` | Sidecar output (Markdown, JSON) | Optional |
+| `/work/output` | Sidecar output (Markdown, JSON, manifests) | Optional |
 | `/paperless-consume` | Paperless-ngx consume directory | Yes |
 
 ## Error Handling
@@ -240,21 +256,100 @@ devices:
 
 ## OCR Language
 
-The `ocrmypdf-rapidocr` plugin supports single-language codes:
+### PP-OCR Languages
 
 | Language | Code |
 |---|---|
-| German | `deu` |
-| English | `eng` |
-| French | `fra` |
-| Spanish | `spa` |
-| Italian | `ita` |
-| Portuguese | `por` |
-| Dutch | `nld` |
-| Polish | `pol` |
-| Chinese (Simplified) | `ch_sim` |
-| Japanese | `jpn` |
-| Korean | `kor` |
+| German | `german` |
+| English | `en` |
+| French | `french` |
+| Spanish | `spanish` |
+| Chinese (Simplified) | `ch` |
+| Japanese | `japan` |
+| Korean | `korean` |
+
+### PaddleOCR-VL
+
+PaddleOCR-VL is language-agnostic for document understanding. It produces structured markdown output regardless of the document language.
+
+## Testing
+
+### Unit Tests
+
+```bash
+pip install -r requirements.txt
+pytest tests/ -v
+```
+
+### Load Testing
+
+```bash
+# Start Locust web UI
+locust -f locustfile.py --host http://localhost:8000
+
+# Headless mode
+locust -f locustfile.py --host http://localhost:8000 \
+    --users 10 --spawn-rate 2 --run-time 5m --headless
+```
+
+### Security Scanning
+
+```bash
+# Bandit (Python security linter)
+bandit -r server/ -ll
+
+# Trivy (container vulnerability scanner)
+trivy image doc-worker:latest --severity CRITICAL,HIGH
+```
+
+## Production Deployment
+
+### Docker Compose (Production)
+
+```yaml
+services:
+  doc-worker:
+    image: doc-worker:latest
+    container_name: doc-worker
+    restart: always
+    volumes:
+      - ./work/inbox:/work/inbox
+      - ./work/processing:/work/processing
+      - ./work/done:/work/done
+      - ./work/error:/work/error
+      - ./work/output:/work/output
+      - ./paperless-consume:/paperless-consume
+      - paddle-model-cache:/root/.cache/modelscope
+    ports:
+      - "8000:8000"
+    environment:
+      - OCR_LANG=deu
+      - PROCESSING_MODE=auto
+      - MAX_CONCURRENT_JOBS=2
+      - LOG_LEVEL=INFO
+      - LOG_JSON=true
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+```
+
+### Security Considerations
+
+1. **Rate Limiting**: Built-in rate limiting (60 requests/minute per IP)
+2. **Input Validation**: File type and size validation
+3. **Secure Headers**: X-Content-Type-Options, X-Frame-Options, HSTS, CSP
+4. **CORS**: Configurable CORS policy
+5. **Trusted Hosts**: Configurable host validation
+
+### Monitoring
+
+- **Health Check**: `GET /health` — basic health status
+- **Readiness**: `GET /ready` — model loading + orchestrator status
+- **Metrics**: `GET /metrics` — processing counters and timings
+- **Structured Logging**: JSON-formatted logs for log aggregation
 
 ## Migration Notes
 
@@ -262,9 +357,17 @@ The `ocrmypdf-rapidocr` plugin supports single-language codes:
 
 - **Entry point**: `worker.py` → `main.py`
 - **Default mode**: Combined (folder + API). Use `--mode folder` for folder-only behavior.
-- **Docling**: The external Docling service is deprecated. Sidecar generation is handled by the integrated PaddleOCR-VL model (Phase 4).
-- **Configuration**: All existing environment variables are supported. New variables added for API and pipeline control.
-- **Backward compatibility**: The folder watcher behavior is identical to v1. The API is an addition, not a replacement.
+- **Docling**: The external Docling service has been replaced by integrated PaddleOCR-VL.
+- **Configuration**: All existing environment variables are supported. New variables added for PaddleOCR control.
+- **Backward compatibility**: The folder watcher behavior is identical to v1. The API is an addition.
+
+### From v2 (RapidOCR) to v3 (PaddleOCR-VL)
+
+- **OCR Engine**: RapidOCR → PaddleOCR (PP-OCRv6 + PaddleOCR-VL)
+- **Model Loading**: PaddleOCR models are pre-downloaded at build time
+- **Document Understanding**: PaddleOCR-VL provides layout analysis, table detection, and formula recognition
+- **Markdown Output**: Generated by PaddleOCR-VL instead of Docling API
+- **Docker Image**: Larger due to PaddlePaddle + PaddleOCR-VL models (~2-3 GB)
 
 ## License
 

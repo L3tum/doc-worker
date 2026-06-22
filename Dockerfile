@@ -1,5 +1,5 @@
 # =============================================================================
-# Doc-Worker — Dockerfile
+# Doc-Worker — Dockerfile (Phase 4-6: PaddleOCR-VL)
 # =============================================================================
 # Multi-stage: CPU (default) or GPU build.
 #
@@ -46,7 +46,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/pip3 /usr/bin/pip
 
 # OpenVINO base (Intel GPU/CPU)
-# OpenVINO EP is provided by pip (onnxruntime-openvino), no system package needed.
 FROM python:3.12-slim-bookworm AS base-openvino
 
 # ROCm base (AMD GPU)
@@ -58,7 +57,6 @@ FROM base-${ONNX_RUNTIME} AS base
 ARG ONNX_RUNTIME=cpu
 
 # Ubuntu 24.04 (CUDA base) enforces PEP 668 — allow pip to install system-wide.
-# Safe here: this is a container, not a host system.
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
 # ---------------------------------------------------------------------------
@@ -69,8 +67,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ghostscript \
     fonts-dejavu \
     fonts-noto-cjk \
-    # PDF processing helpers — tesseract-ocr required by OCRmyPDF at import time
-    qpdf libgl1 tesseract-ocr \
+    # PDF processing helpers
+    qpdf libgl1 \
+    # PaddleOCR dependencies
+    libgomp1 \
+    libopenblas0 \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -83,7 +84,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Swap in GPU runtime if requested
 # NOTE: onnxruntime-gpu >=1.27 requires CUDA 13 (libcudart.so.13), but our
 # base image (nvidia/cuda:12.8.1) only provides CUDA 12. Pin to <1.27 to keep
-# CUDA 12 compatibility. See: https://github.com/microsoft/onnxruntime/releases
+# CUDA 12 compatibility.
 RUN if [ "$ONNX_RUNTIME" = "cuda" ]; then \
       pip install --no-cache-dir 'onnxruntime-gpu<1.27'; \
     elif [ "$ONNX_RUNTIME" = "openvino" ]; then \
@@ -99,25 +100,35 @@ WORKDIR /app
 COPY . .
 
 # ---------------------------------------------------------------------------
-# Pre-download RapidOCR models (avoids first-run download delay / offline fail)
-# Use the OCRmyPDF plugin helper so model selection matches runtime behavior:
-# German maps to RapidOCR's Latin recognition model.
-#
-# Force CPU runtime during pre-download so this works on all build variants
-# (CUDA/OpenVINO/ROCm libs are not available at Docker build time).
+# Pre-download PaddleOCR models (avoids first-run download delay / offline fail)
 # ---------------------------------------------------------------------------
-RUN OCR_RUNTIME=cpu python -c \
-      "from ocrmypdf_rapidocr.engine import get_rapidocr_engine; get_rapidocr_engine('deu', None)"
+RUN python -c " \
+import os; \
+os.environ['PADDLE_DEVICE'] = 'cpu'; \
+try: \
+    from paddleocr import PaddleOCR; \
+    ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False, use_gpu=False); \
+    print('PP-OCR models pre-downloaded successfully'); \
+except Exception as e: \
+    print(f'PP-OCR pre-download skipped: {e}'); \
+"
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label
 # ---------------------------------------------------------------------------
 LABEL onnx-runtime="${ONNX_RUNTIME}"
+LABEL paddle-ocr="pp-ocr-v6 + paddleocr-vl"
 
 # ---------------------------------------------------------------------------
 # Expose API port
 # ---------------------------------------------------------------------------
 EXPOSE 8000
+
+# ---------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
 
 # ---------------------------------------------------------------------------
 # Entrypoint — unified pipeline (combined mode: folder + API)

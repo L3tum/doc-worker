@@ -8,6 +8,8 @@ Entry point for the refactored doc-worker. Supports two modes:
 - API server: HTTP endpoint for on-demand processing
 - Both: run folder watcher + API server concurrently
 
+Phase 4: PaddleOCR-VL integration replaces RapidOCR as the primary OCR engine.
+
 Usage:
     python main.py              # folder watcher + API
     python main.py --mode folder  # folder watcher only
@@ -60,13 +62,13 @@ def run_folder_mode(orchestrator: Orchestrator) -> None:
     recover_leftover_files(config)
 
     orchestrator.start()
-    adapter = FolderWatcherAdapter(orchestrator)
 
     logger.info("Entering folder watcher mode...")
 
     while True:
         try:
             # Find and submit new files
+            adapter = FolderWatcherAdapter(orchestrator)
             adapter._poll()
 
             # Process queued jobs
@@ -135,11 +137,11 @@ def run_combined_mode(orchestrator: Orchestrator) -> None:
     logger.info(f"API server started on {config.API_HOST}:{config.API_PORT}")
 
     # Run folder watcher in main thread
-    adapter = FolderWatcherAdapter(orchestrator)
     logger.info("Entering combined mode (folder + API)...")
 
     while True:
         try:
+            adapter = FolderWatcherAdapter(orchestrator)
             adapter._poll()
 
             while orchestrator.can_accept and orchestrator.queue_size > 0:
@@ -154,6 +156,19 @@ def run_combined_mode(orchestrator: Orchestrator) -> None:
             logger.error(f"Main loop error: {exc}")
 
         time.sleep(config.POLL_INTERVAL)
+
+
+# ---------------------------------------------------------------------------
+# Signal handling
+# ---------------------------------------------------------------------------
+
+_shutdown_event = threading.Event()
+
+
+def _signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    get_logger("doc-worker.main").info(f"Received signal {signum}, shutting down...")
+    _shutdown_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -175,19 +190,26 @@ def main() -> None:
     config = get_config()
     logger = get_logger("doc-worker.main")
 
+    # Register signal handlers
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     logger.info("=" * 60)
-    logger.info("Doc-Worker starting")
-    logger.info(f"  Mode:        {args.mode}")
-    logger.info(f"  INBOX:       {config.INBOX}")
-    logger.info(f"  PROCESSING:  {config.PROCESSING}")
-    logger.info(f"  DONE:        {config.DONE}")
-    logger.info(f"  ERROR:       {config.ERROR}")
-    logger.info(f"  DOCLING_OUT: {config.DOCLING_OUT}")
-    logger.info(f"  PAPERLESS:   {config.PAPERLESS_CONSUME}")
-    logger.info(f"  OCR_LANG:    {config.OCR_LANG}")
-    logger.info(f"  OCR_RUNTIME: {config.OCR_RUNTIME}")
-    logger.info(f"  API:         {config.API_HOST}:{config.API_PORT}")
-    logger.info(f"  MAX_RETRIES: {config.MAX_RETRIES}")
+    logger.info("Doc-Worker starting (Phase 4: PaddleOCR-VL)")
+    logger.info(f"  Mode:            {args.mode}")
+    logger.info(f"  INBOX:           {config.INBOX}")
+    logger.info(f"  PROCESSING:      {config.PROCESSING}")
+    logger.info(f"  DONE:            {config.DONE}")
+    logger.info(f"  ERROR:           {config.ERROR}")
+    logger.info(f"  OUTPUT_DIR:      {config.OUTPUT_DIR}")
+    logger.info(f"  PAPERLESS:       {config.PAPERLESS_CONSUME}")
+    logger.info(f"  OCR_LANG:        {config.OCR_LANG}")
+    logger.info(f"  OCR_RUNTIME:     {config.OCR_RUNTIME}")
+    logger.info(f"  PROCESSING_MODE: {config.PROCESSING_MODE}")
+    logger.info(f"  PADDLE_OCR_LANG: {config.PADDLE_OCR_LANG}")
+    logger.info(f"  PADDLE_VL_MODEL: {config.PADDLE_VL_MODEL}")
+    logger.info(f"  API:             {config.API_HOST}:{config.API_PORT}")
+    logger.info(f"  MAX_RETRIES:     {config.MAX_RETRIES}")
     logger.info("=" * 60)
 
     # Build orchestrator

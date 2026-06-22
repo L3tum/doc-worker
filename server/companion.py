@@ -9,6 +9,8 @@ Provides:
 - Model lifecycle (lazy-loading, inference abstraction)
 - File I/O abstraction (filesystem / in-memory)
 - Metrics tracking
+
+Phase 4: PaddleOCR-VL integration replaces RapidOCR as the primary OCR engine.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ class Config:
     PROCESSING: Path = Path("/work/processing")
     DONE: Path = Path("/work/done")
     ERROR: Path = Path("/work/error")
-    DOCLING_OUT: Path = Path("/work/docling")
+    OUTPUT_DIR: Path = Path("/work/output")
     PAPERLESS_CONSUME: Path = Path("/paperless-consume")
 
     # OCR settings
@@ -47,6 +49,15 @@ class Config:
 
     # Processing mode
     PROCESSING_MODE: str = "auto"  # auto | pp_ocr | paddle_vl
+
+    # PaddleOCR settings
+    PADDLE_OCR_USE_ANGLE: bool = True
+    PADDLE_OCR_USE_DLL: bool = False  # Differential evolution for layout
+    PADDLE_OCR_USE_DB: bool = True    # Detection algorithm
+    PADDLE_OCR_USE_REC: bool = True   # Recognition
+    PADDLE_OCR_LANG: str = "ch"       # ch | en | french | german | japan | korean
+    PADDLE_VL_MODEL: str = "PaddleOCR-VL-1.5B"  # Default VL model
+    PADDLE_DEVICE: str = ""           # auto | cpu | gpu | xpu
 
     # Pipeline settings
     POLL_INTERVAL: int = 5
@@ -61,10 +72,6 @@ class Config:
     API_PORT: int = 8000
     API_ENABLED: bool = True
 
-    # Docling (legacy compatibility)
-    DOCLING_BASE_URL: str = ""
-    DOCLING_MODE: str = "off"
-
     # Logging
     LOG_LEVEL: str = "INFO"
     LOG_JSON: bool = True
@@ -76,7 +83,7 @@ class Config:
 
         # Directory paths
         for attr in ("INBOX", "PROCESSING", "DONE", "ERROR",
-                      "DOCLING_OUT", "PAPERLESS_CONSUME"):
+                      "OUTPUT_DIR", "PAPERLESS_CONSUME"):
             val = os.getenv(attr)
             if val:
                 setattr(config, attr, Path(val))
@@ -87,6 +94,15 @@ class Config:
 
         # Processing mode
         config.PROCESSING_MODE = os.getenv("PROCESSING_MODE", "auto")
+
+        # PaddleOCR settings
+        config.PADDLE_OCR_USE_ANGLE = os.getenv("PADDLE_OCR_USE_ANGLE", "true").lower() == "true"
+        config.PADDLE_OCR_USE_DLL = os.getenv("PADDLE_OCR_USE_DLL", "false").lower() == "true"
+        config.PADDLE_OCR_USE_DB = os.getenv("PADDLE_OCR_USE_DB", "true").lower() == "true"
+        config.PADDLE_OCR_USE_REC = os.getenv("PADDLE_OCR_USE_REC", "true").lower() == "true"
+        config.PADDLE_OCR_LANG = os.getenv("PADDLE_OCR_LANG", "ch")
+        config.PADDLE_VL_MODEL = os.getenv("PADDLE_VL_MODEL", "PaddleOCR-VL-1.5B")
+        config.PADDLE_DEVICE = os.getenv("PADDLE_DEVICE", "auto")
 
         # Pipeline settings
         config.POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
@@ -101,10 +117,6 @@ class Config:
         config.API_PORT = int(os.getenv("API_PORT", "8000"))
         config.API_ENABLED = os.getenv("API_ENABLED", "true").lower() != "false"
 
-        # Docling (legacy)
-        config.DOCLING_BASE_URL = os.getenv("DOCLING_BASE_URL", "")
-        config.DOCLING_MODE = os.getenv("DOCLING_MODE", "off")
-
         # Logging
         config.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
         config.LOG_JSON = os.getenv("LOG_JSON", "true").lower() == "true"
@@ -114,7 +126,7 @@ class Config:
     def ensure_directories(self) -> None:
         """Create all required directories."""
         for path in (self.INBOX, self.PROCESSING, self.DONE,
-                      self.ERROR, self.DOCLING_OUT, self.PAPERLESS_CONSUME):
+                      self.ERROR, self.OUTPUT_DIR, self.PAPERLESS_CONSUME):
             path.mkdir(parents=True, exist_ok=True)
 
 
@@ -228,18 +240,31 @@ class Metrics:
 
 
 # ---------------------------------------------------------------------------
-# Model Lifecycle
+# Model Lifecycle — PaddleOCR-VL Integration
 # ---------------------------------------------------------------------------
 
 class ModelManager:
     """Manages PaddleOCR model lifecycle.
 
-    Handles lazy-loading, warm-up, and provides a unified inference interface.
+    Handles lazy-loading, warm-up, and provides a unified inference interface
+    for both PP-OCRv6 (text recognition) and PaddleOCR-VL (document understanding).
+
+    Architecture:
+    - PP-OCRv6: Detection (DB) + Recognition (CRNN/SVTR) for text extraction
+    - PaddleOCR-VL: Vision-Language model for layout analysis, table detection,
+      formula recognition, and markdown generation
+
+    The model selection is driven by PROCESSING_MODE config:
+    - "auto": Use PP-OCR for text, PaddleOCR-VL for complex documents
+    - "pp_ocr": Use only PP-OCRv6 (fast, text-only)
+    - "paddle_vl": Use PaddleOCR-VL for full document understanding
     """
 
     def __init__(self, config: Config):
         self.config = config
-        self._model = None
+        self._pp_ocr_engine = None
+        self._vl_model = None
+        self._vl_processor = None
         self._model_type: str | None = None
         self._loaded = False
         self._logger = get_logger("doc-worker.model")
@@ -249,11 +274,11 @@ class ModelManager:
         return self._loaded
 
     def load(self, model_type: str | None = None) -> None:
-        """Load the specified model.
+        """Load the specified model(s).
 
         Args:
-            model_type: "pp_ocr" for PP-OCRv6, "paddle_vl" for PaddleOCR-VL.
-                        If None, uses config.PROCESSING_MODE.
+            model_type: "pp_ocr" for PP-OCRv6, "paddle_vl" for PaddleOCR-VL,
+                        or "auto" for both. If None, uses config.PROCESSING_MODE.
         """
         if self._loaded:
             if model_type and model_type != self._model_type:
@@ -264,73 +289,406 @@ class ModelManager:
             return
 
         start = time.time()
-        self._logger.info(f"Loading model: {model_type or self.config.PROCESSING_MODE}")
+        effective_type = model_type or self.config.PROCESSING_MODE
+        self._logger.info(f"Loading model(s): {effective_type}")
 
         try:
-            self._model_type = model_type or self.config.PROCESSING_MODE
-            self._model = self._load_model(self._model_type)
+            self._model_type = effective_type
+
+            # Always load PP-OCR for text recognition
+            self._load_pp_ocr()
+
+            # Load PaddleOCR-VL if needed
+            if effective_type in ("paddle_vl", "auto"):
+                self._load_paddle_vl()
+
             self._loaded = True
             load_time = time.time() - start
-            self._logger.info(f"Model loaded in {load_time:.2f}s: {self._model_type}")
+            self._logger.info(f"All models loaded in {load_time:.2f}s: {self._model_type}")
+
+            # Record metrics
+            metrics = get_metrics()
+            metrics.model_load_time = load_time
+
         except Exception as exc:
-            self._logger.error(f"Failed to load model: {exc}")
+            self._logger.error(f"Failed to load model(s): {exc}")
             raise
 
-    def _load_model(self, model_type: str) -> Any:
-        """Load the actual model. Returns the model instance."""
-        # This is a placeholder that will be filled in during Phase 4
-        # when we integrate the actual PaddleOCR models.
-        # For now, it returns a mock that can be replaced.
-        if model_type == "paddle_vl":
-            self._logger.info("PaddleOCR-VL integration pending (Phase 4)")
-            return None
-        elif model_type == "pp_ocr":
-            self._logger.info("PP-OCRv6 integration pending (Phase 4)")
-            return None
-        else:
-            self._logger.info(f"Using auto mode (model type: {model_type})")
-            return None
+    def _load_pp_ocr(self) -> None:
+        """Load PP-OCRv6 engine for text detection and recognition."""
+        self._logger.info("Loading PP-OCRv6 engine...")
 
-    def infer(self, input_data: bytes | Path, ctx: JobContext) -> dict[str, Any]:
-        """Run inference on the given input.
+        try:
+            from paddleocr import PaddleOCR
+
+            # Map our language codes to PaddleOCR language codes
+            lang_map = {
+                "deu": "german",
+                "eng": "en",
+                "fra": "french",
+                "spa": "spanish",
+                "ita": "italian",
+                "por": "portuguese",
+                "nld": "dutch",
+                "pol": "polish",
+                "ch_sim": "ch",
+                "jpn": "japan",
+                "kor": "korean",
+                "ch": "ch",
+            }
+            paddle_lang = lang_map.get(self.config.OCR_LANG, self.config.OCR_LANG)
+
+            # Determine device
+            device = self._resolve_device()
+
+            self._pp_ocr_engine = PaddleOCR(
+                use_angle_cls=self.config.PADDLE_OCR_USE_ANGLE,
+                use_doc_unwarping=False,
+                use_dll=self.config.PADDLE_OCR_USE_DLL,
+                use_db=self.config.PADDLE_OCR_USE_DB,
+                use_rec=self.config.PADDLE_OCR_USE_REC,
+                lang=paddle_lang,
+                show_log=False,
+                use_gpu="gpu" in device.lower(),
+                device=device,
+            )
+
+            self._logger.info(f"PP-OCRv6 loaded (lang={paddle_lang}, device={device})")
+
+        except ImportError:
+            self._logger.warning(
+                "paddleocr not installed. PP-OCR will be unavailable. "
+                "Install with: pip install paddleocr paddlepaddle"
+            )
+            self._pp_ocr_engine = None
+        except Exception as exc:
+            self._logger.error(f"Failed to load PP-OCR: {exc}")
+            self._pp_ocr_engine = None
+
+    def _load_paddle_vl(self) -> None:
+        """Load PaddleOCR-VL model for document understanding."""
+        self._logger.info(f"Loading PaddleOCR-VL model: {self.config.PADDLE_VL_MODEL}")
+
+        try:
+            from modelscope import snapshot_download
+            from transformers import AutoModel, AutoProcessor
+
+            # Download model from ModelScope
+            model_dir = snapshot_download(
+                self.config.PADDLE_VL_MODEL,
+                cache_dir="/root/.cache/modelscope",
+            )
+
+            device = self._resolve_device()
+
+            self._vl_model = AutoModel.from_pretrained(
+                model_dir,
+                trust_remote_code=True,
+            ).eval()
+
+            self._vl_processor = AutoProcessor.from_pretrained(
+                model_dir,
+                trust_remote_code=True,
+            )
+
+            # Move model to device
+            if "gpu" in device.lower():
+                self._vl_model = self._vl_model.cuda()
+
+            self._logger.info(
+                f"PaddleOCR-VL loaded (model={self.config.PADDLE_VL_MODEL}, "
+                f"device={device})"
+            )
+
+        except ImportError:
+            self._logger.warning(
+                "transformers/modelscope not installed. PaddleOCR-VL will be unavailable. "
+                "Install with: pip install transformers modelscope"
+            )
+            self._vl_model = None
+            self._vl_processor = None
+        except Exception as exc:
+            self._logger.error(f"Failed to load PaddleOCR-VL: {exc}")
+            self._vl_model = None
+            self._vl_processor = None
+
+    def _resolve_device(self) -> str:
+        """Resolve the device to use for inference."""
+        if self.config.PADDLE_DEVICE and self.config.PADDLE_DEVICE != "auto":
+            return self.config.PADDLE_DEVICE
+
+        # Auto-detect
+        try:
+            import paddle
+            if paddle.is_compiled_with_cuda():
+                return "gpu"
+        except Exception:
+            pass
+        return "cpu"
+
+    def run_ocr(self, input_data: bytes | Path, ctx: JobContext) -> dict[str, Any]:
+        """Run PP-OCR text detection and recognition.
 
         Args:
             input_data: Either a file path or raw bytes.
             ctx: The job context for tracking results.
 
         Returns:
-            Dict with inference results (text, layout, confidence, etc.)
+            Dict with OCR results (text blocks, bounding boxes, confidence).
         """
         if not self._loaded:
             self.load()
 
         start = time.time()
         try:
-            result = self._run_inference(input_data)
+            result = self._run_pp_ocr(input_data)
             duration = time.time() - start
-            ctx.timings["inference"] = duration
+            ctx.timings["pp_ocr"] = duration
+            self._logger.debug(f"PP-OCR completed in {duration:.2f}s")
             return result
         except Exception as exc:
-            self._logger.error(f"Inference failed: {exc}")
+            self._logger.error(f"PP-OCR failed: {exc}")
             raise
 
-    def _run_inference(self, input_data: bytes | Path) -> dict[str, Any]:
-        """Run the actual inference. Placeholder for Phase 4."""
-        # This will be replaced with actual PaddleOCR inference code
+    def run_vl_understanding(self, input_data: bytes | Path, ctx: JobContext) -> dict[str, Any]:
+        """Run PaddleOCR-VL document understanding.
+
+        Produces:
+        - Structured markdown with layout preservation
+        - Table detection and extraction
+        - Formula recognition
+        - Block-level confidence scores
+
+        Args:
+            input_data: Either a file path or raw bytes.
+            ctx: The job context for tracking results.
+
+        Returns:
+            Dict with VL results (markdown, layout, tables, formulas).
+        """
+        if not self._loaded:
+            self.load()
+
+        if self._vl_model is None or self._vl_processor is None:
+            self._logger.warning("PaddleOCR-VL not available, falling back to PP-OCR only")
+            return self.run_ocr(input_data, ctx)
+
+        start = time.time()
+        try:
+            result = self._run_paddle_vl(input_data)
+            duration = time.time() - start
+            ctx.timings["paddle_vl"] = duration
+            self._logger.debug(f"PaddleOCR-VL completed in {duration:.2f}s")
+            return result
+        except Exception as exc:
+            self._logger.error(f"PaddleOCR-VL failed: {exc}")
+            # Fallback to PP-OCR
+            self._logger.info("Falling back to PP-OCR")
+            return self.run_ocr(input_data, ctx)
+
+    def _run_pp_ocr(self, input_data: bytes | Path) -> dict[str, Any]:
+        """Run PP-OCR inference on the input."""
+        if self._pp_ocr_engine is None:
+            raise RuntimeError("PP-OCR engine not loaded")
+
+        # Write to temp file if bytes
+        import tempfile
+        tmp_path = None
+        if isinstance(input_data, bytes):
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                f.write(input_data)
+                tmp_path = Path(f.name)
+            input_path = str(tmp_path)
+        else:
+            input_path = str(input_data)
+
+        try:
+            results = self._pp_ocr_engine.ocr(input_path, cls=True)
+
+            # Parse results
+            text_blocks = []
+            full_text = []
+
+            if results and results[0]:
+                for line in results[0]:
+                    bbox = line[0]  # bounding box
+                    text = line[1][0]  # recognized text
+                    confidence = line[1][1]  # confidence score
+
+                    text_blocks.append({
+                        "text": text,
+                        "bbox": bbox,
+                        "confidence": confidence,
+                    })
+                    full_text.append(text)
+
+            return {
+                "text": "\n".join(full_text),
+                "text_blocks": text_blocks,
+                "block_count": len(text_blocks),
+                "avg_confidence": (
+                    sum(b["confidence"] for b in text_blocks) / len(text_blocks)
+                    if text_blocks else 0.0
+                ),
+                "model": "pp_ocr",
+            }
+
+        finally:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink()
+
+    def _run_paddle_vl(self, input_data: bytes | Path) -> dict[str, Any]:
+        """Run PaddleOCR-VL inference for document understanding."""
+        if self._vl_model is None or self._vl_processor is None:
+            raise RuntimeError("PaddleOCR-VL model not loaded")
+
+        import torch
+        import tempfile
+        from PIL import Image
+
+        # Write to temp file if bytes
+        tmp_path = None
+        if isinstance(input_data, bytes):
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                f.write(input_data)
+                tmp_path = Path(f.name)
+            image_path = str(tmp_path)
+        else:
+            image_path = str(input_data)
+
+        try:
+            # Load image
+            image = Image.open(image_path).convert("RGB")
+
+            # Build prompt for document understanding
+            system_prompt = (
+                "You are a document analysis assistant. Analyze the document and "
+                "return structured markdown output. Include:\n"
+                "1. Document title and headings\n"
+                "2. Body text with proper formatting\n"
+                "3. Tables in markdown table format\n"
+                "4. Lists with proper indentation\n"
+                "5. Mathematical formulas in LaTeX format\n"
+                "6. Footnotes and references\n\n"
+                "Preserve the document structure and formatting as much as possible."
+            )
+
+            user_prompt = "Please analyze this document and extract its content as structured markdown."
+
+            # Process with VL model
+            inputs = self._vl_processor(
+                image=image,
+                text=user_prompt,
+                system=system_prompt,
+                return_tensors="pt",
+            )
+
+            # Move to device
+            device = next(self._vl_model.parameters()).device
+            inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                      for k, v in inputs.items()}
+
+            # Generate
+            with torch.no_grad():
+                outputs = self._vl_model.generate(
+                    **inputs,
+                    max_new_tokens=4096,
+                    do_sample=False,
+                    temperature=0.1,
+                )
+
+            # Decode response
+            response = self._vl_processor.decode(
+                outputs[0],
+                skip_special_tokens=True,
+            )
+
+            # Parse the response into structured components
+            parsed = self._parse_vl_response(response)
+
+            return {
+                "markdown": parsed["markdown"],
+                "layout": parsed["layout"],
+                "tables": parsed["tables"],
+                "formulas": parsed["formulas"],
+                "text": parsed["plain_text"],
+                "confidence": parsed.get("confidence", 0.9),
+                "model": "paddle_vl",
+            }
+
+        finally:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink()
+
+    def _parse_vl_response(self, response: str) -> dict[str, Any]:
+        """Parse the VL model response into structured components."""
+        import re
+
+        markdown = response
+        plain_text = re.sub(r'[#*\-\[\]`_~>]', '', response).strip()
+
+        # Extract tables
+        tables = []
+        table_pattern = r'\|.*\|\n\|[-\s|:]+\|.*(?:\n\|.*\|)*'
+        for match in re.finditer(table_pattern, response):
+            tables.append(match.group())
+
+        # Extract formulas (LaTeX)
+        formulas = []
+        formula_pattern = r'(?:(?:\$)(.*?)(?:\$)|(?:\$\$)(.*?)(?:\$\$))'
+        for match in re.finditer(formula_pattern, response):
+            formulas.append(match.group(1) or match.group(2))
+
+        # Extract layout blocks
+        layout = []
+        heading_pattern = r'^(#{1,6}\s+.+)$'
+        for i, line in enumerate(response.split('\n')):
+            if re.match(heading_pattern, line):
+                layout.append({
+                    "type": "heading",
+                    "level": len(re.match(r'^(#+)', line).group()),
+                    "text": line.lstrip('# ').strip(),
+                    "line": i,
+                })
+            elif line.strip().startswith('|') and '|' in line:
+                layout.append({
+                    "type": "table",
+                    "line": i,
+                })
+            elif line.strip().startswith('- ') or line.strip().startswith('* '):
+                layout.append({
+                    "type": "list_item",
+                    "text": line.strip()[2:],
+                    "line": i,
+                })
+
         return {
-            "text": "",
-            "layout": [],
-            "confidence": 0.0,
-            "model": self._model_type,
+            "markdown": markdown,
+            "plain_text": plain_text,
+            "tables": tables,
+            "formulas": formulas,
+            "layout": layout,
         }
 
     def unload(self) -> None:
-        """Unload the model and free resources."""
+        """Unload all models and free resources."""
         if self._loaded:
-            self._model = None
+            self._pp_ocr_engine = None
+            self._vl_model = None
+            self._vl_processor = None
             self._model_type = None
             self._loaded = False
-            self._logger.info("Model unloaded")
+            self._logger.info("All models unloaded")
+
+            # Force garbage collection for GPU memory
+            import gc
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +743,8 @@ class HealthStatus:
     status: str = "healthy"  # healthy | degraded | unhealthy
     ready: bool = True
     model_loaded: bool = False
+    pp_ocr_loaded: bool = False
+    vl_model_loaded: bool = False
     uptime: float = 0.0
     metrics: dict[str, Any] = field(default_factory=dict)
 
@@ -430,6 +790,8 @@ def get_health() -> HealthStatus:
         status="healthy",
         ready=True,
         model_loaded=model_mgr.is_loaded,
+        pp_ocr_loaded=model_mgr._pp_ocr_engine is not None,
+        vl_model_loaded=model_mgr._vl_model is not None,
         uptime=time.time() - _start_time,
         metrics=get_metrics().summary(),
     )
@@ -444,3 +806,4 @@ def init_companion() -> None:
     logger.info(f"Config: INBOX={config.INBOX}, PROCESSING={config.PROCESSING}, "
                 f"DONE={config.DONE}, ERROR={config.ERROR}")
     logger.info(f"OCR_RUNTIME={config.OCR_RUNTIME}, PROCESSING_MODE={config.PROCESSING_MODE}")
+    logger.info(f"PADDLE_OCR_LANG={config.PADDLE_OCR_LANG}, PADDLE_VL_MODEL={config.PADDLE_VL_MODEL}")
