@@ -123,7 +123,7 @@ class FolderWatcherAdapter:
         if not self.config.INBOX.exists():
             return []
 
-        files = set()
+        files: set[Path] = set()
         for ext in self.SUPPORTED_EXTENSIONS:
             files.update(self.config.INBOX.glob(f"*{ext}"))
 
