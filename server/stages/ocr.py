@@ -66,7 +66,9 @@ def ocr(job: Job, ctx: JobContext) -> JobContext:
             result = _run_paddle_ocr_pipeline(content, filename, ctx, config)
             ctx.outputs.ocr_pdf = cast(bytes | None, result.get("pdf"))
             ctx.outputs.markdown = cast(str | None, result.get("markdown"))
-            ctx.outputs.json_metadata = cast(dict[str, Any] | None, result.get("metadata"))
+            ctx.outputs.json_metadata = cast(
+                dict[str, Any] | None, result.get("metadata")
+            )
 
             logger.info(f"OCR complete: {filename}")
 
