@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from server.companion import (
     get_config,
@@ -100,7 +100,7 @@ async def health() -> dict[str, Any]:
 
 
 @app.get("/ready")
-async def ready() -> dict[str, Any]:
+async def ready() -> Response:
     """Readiness check endpoint.
 
     Returns detailed readiness status including model loading state.
@@ -112,12 +112,12 @@ async def ready() -> dict[str, Any]:
     except HTTPException:
         pass
 
-    ready = health_status.ready and orchestrator is not None
+    is_ready = health_status.ready and orchestrator is not None
 
     return JSONResponse(
-        status_code=200 if ready else 503,
+        status_code=200 if is_ready else 503,
         content={
-            "ready": ready,
+            "ready": is_ready,
             "model_loaded": health_status.model_loaded,
             "pp_ocr_loaded": getattr(health_status, "pp_ocr_loaded", False),
             "vl_model_loaded": getattr(health_status, "vl_model_loaded", False),
