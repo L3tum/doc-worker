@@ -220,23 +220,28 @@ def _extract_text_from_pdf(content: bytes) -> str:
     Uses PyPDF2/pypdf for text extraction.
     """
     try:
-        try:
-            from pypdf import PdfReader as _PdfReader
-        except ImportError:
-            try:
-                from PyPDF2 import PdfReader as _PdfReader
-            except ImportError:
-                _PdfReader = None  # type: ignore[assignment]
-
         import io
 
-        if _PdfReader is None:
+        # Import PdfReader from whichever library is available
+        # Use distinct aliases to avoid mypy no-redef
+        pdf_reader_cls: type | None = None
+        try:
+            from pypdf import PdfReader as _PypdfReader
+            pdf_reader_cls = _PypdfReader
+        except ImportError:
+            try:
+                from PyPDF2 import PdfReader as _Pypdf2Reader
+                pdf_reader_cls = _Pypdf2Reader
+            except ImportError:
+                pass
+
+        if pdf_reader_cls is None:
             get_logger("doc-worker.stages.ocr").warning(
                 "pypdf/PyPDF2 not installed, cannot extract text from PDF"
             )
             return ""
 
-        reader = _PdfReader(io.BytesIO(content))
+        reader = pdf_reader_cls(io.BytesIO(content))
         text_parts: list[str] = []
         for page in reader.pages:
             page_text = page.extract_text()
