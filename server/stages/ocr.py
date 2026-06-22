@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import Any, cast
 
 from server.companion import (
     FileIO,
@@ -63,9 +64,9 @@ def ocr(job: Job, ctx: JobContext) -> JobContext:
         elif ctx.processing_mode in (ProcessingMode.FULL_OCR, ProcessingMode.OVERLAY):
             # Run PaddleOCR pipeline
             result = _run_paddle_ocr_pipeline(content, filename, ctx, config)
-            ctx.outputs.ocr_pdf = result.get("pdf")
-            ctx.outputs.markdown = result.get("markdown")
-            ctx.outputs.json_metadata = result.get("metadata")
+            ctx.outputs.ocr_pdf = cast(bytes | None, result.get("pdf"))
+            ctx.outputs.markdown = cast(str | None, result.get("markdown"))
+            ctx.outputs.json_metadata = cast(dict[str, Any] | None, result.get("metadata"))
 
             logger.info(f"OCR complete: {filename}")
 
@@ -89,7 +90,7 @@ def ocr(job: Job, ctx: JobContext) -> JobContext:
 
 def _run_paddle_ocr_pipeline(
     content: bytes, filename: str, ctx: JobContext, config
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """Run the PaddleOCR pipeline.
 
     Steps:
@@ -218,13 +219,13 @@ def _extract_text_from_pdf(content: bytes) -> str:
     """
     try:
         try:
-            from pypdf import PdfReader
+            from pypdf import PdfReader as _PdfReader
         except ImportError:
-            from PyPDF2 import PdfReader
+            from PyPDF2 import PdfReader as _PdfReader
 
         import io
 
-        reader = PdfReader(io.BytesIO(content))
+        reader = _PdfReader(io.BytesIO(content))
         text_parts = []
         for page in reader.pages:
             page_text = page.extract_text()
