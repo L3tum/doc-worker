@@ -102,16 +102,16 @@ COPY . .
 # ---------------------------------------------------------------------------
 # Pre-download PaddleOCR models (avoids first-run download delay / offline fail)
 # ---------------------------------------------------------------------------
-RUN python -c " \
-import os; \
-os.environ['PADDLE_DEVICE'] = 'cpu'; \
-try: \
-    from paddleocr import PaddleOCR; \
-    ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False, use_gpu=False); \
-    print('PP-OCR models pre-downloaded successfully'); \
-except Exception as e: \
-    print(f'PP-OCR pre-download skipped: {e}'); \
-"
+RUN python3 << 'PYEOF'
+import os
+os.environ['PADDLE_DEVICE'] = 'cpu'
+try:
+    from paddleocr import PaddleOCR
+    ocr = PaddleOCR(use_angle_cls=True, lang='ch', show_log=False, use_gpu=False)
+    print('PP-OCR models pre-downloaded successfully')
+except Exception as e:
+    print(f'PP-OCR pre-download skipped: {e}')
+PYEOF
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label

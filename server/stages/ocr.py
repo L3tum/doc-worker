@@ -227,10 +227,12 @@ def _extract_text_from_pdf(content: bytes) -> str:
         pdf_reader_cls: type | None = None
         try:
             from pypdf import PdfReader as _PypdfReader
+
             pdf_reader_cls = _PypdfReader
         except ImportError:
             try:
                 from PyPDF2 import PdfReader as _Pypdf2Reader
+
                 pdf_reader_cls = _Pypdf2Reader
             except ImportError:
                 pass
