@@ -25,7 +25,7 @@ ARG PADDLE_GPU=cpu
 FROM python:3.12-slim-bookworm AS base-cpu
 
 # CUDA base (NVIDIA GPU)
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS base-cuda
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04@sha256:070f8f2672df1b05b84c0409a5fd1d54ddfd646e5b9d8dee7878131271b563fc AS base-cuda
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 python3.12-venv python3-pip \
