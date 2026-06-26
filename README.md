@@ -3,9 +3,10 @@
 A Docker-based OCR pipeline worker that:
 
 1. **Polls** an inbox directory for new PDF files.
-2. **Runs OCR** using [OCRmyPDF](https://github.com/jbarlow83/OCRmyPDF) with the [RapidOCR](https://github.com/RapidAI/RapidOCR) ONNX plugin via Python API. Tesseract is used for deskewing and image optimization (the RapidOCR plugin handles text recognition).
+2. **Runs OCR** using [OCRmyPDF](https://github.com/jbarlow83/OCRmyPDF) with the [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) plugin via Python API.
 3. **Generates sidecar documents** via the [Docling](https://github.com/DS4SD/docling) API (Markdown + JSON).
 4. **Pushes** the processed PDFs into a [Paperless-ngx](https://paperless-ngx.com/) consume directory.
+5. **Serves a FastAPI endpoint** for on-demand document understanding (Open-WebUI compatible).
 
 ## Architecture
 
@@ -16,51 +17,50 @@ INBOX/*.pdf
   │
   ├─ PROCESSING/
   │   ├─ Docling API  →  sidecar JSON
-  │   ├─ ocrmypdf.ocr() + RapidOCR  →  searchable PDF
+  │   ├─ ocrmypdf.ocr() + PaddleOCR  →  searchable PDF
   │   └─ Push → Paperless consume/
   │
   ├─ DONE/       (successfully processed)
   └─ ERROR/      (failed processing, for inspection)
+
+API Server (port 8000)
+  ├─ GET  /health           — Health check
+  ├─ POST /layout-parsing   — Open-WebUI PaddleOCR-VL endpoint
+  └─ POST /extract          — Direct text extraction (non-Open-WebUI)
 ```
 
 ## Quick Start
 
 ### 1. Build or pull the image
 
-Published image tags are planned as:
+Published image tags:
 
 | Tag | Backend |
 |---|---|
 | `:latest` | CPU default |
 | `:cpu` | CPU explicit |
 | `:cuda` | NVIDIA CUDA |
-| `:openvino` | OpenVINO *(experimental)* |
-| `:rocm` | ROCm *(experimental)* |
 
-Build locally with matching tags:
+Build locally:
 
 ```bash
 # CPU (default)
 docker build -t doc-worker:cpu -t doc-worker:latest .
 
 # CUDA GPU (NVIDIA)
-docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker:cuda .
-
-# OpenVINO (Intel GPU/CPU, experimental)
-docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker:openvino .
-
-# ROCm (AMD GPU, experimental)
-docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker:rocm .
+docker build --build-arg PADDLE_GPU=cuda -t doc-worker:cuda .
 ```
 
 ### 2. Run with Docker Compose
 
-See [`docker-compose.yml`](docker-compose.yml) for a complete example. The minimal setup:
+See [`docker-compose.yml`](docker-compose.yml) for a complete example:
 
 ```yaml
 services:
   doc-worker:
     image: doc-worker
+    ports:
+      - "8000:8000"    # API server
     volumes:
       - ./inbox:/work/inbox
       - ./processing:/work/processing
@@ -69,22 +69,18 @@ services:
       - ./docling:/work/docling
       - ./paperless-consume:/paperless-consume
     environment:
-      - DOCLING_BASE_URL=http://docling:5001
+      - DOCLING_BASE_URL=http://docling:12000
       - DOCLING_MODE=best_effort
       - OCR_LANG=deu
-      - OCR_RUNTIME=cpu
+      - OCR_USE_GPU=false
       - POLL_INTERVAL=5
-      - MAX_RETRIES=3
-      - RETRY_DELAY=10
-    depends_on:
-      - docling
 ```
 
-For **GPU acceleration**, set `OCR_RUNTIME` to match your build and enable the appropriate GPU passthrough:
+For **GPU acceleration (NVIDIA)**:
 
 ```yaml
     environment:
-      - OCR_RUNTIME=cuda
+      - OCR_USE_GPU=true
     deploy:
       resources:
         reservations:
@@ -102,9 +98,30 @@ cp new-document.pdf ./inbox/
 
 The worker will pick it up within `POLL_INTERVAL` seconds.
 
+### 4. Configure Open-WebUI
+
+In Open-WebUI, go to **Admin Settings > Documents**:
+
+1. Set **Content Extraction Engine** to `PaddleOCR-VL`
+2. Set **API Base URL** to `http://doc-worker:8000`
+3. (Optional) Set **API Token** if you configured `PADDLEOCR_VL_TOKEN`
+
+Open-WebUI will call `POST /layout-parsing` with base64-encoded files.
+
+### 5. Direct API access
+
+```bash
+# Health check
+curl http://localhost:8000/health
+
+# Extract text (direct API, non-Open-WebUI)
+curl -X POST http://localhost:8000/extract \
+  -F "file=@document.pdf" | python -m json.tool
+```
+
 ## Configuration
 
-All settings are environment variables:
+### Worker (folder polling)
 
 | Variable | Default | Description |
 |---|---|---|
@@ -114,85 +131,91 @@ All settings are environment variables:
 | `ERROR` | `/work/error` | Failed files (for inspection) |
 | `DOCLING_DIR` | `/work/docling` | Docling sidecar output |
 | `PAPERLESS_CONSUME` | `/paperless-consume` | Paperless-ngx consume directory |
-| `OCR_LANG` | `deu` | OCR language (single language, see note below) |
-| `OCR_RUNTIME` | `cpu` | Inference backend: `cpu`, `cuda`, `openvino`, or `rocm` |
+| `OCR_LANG` | `deu` | OCR language (see [Language Codes](#ocr-language)) |
+| `OCR_USE_GPU` | `false` | Enable GPU acceleration (`true`/`false`) |
 | `POLL_INTERVAL` | `5` | Seconds between inbox polls |
-| `DOCLING_BASE_URL` | `http://docling:5001` | Docling API endpoint |
-| `DOCLING_MODE` | `best_effort` | Docling behavior: `off`, `best_effort`, or `required` (see below) |
-| `DOCLING_TIMEOUT` | `900` | Timeout for Docling API calls (seconds, hardcoded) |
-| `RAPIDOCR_CONFIG` | *(none)* | Optional path to a custom RapidOCR YAML config. If omitted, RapidOCR uses its built-in defaults. |
+| `DOCLING_BASE_URL` | `http://docling:12000` | Docling API endpoint |
+| `DOCLING_MODE` | `best_effort` | Sidecar mode: `off`, `best_effort`, `required`, or `native` |
+| `DOCLING_TIMEOUT` | `900` | Docling API timeout (seconds) |
 | `MAX_RETRIES` | `3` | Max OCR retry attempts |
 | `RETRY_DELAY` | `10` | Seconds between OCR retries |
+| `PADDLEOCR_VL_TOKEN` | *(none)* | Bearer token for `/layout-parsing` and `/extract` auth (Open-WebUI) |
+| `PADDLEOCR_MODELS` | `/app/models` | Path to pre-downloaded PaddleOCR model dirs |
+| `MAX_REQUEST_SIZE` | `104857600` | Max request body size in bytes (100 MB default) |
 
 ### Build Arguments
 
 | Argument | Default | Description |
 |---|---|---|
-| `ONNX_RUNTIME` | `cpu` | ONNX Runtime variant (see [Runtime Backends](#runtime-backends)) |
+| `PADDLE_GPU` | `cpu` | PaddlePaddle variant: `cpu` or `cuda` |
 
-## Runtime Backends
+## API Endpoints
 
-The worker supports four image/runtime variants, selected via the `ONNX_RUNTIME` build arg and `OCR_RUNTIME` runtime env var:
+### `GET /health`
 
-| Backend | Image Tag | Build Arg | Env Var | Hardware | Package | Status |
-|---|---|---|---|---|---|---|
-| **CPU** | `:latest`, `:cpu` | `cpu` | `cpu` | Any CPU | `onnxruntime` | Supported default |
-| **CUDA** | `:cuda` | `cuda` | `cuda` | NVIDIA GPU | `onnxruntime-gpu` | Supported via RapidOCR `use_cuda` |
-| **OpenVINO** | `:openvino` | `openvino` | `openvino` | Intel GPU/CPU | `onnxruntime-openvino` | **Experimental** |
-| **ROCm** | `:rocm` | `rocm` | `rocm` | AMD GPU | `onnxruntime-rocm` | **Experimental** |
-
-The worker **auto-detects** ONNX Runtime provider availability at startup. If the requested provider is not available, it falls back to CPU with a warning.
-
-Implementation notes:
-
-- CPU uses ONNX Runtime's `CPUExecutionProvider`.
-- CUDA uses RapidOCR's supported `EngineConfig.onnxruntime.use_cuda` setting.
-- OpenVINO and ROCm are experimental because RapidOCR's ONNX Runtime wrapper does not currently expose first-class config toggles for `OpenVINOExecutionProvider` or `ROCMExecutionProvider`. The worker sets `RAPIDOCR_ONNXRUNTIME_PROVIDER` internally and patches RapidOCR provider ordering so ONNX Runtime receives the requested provider before CPU fallback.
-
-### CUDA (NVIDIA)
-
-Requires the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host. Uses CUDA 12.8.1 with cuDNN because current ONNX Runtime GPU PyPI wheels require CUDA 12.x and cuDNN 9.x.
-
-```yaml
-environment:
-  - OCR_RUNTIME=cuda
-deploy:
-  resources:
-    reservations:
-      devices:
-        - driver: nvidia
-          count: 1
-          capabilities: [gpu]
+Health check. Returns:
+```json
+{"status": "ok", "ocr_lang": "deu", "paddleocr_lang": "german", "gpu": false}
 ```
 
-### OpenVINO (Intel, experimental)
+### `POST /layout-parsing` (Open-WebUI)
 
-Targets ONNX Runtime's `OpenVINOExecutionProvider`. Works with supported Intel integrated GPUs (iGPU), discrete GPUs (Arc), and CPUs. No special Docker runtime is usually needed, but device access may vary by host.
+The endpoint Open-WebUI calls when PaddleOCR-VL is selected as Content Extraction Engine.
 
-```yaml
-image: doc-worker:openvino
-environment:
-  - OCR_RUNTIME=openvino
+**Request:**
+```http
+POST /layout-parsing
+Authorization: Bearer <PADDLEOCR_VL_TOKEN>
+Content-Type: application/json
+
+{
+  "file": "<base64-encoded file bytes>",
+  "fileType": 0,              // 0=PDF, 1=image
+  "useDocOrientationClassify": false,
+  "useDocUnwarping": false,
+  "useChartRecognition": false
+}
 ```
 
-### ROCm (AMD, experimental)
+**Response:**
+```json
+{
+  "result": {
+    "layoutParsingResults": [
+      { "markdown": { "text": "Page 1 extracted text..." } },
+      { "markdown": { "text": "Page 2 extracted text..." } }
+    ]
+  }
+}
+```
 
-Targets ONNX Runtime's `ROCMExecutionProvider`. Requires an AMD GPU with ROCm support and host/device passthrough.
+### `POST /extract` (Direct API)
 
-```yaml
-image: doc-worker:rocm
-environment:
-  - OCR_RUNTIME=rocm
-devices:
-  - /dev/kfd
-  - /dev/dri
+Upload a PDF or image, extract text via PaddleOCR.
+
+**Request:** `multipart/form-data` with field `file`
+**Response:**
+```json
+{
+  "filename": "document.pdf",
+  "pages": [
+    {
+      "page": 1,
+      "text": "Full page text...",
+      "blocks": [
+        {"text": "Line text", "bbox": [x0, y0, x1, y1], "confidence": 0.98}
+      ]
+    }
+  ],
+  "full_text": "All pages concatenated"
+}
 ```
 
 ## Important Notes
 
 ### OCR Language
 
-The `ocrmypdf-rapidocr` plugin currently **does not support multi-language selection** (e.g. `deu+eng`). The `+` separator is a Tesseract convention that RapidOCR does not understand. Set `OCR_LANG` to a **single language code**:
+The `ocrmypdf-paddleocr` plugin supports PaddleOCR language codes:
 
 | Language | Code |
 |---|---|
@@ -204,7 +227,7 @@ The `ocrmypdf-rapidocr` plugin currently **does not support multi-language selec
 | Portuguese | `por` |
 | Dutch | `nld` |
 | Polish | `pol` |
-| Czech | `ces` |
+| Turkish | `tur` |
 | Chinese (Simplified) | `ch_sim` |
 | Chinese (Traditional) | `ch_tra` |
 | Japanese | `jpn` |
@@ -212,48 +235,34 @@ The `ocrmypdf-rapidocr` plugin currently **does not support multi-language selec
 
 ### Pre-downloaded Models
 
-The Docker image ships with **Latin language models** pre-downloaded. If you use a non-Latin language (e.g. Chinese, Japanese, Korean), the first run will download the corresponding models automatically.
+The Docker image ships with **Latin language models** pre-downloaded. Non-Latin languages download on first use.
 
-### Docling Modes
-
-The `DOCLING_MODE` environment variable controls how Docling sidecar generation is handled:
+### Sidecar Modes
 
 | Mode | Behavior |
 |---|---|
-| `best_effort` (default) | Attempt Docling conversion. If it fails, log a warning and continue with OCR + Paperless. |
-| `off` | Skip Docling entirely. No sidecar files are generated. Useful when Docling is not available or not needed. |
-| `required` | Attempt Docling conversion. If it fails, move the file to `/work/error` (treat Docling as a hard requirement). |
-
-**To disable Docling:**
-
-```yaml
-environment:
-  - DOCLING_MODE=off
-```
-
-When Docling runs, it generates Markdown (`.md`) and JSON (`.json`) sidecar files in `/work/docling/<filename>/`.
+| `best_effort` (default) | Attempt Docling API. If it fails, continue with OCR. |
+| `off` | Skip sidecar generation entirely. |
+| `required` | If sidecar generation fails, move to ERROR. |
+| `native` | Use local PaddleOCR instead of the Docling API. Same output format, no external dependency. |
 
 ## Volume Mounts
 
 | Path | Purpose | Required |
-|---|---|
+|---|---|---|
 | `/work/inbox` | Input directory for new PDFs | Yes |
 | `/work/processing` | Temporary staging area | Yes |
-| `/work/done` | Archive of successfully processed files | Yes |
+| `/work/done` | Archive of processed files | Yes |
 | `/work/error` | Failed files for inspection | Yes |
-| `/work/docling` | Docling sidecar output (JSON) | Optional |
+| `/work/docling` | Docling sidecar output | Optional |
 | `/paperless-consume` | Paperless-ngx consume directory | Yes |
 
 ## Error Handling
 
-- **Unstable files**: If a file's size changes during the stability check (default 30 s), it is skipped and retried on the next poll.
-- **Docling failures**: Logged but non-fatal. The pipeline continues with OCR and Paperless ingestion.
-- **OCR failures**: Retried up to `MAX_RETRIES` times with `RETRY_DELAY` seconds between attempts. On final failure, the file is moved to `/work/error`.
-- **Paperless push failures**: The file is moved to `/work/error` for manual inspection.
-
-## Health Check
-
-The container includes a `HEALTHCHECK` that verifies the worker process is still running. Use `docker inspect` or your orchestrator's health monitoring to check status.
+- **Unstable files**: Skipped if size changes during stability check.
+- **Docling failures**: Non-fatal by default (mode=best_effort).
+- **OCR failures**: Retried up to `MAX_RETRIES` times. On final failure → ERROR.
+- **Paperless push failures**: File moved to ERROR.
 
 ## License
 

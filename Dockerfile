@@ -1,37 +1,30 @@
 # =============================================================================
 # Doc-Worker — Dockerfile
 # =============================================================================
-# Multi-stage: CPU (default) or GPU build.
+# Multi-stage: CPU (default) or CUDA (NVIDIA GPU) build.
 #
 # Usage:
 #   CPU (default, tags :latest/:cpu):
 #     docker build -t doc-worker:latest -t doc-worker:cpu .
 #
 #   CUDA GPU (NVIDIA, tag :cuda):
-#     docker build --build-arg ONNX_RUNTIME=cuda -t doc-worker:cuda .
+#     docker build --build-arg PADDLE_GPU=cuda -t doc-worker:cuda .
 #
-#   OpenVINO (Intel GPU/CPU, experimental, tag :openvino):
-#     docker build --build-arg ONNX_RUNTIME=openvino -t doc-worker:openvino .
+# PaddlePaddle handles GPU detection internally. The PADDLE_GPU build arg
+# controls which PaddlePaddle package is installed:
+#   cpu  — paddlepaddle (CPU-only, smallest image)
+#   cuda — paddlepaddle-gpu (NVIDIA GPU, CUDA 12.x)
 #
-#   ROCm (AMD GPU, experimental, tag :rocm):
-#     docker build --build-arg ONNX_RUNTIME=rocm -t doc-worker:rocm .
-#
-# The ONNX_RUNTIME build arg controls the ONNX Runtime package installed:
-#   cpu       — onnxruntime (CPU-only, smallest image)
-#   cuda      — onnxruntime-gpu (CUDA 12.8.1 + cuDNN, NVIDIA GPU)
-#   openvino  — onnxruntime-openvino (Intel GPU/CPU via OpenVINO)
-#   rocm      — onnxruntime-rocm (AMD GPU via ROCm)
+# Note: ROCm (AMD GPU) is not supported — PaddlePaddle's ROCm wheels are only
+# available via their Docker images, not pip.
 # =============================================================================
 
-# ---------------------------------------------------------------------------
-# Select base image based on runtime
-# ---------------------------------------------------------------------------
-ARG ONNX_RUNTIME=cpu
+ARG PADDLE_GPU=cpu
 
 # CPU base (default)
 FROM python:3.12-slim-bookworm AS base-cpu
 
-# CUDA base (NVIDIA GPU) — ONNX Runtime PyPI GPU wheels require CUDA 12.x + cuDNN 9.x.
+# CUDA base (NVIDIA GPU)
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS base-cuda
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -40,17 +33,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && ln -sf /usr/bin/pip3 /usr/bin/pip
 
-# OpenVINO base (Intel GPU/CPU)
-# OpenVINO EP is provided by pip (onnxruntime-openvino), no system package needed.
-FROM python:3.12-slim-bookworm AS base-openvino
-
-# ROCm base (AMD GPU)
-FROM python:3.12-slim-bookworm AS base-rocm
-
 # Pick the correct base
-FROM base-${ONNX_RUNTIME} AS base
+FROM base-${PADDLE_GPU} AS base
 
-ARG ONNX_RUNTIME=cpu
+ARG PADDLE_GPU=cpu
 
 # Ubuntu 24.04 (CUDA base) enforces PEP 668 — allow pip to install system-wide.
 # Safe here: this is a container, not a host system.
@@ -66,6 +52,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-cjk \
     # PDF processing helpers — tesseract-ocr required by OCRmyPDF at import time
     qpdf libgl1 tesseract-ocr \
+    # tini for process supervision, wget for model downloads
+    tini wget \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -75,17 +63,29 @@ COPY requirements.txt /app/requirements.txt
 
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Swap in GPU runtime if requested
-# NOTE: onnxruntime-gpu >=1.27 requires CUDA 13 (libcudart.so.13), but our
-# base image (nvidia/cuda:12.8.1) only provides CUDA 12. Pin to <1.27 to keep
-# CUDA 12 compatibility. See: https://github.com/microsoft/onnxruntime/releases
-RUN if [ "$ONNX_RUNTIME" = "cuda" ]; then \
-      pip install --no-cache-dir 'onnxruntime-gpu<1.27'; \
-    elif [ "$ONNX_RUNTIME" = "openvino" ]; then \
-      pip install --no-cache-dir onnxruntime-openvino; \
-    elif [ "$ONNX_RUNTIME" = "rocm" ]; then \
-      pip install --no-cache-dir onnxruntime-rocm; \
+# Swap in GPU PaddlePaddle if requested
+# Note: PaddlePaddle GPU wheels are built against CUDA 12.6 (cu126), but the
+# base image uses CUDA 12.8 for newer GPU support (e.g. Blackwell). CUDA is
+# backward-compatible within the 12.x series, so this works fine.
+RUN if [ "$PADDLE_GPU" = "cuda" ]; then \
+      pip uninstall -y paddlepaddle && \
+      pip install --no-cache-dir paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/; \
     fi
+
+# ---------------------------------------------------------------------------
+# Pre-download PaddleOCR models (bypasses runtime download on first request)
+# Uses wget + tar — no Python or PaddleX dependency needed
+# ---------------------------------------------------------------------------
+ENV PADDLEOCR_MODELS=/app/models
+
+RUN mkdir -p "${PADDLEOCR_MODELS}" && \
+    base="https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0" && \
+    for name in PP-OCRv6_medium_det_infer PP-OCRv6_medium_rec_infer; do \
+        echo "Downloading ${name}..." && \
+        wget -q "${base}/${name}.tar" -O "/tmp/${name}.tar" && \
+        tar -xf "/tmp/${name}.tar" -C "${PADDLEOCR_MODELS}" && \
+        rm "/tmp/${name}.tar"; \
+    done
 
 # ---------------------------------------------------------------------------
 # Application code
@@ -94,22 +94,28 @@ WORKDIR /app
 COPY . .
 
 # ---------------------------------------------------------------------------
-# Pre-download RapidOCR models (avoids first-run download delay / offline fail)
-# Use the OCRmyPDF plugin helper so model selection matches runtime behavior:
-# German maps to RapidOCR's Latin recognition model.
-#
-# Force CPU runtime during pre-download so this works on all build variants
-# (CUDA/OpenVINO/ROCm libs are not available at Docker build time).
+# Expose API port
 # ---------------------------------------------------------------------------
-RUN OCR_RUNTIME=cpu python -c \
-      "from ocrmypdf_rapidocr.engine import get_rapidocr_engine; get_rapidocr_engine('deu', None)"
+EXPOSE 8000
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label
 # ---------------------------------------------------------------------------
-LABEL onnx-runtime="${ONNX_RUNTIME}"
+LABEL paddle-gpu="${PADDLE_GPU}"
 
 # ---------------------------------------------------------------------------
-# Entrypoint
+# Health check — verifies the API server is responsive
 # ---------------------------------------------------------------------------
-CMD ["python", "-u", "worker.py"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+
+# ---------------------------------------------------------------------------
+# Entrypoint — tini manages signals, shell script forwards to child processes
+# ---------------------------------------------------------------------------
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sh", "-c", " \
+    python -u server.py & SERVER_PID=$! && \
+    python -u worker.py & WORKER_PID=$! && \
+    trap 'kill $SERVER_PID $WORKER_PID 2>/dev/null; wait' TERM INT && \
+    wait \
+"]

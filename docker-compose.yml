@@ -3,15 +3,14 @@ services:
     build:
       context: .
       args:
-        # Runtime selection: "cpu" (default), "cuda", "openvino", or "rocm"
-        #   cpu       — CPU-only (:latest/:cpu, smallest image, no GPU needed)
-        #   cuda      — NVIDIA GPU (:cuda, CUDA 12.8.1 + cuDNN + onnxruntime-gpu)
-        #   openvino  — Intel GPU/CPU (:openvino, experimental)
-        #   rocm      — AMD GPU (:rocm, experimental)
-        ONNX_RUNTIME: cpu
+        # Runtime selection: "cpu" (default) or "cuda" (NVIDIA GPU)
+        PADDLE_GPU: cpu
     # image: doc-worker       # use this if you pre-built the image
     container_name: doc-worker
     restart: unless-stopped
+    ports:
+      # FastAPI document understanding endpoint (for Open-WebUI)
+      - "8000:8000"
     volumes:
       # Worker staging directories
       - ./work/inbox:/work/inbox
@@ -28,12 +27,11 @@ services:
 
       # OCR settings
       - OCR_LANG=deu
+      - OCR_USE_GPU=false
 
-      # Runtime selection: "cpu", "cuda", "openvino", or "rocm"
-      # Must match the ONNX_RUNTIME build arg used when building the image.
-      # At runtime, the worker will auto-detect if the provider is available
-      # and fall back to CPU if not.
-      - OCR_RUNTIME=cpu
+      # PaddleOCR-VL token (for Open-WebUI /layout-parsing auth)
+      # Set to a secret value; Open-WebUI sends: Authorization: Bearer <value>
+      # - PADDLEOCR_VL_TOKEN=your-secret-token
 
       # Polling
       - POLL_INTERVAL=5
@@ -42,7 +40,7 @@ services:
       - MAX_RETRIES=3
       - RETRY_DELAY=10
 
-      # GPU passthrough (uncomment when using ONNX_RUNTIME=cuda)
+      # GPU passthrough (uncomment when using PADDLE_GPU=cuda)
       # deploy:
       #   resources:
       #     reservations:

@@ -1,5 +1,6 @@
-ocrmypdf==17.4.1
-ocrmypdf-rapidocr==1.0.1
-rapidocr
-onnxruntime
+ocrmypdf>=17.4.1,<18
+ocrmypdf-paddleocr
+paddlepaddle==3.2.2
+fastapi
+uvicorn[standard]
 requests

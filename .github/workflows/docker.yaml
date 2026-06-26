@@ -27,17 +27,17 @@ jobs:
       - name: Lint with ruff
         run: |
           pip install ruff
-          ruff check worker.py
+          ruff check *.py
 
       - name: Type check with mypy
         run: |
           pip install mypy
-          mypy worker.py
+          mypy *.py
 
       - name: Validate syntax
         run: python -c "import ast; [ast.parse(open(f).read()) for f in __import__('glob').glob('*.py')]"
 
-  publish-latest-cpu:
+  publish-cpu:
     needs: [test]
     if: github.server_url != 'https://github.com'
     uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
@@ -55,41 +55,10 @@ jobs:
     with:
       BUILD_ARGS_JSON: |
         {
-          "ONNX_RUNTIME": "cuda"
+          "PADDLE_GPU": "cuda"
         }
       PUSH_LATEST: false
       RELEASE_TAG: "cuda"
       PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
     secrets:
       PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-  publish-openvino:
-    needs: [test]
-    if: github.server_url != 'https://github.com'
-    uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
-    runs-on: ubuntu-latest
-    with:
-      BUILD_ARGS_JSON: |
-        {
-          "ONNX_RUNTIME": "openvino"
-        }
-      PUSH_LATEST: false
-      RELEASE_TAG: "openvino"
-      PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
-    secrets:
-      PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-  publish-rocm:
-    needs: [test]
-    if: github.server_url != 'https://github.com'
-    uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
-    runs-on: ubuntu-latest
-    with:
-      BUILD_ARGS_JSON: |
-        {
-          "ONNX_RUNTIME": "rocm"
-        }
-      PUSH_LATEST: false
-      RELEASE_TAG: "rocm"
-      PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
-    secrets:
-      PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
-

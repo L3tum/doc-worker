@@ -4,8 +4,8 @@ Doc-Worker — OCR pipeline for PDFs
 ===================================
 
 1. Polls an inbox directory for new PDF files.
-2. Runs OCR using OCRmyPDF with the RapidOCR ONNX plugin (via Python API).
-3. Generates sidecar documents via the Docling API (Markdown + JSON).
+2. Runs OCR using OCRmyPDF with the PaddleOCR plugin (via Python API).
+3. Generates sidecar documents (Markdown + JSON) via the Docling API or local PaddleOCR.
 4. Pushes the processed PDFs into a Paperless-ngx consume directory.
 
 All paths and settings are controlled by environment variables (see defaults
@@ -22,11 +22,12 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, cast
 
 import ocrmypdf
-import rapidocr
 import requests
+import json
+
+from paddleocr_helpers import run_paddleocr
 
 # ---------------------------------------------------------------------------
 # Configuration — all overridable via environment variables
@@ -38,10 +39,13 @@ ERROR = Path(os.getenv("ERROR", "/work/error"))
 DOCLING_OUT = Path(os.getenv("DOCLING_DIR", "/work/docling"))
 PAPERLESS_CONSUME = Path(os.getenv("PAPERLESS_CONSUME", "/paperless-consume"))
 
-DOCLING_BASE_URL = os.getenv("DOCLING_BASE_URL", "http://docling:5001").rstrip("/")
-DOCLING_MODE = os.getenv("DOCLING_MODE", "best_effort")  # "off" | "best_effort" | "required"
+DOCLING_BASE_URL = os.getenv("DOCLING_BASE_URL", "http://docling:12000").rstrip("/")
+DOCLING_MODE = os.getenv(
+    "DOCLING_MODE", "best_effort"
+)  # "off" | "best_effort" | "required" | "native"
 OCR_LANG = os.getenv("OCR_LANG", "deu")
-OCR_RUNTIME = os.getenv("OCR_RUNTIME", "cpu").lower()  # "cpu" | "cuda" | "openvino" | "rocm"
+OCR_USE_GPU = os.getenv("OCR_USE_GPU", "false").lower() in ("true", "1", "yes")
+PADDLEOCR_MODELS = os.getenv("PADDLEOCR_MODELS", "/app/models")
 
 for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
     path.mkdir(parents=True, exist_ok=True)
@@ -120,192 +124,104 @@ def call_docling_convert(pdf_path: Path) -> bool:
 
 def handle_docling(pdf_path: Path) -> bool:
     """
-    Run Docling based on DOCLING_MODE.
+    Run sidecar generation based on DOCLING_MODE.
 
     Returns:
-        True  — continue pipeline (Docling succeeded or is disabled).
-        False — abort pipeline (Docling failed in 'required' mode).
+        True  — continue pipeline (sidecar succeeded or is disabled).
+        False — abort pipeline (sidecar failed in 'required' mode).
     """
     if DOCLING_MODE == "off":
-        log("  Docling: SKIPPED (mode=off)")
+        log("  Sidecar: SKIPPED (mode=off)")
         return True
 
-    success = call_docling_convert(pdf_path)
+    if DOCLING_MODE == "native":
+        success = generate_native_sidecar(pdf_path)
+    else:
+        success = call_docling_convert(pdf_path)
 
     if success:
-        log("  Docling: OK")
+        mode_label = "native" if DOCLING_MODE == "native" else "Docling"
+        log(f"  {mode_label}: OK")
         return True
 
-    # Docling failed
+    # Sidecar generation failed
     if DOCLING_MODE == "required":
-        log_error("Docling failed and mode=required — aborting this file.")
+        log_error("Sidecar generation failed and mode=required — aborting this file.")
         return False
 
-    # best_effort: warn and continue
-    log("  Docling: FAILED (mode=best_effort, continuing)")
+    # best_effort or native: warn and continue
+    mode_label = "native" if DOCLING_MODE == "native" else "Docling"
+    log(f"  {mode_label}: FAILED (mode={DOCLING_MODE}, continuing)")
     return True
 
 
 # ---------------------------------------------------------------------------
-# OCRmyPDF via Python API
+# Native PaddleOCR sidecar generation
 # ---------------------------------------------------------------------------
-def _patch_rapidocr_provider_config() -> None:
-    """Experimentally prepend an ONNX Runtime provider in RapidOCR.
+def generate_native_sidecar(pdf_path: Path) -> bool:
+    """Generate Markdown + JSON sidecar files using local PaddleOCR.
 
-    RapidOCR's ONNX Runtime backend currently exposes config toggles for only
-    some execution providers. OpenVINO and ROCm may still be available from the
-    installed onnxruntime package, so this patch lets us pass that provider to
-    InferenceSession while keeping CPU as a fallback.
+    Outputs to DOCLING_OUT/{stem}/{stem}.md and DOCLING_OUT/{stem}/{stem}.json
+    using the same naming convention as the Docling API.
     """
     try:
-        from rapidocr.inference_engine.onnxruntime.provider_config import ProviderConfig
-    except Exception as exc:
-        log(f"WARNING: Could not patch RapidOCR provider config: {exc}")
-        return
+        pages = run_paddleocr(str(pdf_path))
 
-    if getattr(ProviderConfig, "_doc_worker_provider_patch", False):
-        return
+        filename_stem = pdf_path.stem
+        out_dir = DOCLING_OUT / filename_stem
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    original_get_ep_list = ProviderConfig.get_ep_list
-
-    def patched_get_ep_list(self: Any) -> list[Any]:
-        ep_list: list[Any] = cast(list[Any], original_get_ep_list(self))
-        requested_provider = os.environ.get("RAPIDOCR_ONNXRUNTIME_PROVIDER")
-        if not requested_provider or requested_provider == "CPUExecutionProvider":
-            return ep_list
-
-        if requested_provider not in self.had_providers:
-            log(
-                f"WARNING: Experimental provider {requested_provider} is not available. "
-                f"Using RapidOCR defaults: {self.had_providers}"
-            )
-            return ep_list
-
-        filtered = [ep for ep in ep_list if ep[0] != requested_provider]
-        log(f"INFO: Prepending experimental ONNX Runtime provider: {requested_provider}")
-        return [(requested_provider, {})] + filtered
-
-    ProviderConfig.get_ep_list = patched_get_ep_list
-    ProviderConfig._doc_worker_provider_patch = True
-
-
-def _configure_rapidocr_runtime() -> None:
-    """Configure RapidOCR for the selected runtime backend.
-
-    Supported backends (via OCR_RUNTIME env var):
-      cpu       — CPUExecutionProvider (default, always available)
-      cuda      — CUDAExecutionProvider (NVIDIA GPU, requires onnxruntime-gpu)
-      openvino  — OpenVINOExecutionProvider (Intel GPU/CPU, requires onnxruntime-openvino)
-      rocm      — ROCmExecutionProvider (AMD GPU, requires onnxruntime-rocm)
-
-    Auto-detection: if the requested provider is not available, falls back
-    to CPU with a warning.
-    """
-    global _rapidocr_configured, OCR_RUNTIME, _rapidocr_params
-    if _rapidocr_configured:
-        return
-    _rapidocr_configured = True
-
-    # Map runtime names to (provider name, pip package)
-    BACKENDS = {
-        "cpu": ("CPUExecutionProvider", None),
-        "cuda": ("CUDAExecutionProvider", "onnxruntime-gpu"),
-        "openvino": ("OpenVINOExecutionProvider", "onnxruntime-openvino"),
-        "rocm": ("ROCMExecutionProvider", "onnxruntime-rocm"),
-    }
-
-    # Validate runtime
-    if OCR_RUNTIME not in BACKENDS:
-        log(
-            f"WARNING: OCR_RUNTIME='{OCR_RUNTIME}' is invalid, falling back to 'cpu'. "
-            f"Valid values: {', '.join(BACKENDS)}"
-        )
-        OCR_RUNTIME = "cpu"
-
-    target_provider, package_name = BACKENDS[OCR_RUNTIME]
-
-    # Check availability
-    try:
-        import onnxruntime as ort
-        available = ort.get_available_providers()
-
-        if target_provider not in available:
-            if package_name:
-                log(
-                    f"WARNING: OCR_RUNTIME={OCR_RUNTIME} requested but {target_provider} "
-                    f"is not available. Falling back to CPU. "
-                    f"Install '{package_name}' or rebuild with ONNX_RUNTIME={OCR_RUNTIME}. "
-                    f"Available providers: {available}"
-                )
-            else:
-                log(f"INFO: Using CPU runtime. Available providers: {available}")
-            OCR_RUNTIME = "cpu"
-            target_provider = "CPUExecutionProvider"
-        else:
-            log(f"INFO: {target_provider} found — {OCR_RUNTIME.upper()} acceleration enabled")
-    except Exception as exc:
-        log(f"WARNING: Failed to check runtime availability ({exc}), falling back to CPU")
-        OCR_RUNTIME = "cpu"
-        target_provider = "CPUExecutionProvider"
-
-    log(f"INFO: RapidOCR runtime = {OCR_RUNTIME} ({target_provider})")
-
-    # Build flat dot-notation params for RapidOCR 3.x.
-    # RapidOCR's ParseParams.update_batch() expects keys like
-    # "EngineConfig.onnxruntime.use_cuda", NOT nested dicts.
-    _rapidocr_params = {}
-
-    if OCR_RUNTIME == "cuda":
-        # CUDA is directly supported by RapidOCR's ONNX Runtime provider config.
-        _rapidocr_params = {
-            "EngineConfig.onnxruntime.use_cuda": True,
+        # Build JSON sidecar
+        full_text = "\n\n".join(p["text"] for p in pages if p["text"])
+        sidecar_json = {
+            "filename": pdf_path.name,
+            "pages": [
+                {"page": p["page"], "text": p["text"], "blocks": p["blocks"]}
+                for p in pages
+            ],
+            "full_text": full_text,
         }
-    elif OCR_RUNTIME in ("openvino", "rocm"):
-        # Experimental: RapidOCR's ONNX Runtime provider config does not expose
-        # OpenVINO/ROCm toggles, even when onnxruntime lists those providers.
-        # Store the requested provider in an env var and patch ProviderConfig so
-        # ONNX Runtime receives e.g. ["ROCMExecutionProvider", "CPUExecutionProvider"].
-        os.environ["RAPIDOCR_ONNXRUNTIME_PROVIDER"] = target_provider
-        _patch_rapidocr_provider_config()
+        json_out = out_dir / f"{filename_stem}.json"
+        with open(json_out, "w", encoding="utf-8") as wf:
+            json.dump(sidecar_json, wf, ensure_ascii=False, indent=2)
+        log(f"  Native JSON written: {json_out}")
 
-    # Monkey-patch RapidOCR.__init__ to inject our runtime params.
-    # The ocrmypdf_rapidocr plugin calls RapidOCR(config_path=..., params=...)
-    # so our patched __init__ must accept `params` as a kwarg name.
-    _orig_init = rapidocr.RapidOCR.__init__
+        # Build Markdown sidecar (simple page-by-page text)
+        md_parts: list[str] = []
+        for p in pages:
+            md_parts.append(f"## Page {p['page']}")
+            if p["text"]:
+                md_parts.append(p["text"])
+        md_out = out_dir / f"{filename_stem}.md"
+        with open(md_out, "w", encoding="utf-8") as wf:
+            wf.write("\n\n".join(md_parts))
+        log(f"  Native MD written: {md_out}")
 
-    def _patched_init(
-        self: Any,
-        config_path: str | None = None,
-        params: dict[str, Any] | None = None,
-    ) -> None:
-        # Merge our flat dot-notation runtime params with any user-provided params.
-        # Both dicts use flat dot-notation keys, so a simple dict merge works.
-        merged = dict(_rapidocr_params)
-        if params:
-            merged.update(params)
-        _orig_init(self, config_path=config_path, params=merged if merged else None)
+        return True
 
-    rapidocr.RapidOCR.__init__ = _patched_init
+    except Exception as exc:
+        log_error(f"Native sidecar generation failed: {exc}")
+        return False
 
 
-_rapidocr_configured = False
-_rapidocr_params: dict[str, Any] = {}
-
-
+# ---------------------------------------------------------------------------
+# OCRmyPDF via Python API — PaddleOCR engine
+# ---------------------------------------------------------------------------
 def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
-    """Run OCRmyPDF with RapidOCR engine via Python API."""
-    _configure_rapidocr_runtime()
+    """Run OCRmyPDF with PaddleOCR engine via Python API.
 
-    # input_file_or_options and output_file are positional args in ocrmypdf.ocr()
-    # Everything else is keyword-only (after the * in the signature)
-    # The plugin is auto-registered via the `plugins` parameter (pluggy).
+    Uses the ocrmypdf-paddleocr plugin which properly implements the
+    OcrEngine interface, generating hOCR from PaddleOCR bounding boxes.
+    """
     ocrmypdf.ocr(
         input_pdf,
         output_pdf,
-        plugins=["ocrmypdf_rapidocr"],
+        plugins=["ocrmypdf_paddleocr"],
         language=OCR_LANG,
         force_ocr=True,
-        rapidocr_config_path=os.environ.get("RAPIDOCR_CONFIG"),
+        paddle_use_gpu=OCR_USE_GPU,
+        paddle_det_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_det_infer",
+        paddle_rec_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_rec_infer",
     )
 
 
@@ -337,7 +253,14 @@ def push_to_paperless(ocr_pdf: Path) -> bool:
 # Docling health check
 # ---------------------------------------------------------------------------
 def wait_for_docling(timeout: int = 120) -> None:
-    """Wait for Docling API to become available before processing."""
+    """Wait for Docling API to become available before processing.
+
+    Skips the health check when DOCLING_MODE is 'off' or 'native' since no
+    external Docling service is needed in those cases.
+    """
+    if DOCLING_MODE in ("off", "native"):
+        return
+
     log(f"Waiting for Docling at {DOCLING_BASE_URL}...")
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -441,16 +364,15 @@ def main() -> None:
     log(f"  DOCLING_URL: {DOCLING_BASE_URL}")
     log(f"  DOCLING_MODE: {DOCLING_MODE}")
     log(f"  OCR_LANG:  {OCR_LANG}")
-    log(f"  OCR_RUNTIME: {OCR_RUNTIME}")
+    log(f"  OCR_USE_GPU: {OCR_USE_GPU}")
     log(f"  STABILITY_TIMEOUT: {os.getenv('STABILITY_TIMEOUT', '10')}s")
 
     # Crash recovery
     recover_leftover_files()
 
     # Wait for Docling to become available (if configured)
-    if DOCLING_BASE_URL and DOCLING_MODE != "off":
-        docling_timeout = int(os.getenv("DOCLING_TIMEOUT", "900"))
-        wait_for_docling(docling_timeout)
+    docling_timeout = int(os.getenv("DOCLING_TIMEOUT", "900"))
+    wait_for_docling(docling_timeout)
 
     poll_interval = int(os.getenv("POLL_INTERVAL", "5"))
     max_retries = int(os.getenv("MAX_RETRIES", "3"))
@@ -491,7 +413,9 @@ def main() -> None:
                     except Exception as exc:
                         retries += 1
                         if retries < max_retries:
-                            log_error(f"Retry {retries}/{max_retries} for {pdf.name}: {exc}")
+                            log_error(
+                                f"Retry {retries}/{max_retries} for {pdf.name}: {exc}"
+                            )
                             time.sleep(retry_delay)
                         else:
                             log_error(f"Max retries reached for {pdf.name}: {exc}")
