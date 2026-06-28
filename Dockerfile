@@ -78,7 +78,11 @@ RUN if [ "$PADDLE_GPU" = "cuda" ]; then \
 # ---------------------------------------------------------------------------
 ENV PADDLEOCR_MODELS=/app/models
 
-RUN mkdir -p "${PADDLEOCR_MODELS}" && \
+# PaddleX / PaddleOCR cache — must be writable and set before importing PaddleOCR
+ENV HOME=/root
+ENV PADDLE_PDX_CACHE_HOME=/app/.paddlex
+
+RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
     base="https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0" && \
     for name in PP-OCRv6_medium_det_infer PP-OCRv6_medium_rec_infer; do \
         echo "Downloading ${name}..." && \

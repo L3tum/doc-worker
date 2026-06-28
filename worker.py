@@ -62,6 +62,29 @@ def log_error(msg: str) -> None:
     print(f"ERROR: {msg}", flush=True, file=sys.stderr)
 
 
+def unique_destination(directory: Path, filename: str) -> Path:
+    """Return a non-existing destination path inside *directory*."""
+    dest = directory / filename
+    if not dest.exists():
+        return dest
+
+    stem = dest.stem
+    suffix = dest.suffix
+    ts = time.strftime("%Y%m%d%H%M%S")
+    return directory / f"{stem}_{ts}{suffix}"
+
+
+def move_to_error(file_path: Path, reason: str) -> None:
+    """Move *file_path* to ERROR/ without overwriting an existing file."""
+    if not file_path.exists():
+        log_error(f"Cannot move missing file to ERROR/: {file_path}")
+        return
+
+    dest = unique_destination(ERROR, file_path.name)
+    shutil.move(str(file_path), str(dest))
+    log(f"  → ERROR/ ({reason})")
+
+
 # ---------------------------------------------------------------------------
 # Crash recovery
 # ---------------------------------------------------------------------------
@@ -278,23 +301,29 @@ def wait_for_docling(timeout: int = 120) -> None:
 # ---------------------------------------------------------------------------
 # Main worker loop
 # ---------------------------------------------------------------------------
-def process_file(pdf_path: Path) -> None:
-    """Process a single PDF: Docling → OCR → Paperless."""
+def process_file(pdf_path: Path) -> bool:
+    """Process a single PDF: Docling → OCR → Paperless.
+
+    Returns True on success. On failure, leaves the original PDF in PROCESSING/
+    so the caller can retry it and decide when to move it to ERROR/.
+    """
     filename = pdf_path.name
     log(f"\n{'=' * 60}")
     log(f"Processing: {filename}")
     log(f"{'=' * 60}")
 
-    # Move to processing
+    # Move to processing unless this is already a retry from PROCESSING/.
     processing_path = PROCESSING / filename
-    shutil.move(str(pdf_path), str(processing_path))
-    log(f"  Moved to processing: {processing_path}")
+    if pdf_path != processing_path:
+        shutil.move(str(pdf_path), str(processing_path))
+        log(f"  Moved to processing: {processing_path}")
+    else:
+        log(f"  Retrying from processing: {processing_path}")
 
     # Docling
     if not handle_docling(processing_path):
-        shutil.move(str(processing_path), str(ERROR / filename))
-        log("  → ERROR/ (Docling required but failed)")
-        return
+        log_error("Sidecar generation failed and will be retried if attempts remain.")
+        return False
 
     # OCR
     ocr_output = PROCESSING / f"{processing_path.stem}_ocr{processing_path.suffix}"
@@ -305,17 +334,13 @@ def process_file(pdf_path: Path) -> None:
         log_error(f"OCR failed: {exc}")
         if ocr_output.exists():
             ocr_output.unlink()
-        shutil.move(str(processing_path), str(ERROR / filename))
-        log("  → ERROR/ (OCR failed)")
-        return
+        return False
 
     # Paperless
     if not push_to_paperless(ocr_output):
         if ocr_output.exists():
             ocr_output.unlink()
-        shutil.move(str(processing_path), str(ERROR / filename))
-        log("  → ERROR/ (Paperless push failed)")
-        return
+        return False
 
     # Done
     shutil.move(str(processing_path), str(DONE / filename))
@@ -323,6 +348,7 @@ def process_file(pdf_path: Path) -> None:
     if ocr_output.exists():
         ocr_output.unlink()
     log(f"  → DONE/ ({filename})")
+    return True
 
 
 def wait_for_stable_file(pdf_path: Path, stability_timeout: int | None = None) -> bool:
@@ -398,35 +424,40 @@ def main() -> None:
                     continue
 
                 # Process with retries
-                retries = 0
-                while retries < max_retries:
+                attempts = max(1, max_retries)
+                for attempt in range(1, attempts + 1):
+                    # If a previous attempt already moved the file to PROCESSING,
+                    # retry with that path instead of the original INBOX path.
+                    current_path = (
+                        PROCESSING / pdf.name if (PROCESSING / pdf.name).exists() else pdf
+                    )
+
                     try:
-                        # If a previous attempt already moved the file to PROCESSING,
-                        # retry with that path instead of the original INBOX path.
-                        current_path = (
-                            PROCESSING / pdf.name
-                            if (PROCESSING / pdf.name).exists()
-                            else pdf
-                        )
-                        process_file(current_path)
-                        break  # Success — move to next file
+                        success = process_file(current_path)
                     except Exception as exc:
-                        retries += 1
-                        if retries < max_retries:
-                            log_error(
-                                f"Retry {retries}/{max_retries} for {pdf.name}: {exc}"
-                            )
-                            time.sleep(retry_delay)
-                        else:
-                            log_error(f"Max retries reached for {pdf.name}: {exc}")
-                            # Make sure the file ends up in ERROR/
-                            if pdf.exists():
-                                shutil.move(str(pdf), str(ERROR / pdf.name))
-                            elif (PROCESSING / pdf.name).exists():
-                                shutil.move(
-                                    str(PROCESSING / pdf.name),
-                                    str(ERROR / pdf.name),
-                                )
+                        success = False
+                        log_error(
+                            f"Processing attempt {attempt}/{attempts} for {pdf.name} "
+                            f"raised: {exc}"
+                        )
+
+                    if success:
+                        break  # Success — move to next file
+
+                    if attempt < attempts:
+                        log_error(
+                            f"Processing attempt {attempt}/{attempts} failed for "
+                            f"{pdf.name}; retrying in {retry_delay}s"
+                        )
+                        time.sleep(retry_delay)
+                        continue
+
+                    log_error(f"Max retries reached for {pdf.name}")
+                    # Make sure the file ends up in ERROR/ after the final attempt.
+                    failed_path = (
+                        PROCESSING / pdf.name if (PROCESSING / pdf.name).exists() else pdf
+                    )
+                    move_to_error(failed_path, "max retries reached")
 
         except Exception as exc:
             log_error(f"Main loop error: {exc}")

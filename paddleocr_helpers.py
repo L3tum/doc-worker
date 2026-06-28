@@ -10,6 +10,7 @@ used by both the FastAPI server (`server.py`) and the worker pipeline
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any
 
 # ── Config (mirrors server.py and worker.py) ───────────────────────────
@@ -40,23 +41,55 @@ def paddleocr_lang_code() -> str:
 
 
 # ── Singleton model loader ─────────────────────────────────────────────
+_PADDLEOCR_MODEL_LOCK = threading.Lock()
+
+
+def get_paddleocr_init_exception() -> BaseException | None:
+    """Return a cached PaddleOCR initialization exception, if one occurred."""
+    if hasattr(_get_paddleocr_model, "_model"):
+        return None
+
+    exc = getattr(_get_paddleocr_model, "_init_exception", None)
+    return exc if isinstance(exc, BaseException) else None
+
+
 def _get_paddleocr_model() -> Any:
     """Return a cached (singleton) PaddleOCR instance.
 
     Model loading is expensive; reusing the same instance avoids repeated
     GPU memory allocation and disk I/O.
     """
-    if not hasattr(_get_paddleocr_model, "_model"):
+    with _PADDLEOCR_MODEL_LOCK:
+        if hasattr(_get_paddleocr_model, "_model"):
+            return _get_paddleocr_model._model  # type: ignore[attr-defined]
+
+        # If a previous call failed to initialize, re-raise the stored exception
+        # instead of attempting re-initialization (which would fail with
+        # "PDX has already been initialized. Reinitialization is not supported.")
+        init_exception = get_paddleocr_init_exception()
+        if init_exception is not None:
+            raise init_exception
+
+        # Prevent PaddleX from trying to write to / or other read-only locations
+        os.environ.setdefault("PADDLE_PDX_CACHE_HOME", "/app/.paddlex")
+
         from paddleocr import PaddleOCR
 
-        _get_paddleocr_model._model = PaddleOCR(  # type: ignore[attr-defined]
-            use_textline_orientation=True,
-            lang=paddleocr_lang_code(),
-            device="gpu" if OCR_USE_GPU else "cpu",
-            text_detection_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_det_infer",
-            text_recognition_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_rec_infer",
-        )
-    return _get_paddleocr_model._model  # type: ignore[attr-defined]
+        try:
+            _get_paddleocr_model._model = PaddleOCR(  # type: ignore[attr-defined]
+                use_textline_orientation=True,
+                lang=paddleocr_lang_code(),
+                device="gpu" if OCR_USE_GPU else "cpu",
+                text_detection_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_det_infer",
+                text_recognition_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_rec_infer",
+            )
+        except Exception as exc:
+            # Store the exception to avoid "PDX has already been initialized"
+            # on subsequent retries.
+            _get_paddleocr_model._init_exception = exc  # type: ignore[attr-defined]
+            raise
+
+        return _get_paddleocr_model._model  # type: ignore[attr-defined]
 
 
 # ── OCR extraction ─────────────────────────────────────────────────────

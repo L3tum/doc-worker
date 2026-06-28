@@ -46,7 +46,11 @@ from fastapi.responses import JSONResponse
 from starlette.responses import Response
 from pydantic import BaseModel
 
-from paddleocr_helpers import paddleocr_lang_code, run_paddleocr
+from paddleocr_helpers import (
+    get_paddleocr_init_exception,
+    paddleocr_lang_code,
+    run_paddleocr,
+)
 
 # ── Config ────────────────────────────────────────────────────────────
 OCR_LANG = os.getenv("OCR_LANG", "deu")
@@ -162,6 +166,17 @@ async def layout_parsing(
 @app.get("/health")
 async def health() -> dict:
     """Health check endpoint."""
+    init_exception = get_paddleocr_init_exception()
+    if init_exception is not None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "component": "paddleocr",
+                "error": str(init_exception),
+            },
+        )
+
     return {
         "status": "ok",
         "ocr_lang": OCR_LANG,
