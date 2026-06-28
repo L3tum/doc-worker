@@ -1,6 +1,6 @@
 ocrmypdf>=17.4.1,<18
 ocrmypdf-paddleocr
-paddlepaddle==3.2.2
+paddlepaddle==3.3.1
 fastapi
 uvicorn[standard]
 requests
