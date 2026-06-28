@@ -4,3 +4,4 @@ paddlepaddle==3.2.2
 fastapi
 uvicorn[standard]
 requests
+python-multipart
