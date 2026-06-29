@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import os
 import threading
+from pathlib import Path
 from typing import Any
 
 # ── Config (mirrors server.py and worker.py) ───────────────────────────
 OCR_LANG = os.getenv("OCR_LANG", "deu")
 OCR_USE_GPU = os.getenv("OCR_USE_GPU", "false").lower() in ("true", "1", "yes")
 PADDLEOCR_MODELS = os.getenv("PADDLEOCR_MODELS", "/app/models")
+DEFAULT_PADDLE_PDX_CACHE_HOME = "/tmp/.paddlex"
 
 # ── Language mapping ───────────────────────────────────────────────────
 def paddleocr_lang_code() -> str:
@@ -53,6 +55,29 @@ def get_paddleocr_init_exception() -> BaseException | None:
     return exc if isinstance(exc, BaseException) else None
 
 
+def _assert_writable_directory(path: Path) -> None:
+    """Create *path* and verify the current user can write inside it."""
+    path.mkdir(parents=True, exist_ok=True)
+    probe = path / ".write-test"
+    probe.write_text("ok", encoding="utf-8")
+    probe.unlink(missing_ok=True)
+
+
+def _ensure_paddlex_cache_home() -> None:
+    """Set PADDLE_PDX_CACHE_HOME to a writable directory before PaddleOCR import."""
+    configured_cache = Path(
+        os.environ.get("PADDLE_PDX_CACHE_HOME") or DEFAULT_PADDLE_PDX_CACHE_HOME
+    )
+    try:
+        _assert_writable_directory(configured_cache)
+    except OSError:
+        fallback_cache = Path(DEFAULT_PADDLE_PDX_CACHE_HOME)
+        _assert_writable_directory(fallback_cache)
+        os.environ["PADDLE_PDX_CACHE_HOME"] = str(fallback_cache)
+    else:
+        os.environ["PADDLE_PDX_CACHE_HOME"] = str(configured_cache)
+
+
 def _get_paddleocr_model() -> Any:
     """Return a cached (singleton) PaddleOCR instance.
 
@@ -70,12 +95,14 @@ def _get_paddleocr_model() -> Any:
         if init_exception is not None:
             raise init_exception
 
-        # Prevent PaddleX from trying to write to / or other read-only locations
-        os.environ.setdefault("PADDLE_PDX_CACHE_HOME", "/app/.paddlex")
-
-        from paddleocr import PaddleOCR
+        # Prevent PaddleX from trying to write to / or other read-only locations.
+        # This must run before importing PaddleOCR because PaddleX reads the env
+        # var during import/initialization.
+        _ensure_paddlex_cache_home()
 
         try:
+            from paddleocr import PaddleOCR
+
             _get_paddleocr_model._model = PaddleOCR(  # type: ignore[attr-defined]
                 use_textline_orientation=True,
                 lang=paddleocr_lang_code(),
