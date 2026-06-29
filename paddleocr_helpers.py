@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import threading
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -100,11 +101,45 @@ def _get_paddleocr_model() -> Any:
         # var during import/initialization.
         _ensure_paddlex_cache_home()
 
+        # Validate that local model directories actually exist before attempting
+        # to initialize PaddleOCR. This prevents the confusing "No model hoster"
+        # error that occurs when PaddleOCR tries to download missing models.
+        det_model_dir = Path(f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_det_infer")
+        rec_model_dir = Path(f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_rec_infer")
+        if not det_model_dir.is_dir() or not rec_model_dir.is_dir():
+            missing = []
+            if not det_model_dir.is_dir():
+                missing.append(f"text detection ({det_model_dir})")
+            if not rec_model_dir.is_dir():
+                missing.append(f"text recognition ({rec_model_dir})")
+            raise FileNotFoundError(
+                f"PaddleOCR model directories are missing: {', '.join(missing)}. "
+                "Set PADDLEOCR_MODELS to a directory containing "
+                "PP-OCRv6_medium_det_infer/ and PP-OCRv6_medium_rec_infer/ "
+                "subdirectories, or use a container image that includes these models."
+            )
+
         try:
             from paddleocr import PaddleOCR
+            import paddleocr._utils.logging as paddleocr_logging
 
+            # Suppress PaddleOCR's internal logging noise (e.g. "Creating model", "No model hoster")
+            # We rely on the app's own logging for errors via the exception handling below.
+            paddleocr_logging.logger.setLevel(100)  # above DEBUG/ERROR
+            # Suppress PaddleOCR's UserWarning about lang/ocr_version being ignored when model dirs are provided
+            warnings.filterwarnings(
+                "ignore",
+                message=r"`lang` and `ocr_version` will be ignored when model names or model directories are not `None`",
+            )
+
+            # Disable orientation correction modules that would require additional models
+            # (doc orientation classification, textline orientation, doc unwarping).
+            # These are not needed for our use-case (flat document OCR) and would cause
+            # runtime errors when models aren't present in PADDLEOCR_MODELS.
             _get_paddleocr_model._model = PaddleOCR(  # type: ignore[attr-defined]
-                use_textline_orientation=True,
+                use_doc_orientation_classify=False,
+                use_doc_unwarping=False,
+                use_textline_orientation=False,
                 lang=paddleocr_lang_code(),
                 device="gpu" if OCR_USE_GPU else "cpu",
                 text_detection_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_det_infer",
@@ -129,7 +164,7 @@ def run_paddleocr(file_path: str) -> list[dict]:
         blocks (list[dict]): per-block text, bbox, confidence
     """
     model = _get_paddleocr_model()
-    result = model.ocr(file_path, cls=True)
+    result = model.ocr(file_path)
 
     pages: list[dict] = []
     for page_idx, page_result in enumerate(result or []):
