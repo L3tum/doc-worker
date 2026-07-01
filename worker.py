@@ -27,7 +27,7 @@ import ocrmypdf
 import requests
 import json
 
-from paddleocr_helpers import run_paddleocr
+from paddleocr_helpers import run_paddleocr, validate_paddleocr_models
 
 # ---------------------------------------------------------------------------
 # Configuration — all overridable via environment variables
@@ -395,6 +395,14 @@ def main() -> None:
 
     # Crash recovery
     recover_leftover_files()
+
+    # Validate PaddleOCR models — fail fast if they're missing or mismatched
+    try:
+        validate_paddleocr_models()
+        log("PaddleOCR models validated successfully.")
+    except Exception as exc:
+        log_error(f"PaddleOCR model validation failed: {exc}")
+        sys.exit(1)
 
     # Wait for Docling to become available (if configured)
     docling_timeout = int(os.getenv("DOCLING_TIMEOUT", "900"))

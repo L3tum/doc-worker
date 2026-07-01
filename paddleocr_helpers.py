@@ -20,6 +20,9 @@ OCR_LANG = os.getenv("OCR_LANG", "deu")
 OCR_USE_GPU = os.getenv("OCR_USE_GPU", "false").lower() in ("true", "1", "yes")
 PADDLEOCR_MODELS = os.getenv("PADDLEOCR_MODELS", "/app/models")
 DEFAULT_PADDLE_PDX_CACHE_HOME = "/tmp/.paddlex"
+TEXT_DETECTION_MODEL = "PP-OCRv6_medium_det_infer"
+TEXT_RECOGNITION_MODEL = "PP-OCRv6_medium_rec_infer"
+TEXTLINE_ORIENTATION_MODEL = "PP-LCNet_x1_0_textline_ori_infer"
 
 # ── Language mapping ───────────────────────────────────────────────────
 def paddleocr_lang_code() -> str:
@@ -64,6 +67,67 @@ def _assert_writable_directory(path: Path) -> None:
     probe.unlink(missing_ok=True)
 
 
+def _model_dir(model_name: str) -> Path:
+    """Return the local directory for a bundled PaddleOCR model."""
+    return Path(PADDLEOCR_MODELS) / model_name
+
+
+def validate_paddleocr_models() -> None:
+    """Validate that required PaddleOCR model directories are present.
+
+    PaddleOCR 3.x inference archives contain model directories with
+    ``inference.pdiparams``, ``inference.yml``, and a model-definition file
+    (usually ``inference.json``). Validate those files directly instead of
+    relying on older ``.pdiparams.info`` metadata.
+    """
+    models_dir = Path(PADDLEOCR_MODELS)
+    if not models_dir.is_dir():
+        raise FileNotFoundError(
+            f"PADDLEOCR_MODELS directory does not exist: {models_dir}"
+        )
+
+    # Rename the incorrect directory name used by the previous image, if a user
+    # mounted or copied models with that name manually.
+    legacy_orientation_dir = models_dir / "PP-OCRv6_lcnet_x1_0_textline_ori_infer"
+    orientation_dir = _model_dir(TEXTLINE_ORIENTATION_MODEL)
+    if legacy_orientation_dir.is_dir() and not orientation_dir.exists():
+        os.rename(str(legacy_orientation_dir), str(orientation_dir))
+        print(
+            f"Fixed model directory name: {legacy_orientation_dir.name} -> {orientation_dir.name}",
+            flush=True,
+        )
+
+    missing: list[str] = []
+    for model_name in (
+        TEXT_DETECTION_MODEL,
+        TEXT_RECOGNITION_MODEL,
+        TEXTLINE_ORIENTATION_MODEL,
+    ):
+        model_dir = _model_dir(model_name)
+        if not model_dir.is_dir():
+            missing.append(f"{model_name}/")
+            continue
+
+        required_files = ["inference.pdiparams", "inference.yml"]
+        for required_file in required_files:
+            if not (model_dir / required_file).is_file():
+                missing.append(f"{model_name}/{required_file}")
+
+        if not any(
+            (model_dir / model_file).is_file()
+            for model_file in ("inference.json", "inference.pdmodel")
+        ):
+            missing.append(f"{model_name}/inference.json or inference.pdmodel")
+
+    if missing:
+        raise FileNotFoundError(
+            f"Missing PaddleOCR model files under {models_dir}: "
+            f"{', '.join(missing)}. "
+            "Rebuild the container image with the full model set or set "
+            "PADDLEOCR_MODELS to a complete model directory."
+        )
+
+
 def _ensure_paddlex_cache_home() -> None:
     """Set PADDLE_PDX_CACHE_HOME to a writable directory before PaddleOCR import."""
     configured_cache = Path(
@@ -100,24 +164,7 @@ def _get_paddleocr_model() -> Any:
         # This must run before importing PaddleOCR because PaddleX reads the env
         # var during import/initialization.
         _ensure_paddlex_cache_home()
-
-        # Validate that local model directories actually exist before attempting
-        # to initialize PaddleOCR. This prevents the confusing "No model hoster"
-        # error that occurs when PaddleOCR tries to download missing models.
-        det_model_dir = Path(f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_det_infer")
-        rec_model_dir = Path(f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_rec_infer")
-        if not det_model_dir.is_dir() or not rec_model_dir.is_dir():
-            missing = []
-            if not det_model_dir.is_dir():
-                missing.append(f"text detection ({det_model_dir})")
-            if not rec_model_dir.is_dir():
-                missing.append(f"text recognition ({rec_model_dir})")
-            raise FileNotFoundError(
-                f"PaddleOCR model directories are missing: {', '.join(missing)}. "
-                "Set PADDLEOCR_MODELS to a directory containing "
-                "PP-OCRv6_medium_det_infer/ and PP-OCRv6_medium_rec_infer/ "
-                "subdirectories, or use a container image that includes these models."
-            )
+        validate_paddleocr_models()
 
         try:
             from paddleocr import PaddleOCR
@@ -132,18 +179,17 @@ def _get_paddleocr_model() -> Any:
                 message=r"`lang` and `ocr_version` will be ignored when model names or model directories are not `None`",
             )
 
-            # Disable orientation correction modules that would require additional models
-            # (doc orientation classification, textline orientation, doc unwarping).
-            # These are not needed for our use-case (flat document OCR) and would cause
-            # runtime errors when models aren't present in PADDLEOCR_MODELS.
+            # Orientation model is loaded locally from the pre-downloaded directory,
+            # so no network download attempts occur.
             _get_paddleocr_model._model = PaddleOCR(  # type: ignore[attr-defined]
                 use_doc_orientation_classify=False,
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
                 lang=paddleocr_lang_code(),
                 device="gpu" if OCR_USE_GPU else "cpu",
-                text_detection_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_det_infer",
-                text_recognition_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_rec_infer",
+                text_detection_model_dir=str(_model_dir(TEXT_DETECTION_MODEL)),
+                text_recognition_model_dir=str(_model_dir(TEXT_RECOGNITION_MODEL)),
+                textline_orientation_model_dir=str(_model_dir(TEXTLINE_ORIENTATION_MODEL)),
             )
         except Exception as exc:
             # Store the exception to avoid "PDX has already been initialized"
