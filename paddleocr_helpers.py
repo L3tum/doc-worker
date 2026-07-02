@@ -79,6 +79,10 @@ def validate_paddleocr_models() -> None:
     ``inference.pdiparams``, ``inference.yml``, and a model-definition file
     (usually ``inference.json``). Validate those files directly instead of
     relying on older ``.pdiparams.info`` metadata.
+
+    Also check that the ``model_name`` in each ``inference.yml`` matches the
+    directory name to catch the "model name mismatch" error before PaddleOCR
+    tries to load.
     """
     models_dir = Path(PADDLEOCR_MODELS)
     if not models_dir.is_dir():
@@ -97,7 +101,10 @@ def validate_paddleocr_models() -> None:
             flush=True,
         )
 
+    import re
+
     missing: list[str] = []
+    yml_mismatches: list[str] = []
     for model_name in (
         TEXT_DETECTION_MODEL,
         TEXT_RECOGNITION_MODEL,
@@ -119,12 +126,36 @@ def validate_paddleocr_models() -> None:
         ):
             missing.append(f"{model_name}/inference.json or inference.pdmodel")
 
+        # Check model_name in inference.yml matches directory name
+        yml_path = model_dir / "inference.yml"
+        if yml_path.is_file():
+            yml_content = yml_path.read_text(encoding="utf-8")
+            match = re.search(r"^  model_name:\s*(.+)$", yml_content, re.MULTILINE)
+            if not match:
+                yml_mismatches.append(f"{model_name}: inference.yml missing model_name")
+                continue
+
+            yml_model_name = match.group(1).strip()
+            if yml_model_name != model_name:
+                yml_mismatches.append(
+                    f"{model_name}: inference.yml declares '{yml_model_name}' "
+                    f"(expected '{model_name}')"
+                )
+
     if missing:
         raise FileNotFoundError(
             f"Missing PaddleOCR model files under {models_dir}: "
             f"{', '.join(missing)}. "
             "Rebuild the container image with the full model set or set "
             "PADDLEOCR_MODELS to a complete model directory."
+        )
+
+    if yml_mismatches:
+        raise ValueError(
+            f"PaddleOCR model name mismatches (inference.yml vs directory name): "
+            f"{', '.join(yml_mismatches)}. "
+            "The Dockerfile should patch these, or the model archive is broken. "
+            "Fix: edit inference.yml and set model_name to match the directory."
         )
 
 
