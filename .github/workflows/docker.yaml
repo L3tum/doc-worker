@@ -41,7 +41,6 @@ jobs:
     needs: [test]
     if: github.server_url != 'https://github.com'
     uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
-    runs-on: ubuntu-latest
     with:
       PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
       RELEASE_TAG: "cpu"
@@ -51,7 +50,6 @@ jobs:
     needs: [test]
     if: github.server_url != 'https://github.com'
     uses: l3tum/reusable-workflows/.github/workflows/publish-forgejo.yml@main
-    runs-on: ubuntu-latest
     with:
       BUILD_ARGS_JSON: |
         {
@@ -62,3 +60,22 @@ jobs:
       PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
     secrets:
       PACKAGE_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+  publish-cpu-gchr:
+    needs: [test]
+    if: github.server_url == 'https://github.com'
+    uses: l3tum/reusable-workflows/.github/workflows/publish-gchr.yml@main
+    with:
+      PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
+      RELEASE_TAG: "cpu"
+  publish-cuda-gchr:
+    needs: [test]
+    if: github.server_url == 'https://github.com'
+    uses: l3tum/reusable-workflows/.github/workflows/publish-gchr.yml@main
+    with:
+      BUILD_ARGS_JSON: |
+        {
+          "PADDLE_GPU": "cuda"
+        }
+      PUSH_LATEST: false
+      RELEASE_TAG: "cuda"
+      PUSH: ${{ github.event_name == 'release' && github.event.action == 'published' }}
