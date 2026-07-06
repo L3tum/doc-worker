@@ -92,8 +92,13 @@ RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
         rm "/tmp/${name}.tar"; \
     done && \
     # Patch model_name in inference.yml to match directory name (catches future server-side changes)
+    # Handle variable indentation (1+ spaces or tabs before model_name)
     for name in PP-OCRv6_medium_det_infer PP-OCRv6_medium_rec_infer PP-LCNet_x1_0_textline_ori_infer; do \
-        sed -i "s/^  model_name: .*/  model_name: ${name}/" "${PADDLEOCR_MODELS}/${name}/inference.yml"; \
+        sed -i 's/^ *model_name: .*/  model_name: '"${name}"'/' "${PADDLEOCR_MODELS}/${name}/inference.yml"; \
+        # Verify the patch succeeded
+        if ! grep -q "^  model_name: ${name}$" "${PADDLEOCR_MODELS}/${name}/inference.yml"; then \
+            echo "ERROR: Failed to patch model_name in ${name}/inference.yml" && exit 1; \
+        fi; \
     done
 
 # ---------------------------------------------------------------------------

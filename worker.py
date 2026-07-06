@@ -245,6 +245,7 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
         paddle_use_gpu=OCR_USE_GPU,
         paddle_det_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_det_infer",
         paddle_rec_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_rec_infer",
+        paddle_cls_model_dir=f"{PADDLEOCR_MODELS}/PP-LCNet_x1_0_textline_ori_infer",
     )
 
 

@@ -154,8 +154,10 @@ def validate_paddleocr_models() -> None:
         raise ValueError(
             f"PaddleOCR model name mismatches (inference.yml vs directory name): "
             f"{', '.join(yml_mismatches)}. "
-            "The Dockerfile should patch these, or the model archive is broken. "
-            "Fix: edit inference.yml and set model_name to match the directory."
+            f"Files checked under {models_dir}. "
+            "Likely cause: the Dockerfile's sed patch to fix model_name failed. "
+            "Check that the inference.yml files under {models_dir} contain a line "
+            "'  model_name: <directory-name>' matching the directory."
         )
 
 
