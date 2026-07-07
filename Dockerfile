@@ -82,6 +82,8 @@ ENV PADDLEOCR_MODELS=/app/models
 ENV HOME=/tmp
 ENV PADDLE_PDX_CACHE_HOME=/tmp/.paddlex
 
+# Verify after download that inference.yml keeps Paddle's logical model names
+# without the *_infer directory suffix.
 RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
     chmod 1777 "${PADDLE_PDX_CACHE_HOME}" && \
     base="https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0" && \
@@ -91,13 +93,13 @@ RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
         tar -xf "/tmp/${name}.tar" -C "${PADDLEOCR_MODELS}" && \
         rm "/tmp/${name}.tar"; \
     done && \
-    # Patch model_name in inference.yml to match directory name (catches future server-side changes)
-    # Handle variable indentation (1+ spaces or tabs before model_name)
-    for name in PP-OCRv6_medium_det_infer PP-OCRv6_medium_rec_infer PP-LCNet_x1_0_textline_ori_infer; do \
-        sed -i 's/^ *model_name: .*/  model_name: '"${name}"'/' "${PADDLEOCR_MODELS}/${name}/inference.yml"; \
-        # Verify the patch succeeded
-        if ! grep -q "^  model_name: ${name}$" "${PADDLEOCR_MODELS}/${name}/inference.yml"; then \
-            echo "ERROR: Failed to patch model_name in ${name}/inference.yml" && exit 1; \
+    for spec in \
+        "PP-OCRv6_medium_det_infer PP-OCRv6_medium_det" \
+        "PP-OCRv6_medium_rec_infer PP-OCRv6_medium_rec" \
+        "PP-LCNet_x1_0_textline_ori_infer PP-LCNet_x1_0_textline_ori"; do \
+        set -- ${spec}; dir="$1"; model="$2"; \
+        if ! grep -Eq "^[[:space:]]*model_name:[[:space:]]*${model}$" "${PADDLEOCR_MODELS}/${dir}/inference.yml"; then \
+            echo "ERROR: ${dir}/inference.yml does not declare model_name: ${model}" && exit 1; \
         fi; \
     done
 

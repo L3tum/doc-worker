@@ -215,7 +215,7 @@ Upload a PDF or image, extract text via PaddleOCR.
 
 ### OCR Language
 
-The `ocrmypdf-paddleocr` plugin supports PaddleOCR language codes:
+The bundled local `ocrmypdf_paddleocr` plugin accepts common Tesseract-style OCR language codes:
 
 | Language | Code |
 |---|---|
@@ -235,7 +235,7 @@ The `ocrmypdf-paddleocr` plugin supports PaddleOCR language codes:
 
 ### Pre-downloaded Models
 
-The Docker image ships with **Latin language models** pre-downloaded. Non-Latin languages download on first use.
+The Docker image ships with the PP-OCRv6 medium detection/recognition models and text-line orientation model pre-downloaded. PP-OCRv6 medium is a unified multilingual model, so normal OCR does not need to download per-language models at runtime.
 
 ### Sidecar Modes
 

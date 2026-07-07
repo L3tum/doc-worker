@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import threading
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +19,21 @@ OCR_LANG = os.getenv("OCR_LANG", "deu")
 OCR_USE_GPU = os.getenv("OCR_USE_GPU", "false").lower() in ("true", "1", "yes")
 PADDLEOCR_MODELS = os.getenv("PADDLEOCR_MODELS", "/app/models")
 DEFAULT_PADDLE_PDX_CACHE_HOME = "/tmp/.paddlex"
-TEXT_DETECTION_MODEL = "PP-OCRv6_medium_det_infer"
-TEXT_RECOGNITION_MODEL = "PP-OCRv6_medium_rec_infer"
-TEXTLINE_ORIENTATION_MODEL = "PP-LCNet_x1_0_textline_ori_infer"
+
+# PaddleOCR/PaddleX distinguishes the logical model name from the extracted
+# inference directory name.  The official tarballs extract to ``*_infer``
+# directories, but their ``inference.yml`` files declare the model name without
+# that suffix.  Passing/patching the directory name as the model name triggers
+# PaddleX's "model name mismatch" guard.
+TEXT_DETECTION_MODEL = "PP-OCRv6_medium_det"
+TEXT_RECOGNITION_MODEL = "PP-OCRv6_medium_rec"
+TEXTLINE_ORIENTATION_MODEL = "PP-LCNet_x1_0_textline_ori"
+
+PADDLEOCR_MODEL_DIRS = {
+    TEXT_DETECTION_MODEL: "PP-OCRv6_medium_det_infer",
+    TEXT_RECOGNITION_MODEL: "PP-OCRv6_medium_rec_infer",
+    TEXTLINE_ORIENTATION_MODEL: "PP-LCNet_x1_0_textline_ori_infer",
+}
 
 # ── Language mapping ───────────────────────────────────────────────────
 def paddleocr_lang_code() -> str:
@@ -69,7 +80,7 @@ def _assert_writable_directory(path: Path) -> None:
 
 def _model_dir(model_name: str) -> Path:
     """Return the local directory for a bundled PaddleOCR model."""
-    return Path(PADDLEOCR_MODELS) / model_name
+    return Path(PADDLEOCR_MODELS) / PADDLEOCR_MODEL_DIRS.get(model_name, model_name)
 
 
 def validate_paddleocr_models() -> None:
@@ -81,8 +92,9 @@ def validate_paddleocr_models() -> None:
     relying on older ``.pdiparams.info`` metadata.
 
     Also check that the ``model_name`` in each ``inference.yml`` matches the
-    directory name to catch the "model name mismatch" error before PaddleOCR
-    tries to load.
+    logical PaddleOCR/PaddleX model name (without the ``_infer`` directory
+    suffix) to catch the "model name mismatch" error before PaddleOCR tries to
+    load.
     """
     models_dir = Path(PADDLEOCR_MODELS)
     if not models_dir.is_dir():
@@ -126,11 +138,11 @@ def validate_paddleocr_models() -> None:
         ):
             missing.append(f"{model_name}/inference.json or inference.pdmodel")
 
-        # Check model_name in inference.yml matches directory name
+        # Check model_name in inference.yml matches the logical Paddle model name.
         yml_path = model_dir / "inference.yml"
         if yml_path.is_file():
             yml_content = yml_path.read_text(encoding="utf-8")
-            match = re.search(r"^  model_name:\s*(.+)$", yml_content, re.MULTILINE)
+            match = re.search(r"^[ \t]*model_name:\s*(.+)$", yml_content, re.MULTILINE)
             if not match:
                 yml_mismatches.append(f"{model_name}: inference.yml missing model_name")
                 continue
@@ -152,12 +164,13 @@ def validate_paddleocr_models() -> None:
 
     if yml_mismatches:
         raise ValueError(
-            f"PaddleOCR model name mismatches (inference.yml vs directory name): "
+            f"PaddleOCR model name mismatches (inference.yml vs logical model name): "
             f"{', '.join(yml_mismatches)}. "
             f"Files checked under {models_dir}. "
-            "Likely cause: the Dockerfile's sed patch to fix model_name failed. "
-            "Check that the inference.yml files under {models_dir} contain a line "
-            "'  model_name: <directory-name>' matching the directory."
+            "Likely cause: stale model files from an older image patched "
+            "model_name to the *_infer directory name, or mixed PP-OCR model "
+            "generations. Rebuild the image so inference.yml keeps Paddle's "
+            "logical model names (for example 'model_name: PP-OCRv6_medium_det')."
         )
 
 
@@ -174,6 +187,40 @@ def _ensure_paddlex_cache_home() -> None:
         os.environ["PADDLE_PDX_CACHE_HOME"] = str(fallback_cache)
     else:
         os.environ["PADDLE_PDX_CACHE_HOME"] = str(configured_cache)
+
+
+def create_paddleocr_model(*, use_textline_orientation: bool = False) -> Any:
+    """Create a PaddleOCR instance pinned to the bundled local PP-OCRv6 models."""
+    # Prevent PaddleX from trying to write to / or other read-only locations.
+    # This must run before importing PaddleOCR because PaddleX reads the env var
+    # during import/initialization.
+    _ensure_paddlex_cache_home()
+    validate_paddleocr_models()
+
+    from paddleocr import PaddleOCR
+    import paddleocr._utils.logging as paddleocr_logging
+
+    # Suppress PaddleOCR's internal logging noise (e.g. "Creating model",
+    # "No model hoster"). We rely on the app's own logging for errors via the
+    # exception handling below.
+    paddleocr_logging.logger.setLevel(100)  # above DEBUG/ERROR
+
+    # The official PP-OCRv6 tarballs extract to *_infer directories, but the
+    # logical model names are the same strings without *_infer.  Pass both
+    # explicitly; otherwise PaddleOCR/PaddleX can combine a default PP-OCRv5
+    # model_name with our PP-OCRv6 model_dir for Latin languages.
+    return PaddleOCR(
+        use_doc_orientation_classify=False,
+        use_doc_unwarping=False,
+        use_textline_orientation=use_textline_orientation,
+        device="gpu" if OCR_USE_GPU else "cpu",
+        text_detection_model_name=TEXT_DETECTION_MODEL,
+        text_detection_model_dir=str(_model_dir(TEXT_DETECTION_MODEL)),
+        text_recognition_model_name=TEXT_RECOGNITION_MODEL,
+        text_recognition_model_dir=str(_model_dir(TEXT_RECOGNITION_MODEL)),
+        textline_orientation_model_name=TEXTLINE_ORIENTATION_MODEL,
+        textline_orientation_model_dir=str(_model_dir(TEXTLINE_ORIENTATION_MODEL)),
+    )
 
 
 def _get_paddleocr_model() -> Any:
@@ -193,36 +240,9 @@ def _get_paddleocr_model() -> Any:
         if init_exception is not None:
             raise init_exception
 
-        # Prevent PaddleX from trying to write to / or other read-only locations.
-        # This must run before importing PaddleOCR because PaddleX reads the env
-        # var during import/initialization.
-        _ensure_paddlex_cache_home()
-        validate_paddleocr_models()
-
         try:
-            from paddleocr import PaddleOCR
-            import paddleocr._utils.logging as paddleocr_logging
-
-            # Suppress PaddleOCR's internal logging noise (e.g. "Creating model", "No model hoster")
-            # We rely on the app's own logging for errors via the exception handling below.
-            paddleocr_logging.logger.setLevel(100)  # above DEBUG/ERROR
-            # Suppress PaddleOCR's UserWarning about lang/ocr_version being ignored when model dirs are provided
-            warnings.filterwarnings(
-                "ignore",
-                message=r"`lang` and `ocr_version` will be ignored when model names or model directories are not `None`",
-            )
-
-            # Orientation model is loaded locally from the pre-downloaded directory,
-            # so no network download attempts occur.
-            _get_paddleocr_model._model = PaddleOCR(  # type: ignore[attr-defined]
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-                lang=paddleocr_lang_code(),
-                device="gpu" if OCR_USE_GPU else "cpu",
-                text_detection_model_dir=str(_model_dir(TEXT_DETECTION_MODEL)),
-                text_recognition_model_dir=str(_model_dir(TEXT_RECOGNITION_MODEL)),
-                textline_orientation_model_dir=str(_model_dir(TEXTLINE_ORIENTATION_MODEL)),
+            _get_paddleocr_model._model = create_paddleocr_model(  # type: ignore[attr-defined]
+                use_textline_orientation=False
             )
         except Exception as exc:
             # Store the exception to avoid "PDX has already been initialized"
@@ -243,26 +263,43 @@ def run_paddleocr(file_path: str) -> list[dict]:
         blocks (list[dict]): per-block text, bbox, confidence
     """
     model = _get_paddleocr_model()
-    result = model.ocr(file_path)
+    result = model.predict(file_path)
+
+    def _jsonable(value: Any) -> Any:
+        if hasattr(value, "tolist"):
+            return value.tolist()
+        return value
 
     pages: list[dict] = []
     for page_idx, page_result in enumerate(result or []):
-        if page_result is None:
+        if not page_result:
             pages.append({"page": page_idx + 1, "text": "", "blocks": []})
             continue
 
+        rec_texts = page_result.get("rec_texts", [])
+        rec_scores = page_result.get("rec_scores", [])
+        rec_boxes = page_result.get("rec_boxes", [])
+        rec_polys = page_result.get("rec_polys", page_result.get("dt_polys", []))
+
         blocks: list[dict] = []
         text_parts: list[str] = []
-        for line in page_result:
-            bbox, (text, confidence) = line[0], line[1]
+        for idx, text in enumerate(rec_texts):
+            if not str(text).strip():
+                continue
+
+            confidence = float(rec_scores[idx]) if idx < len(rec_scores) else 0.0
+            bbox = rec_boxes[idx] if idx < len(rec_boxes) else None
+            if bbox is None and idx < len(rec_polys):
+                bbox = rec_polys[idx]
+
             blocks.append(
                 {
-                    "text": text,
-                    "bbox": bbox,
+                    "text": str(text),
+                    "bbox": _jsonable(bbox),
                     "confidence": round(confidence, 4),
                 }
             )
-            text_parts.append(text)
+            text_parts.append(str(text))
 
         pages.append(
             {

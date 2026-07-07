@@ -45,7 +45,6 @@ DOCLING_MODE = os.getenv(
 )  # "off" | "best_effort" | "required" | "native"
 OCR_LANG = os.getenv("OCR_LANG", "deu")
 OCR_USE_GPU = os.getenv("OCR_USE_GPU", "false").lower() in ("true", "1", "yes")
-PADDLEOCR_MODELS = os.getenv("PADDLEOCR_MODELS", "/app/models")
 
 for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
     path.mkdir(parents=True, exist_ok=True)
@@ -233,8 +232,8 @@ def generate_native_sidecar(pdf_path: Path) -> bool:
 def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
     """Run OCRmyPDF with PaddleOCR engine via Python API.
 
-    Uses the ocrmypdf-paddleocr plugin which properly implements the
-    OcrEngine interface, generating hOCR from PaddleOCR bounding boxes.
+    Uses the local ocrmypdf_paddleocr plugin which implements the OcrEngine
+    interface with the bundled local PP-OCRv6 model directories.
     """
     ocrmypdf.ocr(
         input_pdf,
@@ -243,9 +242,6 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
         language=OCR_LANG,
         force_ocr=True,
         paddle_use_gpu=OCR_USE_GPU,
-        paddle_det_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_det_infer",
-        paddle_rec_model_dir=f"{PADDLEOCR_MODELS}/PP-OCRv6_medium_rec_infer",
-        paddle_cls_model_dir=f"{PADDLEOCR_MODELS}/PP-LCNet_x1_0_textline_ori_infer",
     )
 
 
