@@ -22,7 +22,7 @@
 ARG PADDLE_GPU=cpu
 
 # CPU base (default)
-FROM python:3.12-slim-bookworm AS base-cpu
+FROM python:3.14-slim-bookworm@sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9 AS base-cpu
 
 # CUDA base (NVIDIA GPU)
 FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS base-cuda
