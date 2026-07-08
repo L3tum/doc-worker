@@ -50,6 +50,7 @@ from paddleocr_helpers import (
     get_paddleocr_init_exception,
     paddleocr_lang_code,
     run_paddleocr,
+    validate_paddleocr_models,
 )
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -66,6 +67,110 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
 
 app = FastAPI(title="Doc-Worker (PaddleOCR-VL)", version="1.0.0")
 logger = logging.getLogger("doc-worker.api")
+
+
+def _print_gpu_info() -> str:
+    """Detect PaddleOCR GPU support at runtime and return a human-readable string."""
+    try:
+        import paddle
+        has_cuda = paddle.device.is_compiled_with_cuda()
+        if has_cuda and OCR_USE_GPU:
+            # Try to get device count for extra info
+            try:
+                count = paddle.device.cuda.device_count()
+                return f"GPU (CUDA, {count} device(s), OCR_USE_GPU=true)"
+            except Exception:
+                return "GPU (CUDA, device count unknown)"
+        elif has_cuda:
+            return "GPU (CUDA available, OCR_USE_GPU=false — running on CPU)"
+        else:
+            return "CPU (paddlepaddle CPU-only)"
+    except Exception:
+        return "GPU detection unavailable"
+
+
+_PADDLEOCR_MODELS_LIST = [
+    ("PP-OCRv6_medium_det", "PP-OCRv6_medium_det_infer"),
+    ("PP-OCRv6_medium_rec", "PP-OCRv6_medium_rec_infer"),
+    ("PP-LCNet_x1_0_textline_ori", "PP-LCNet_x1_0_textline_ori_infer"),
+]
+
+
+def _model_status(model_name: str, model_dir_name: str) -> str:
+    """Return '✓' or '✗ <detail>' for a single model."""
+    model_path = Path(PADDLEOCR_MODELS) / model_dir_name
+    if not model_path.is_dir():
+        return f"✗ {model_path} not found"
+    # Check required files
+    for fname in ("inference.pdiparams", "inference.yml"):
+        if not (model_path / fname).is_file():
+            return f"✗ {fname} missing"
+    if not any(
+        (model_path / f).is_file()
+        for f in ("inference.json", "inference.pdmodel")
+    ):
+        return "✗ no model definition file"
+    return "✓"
+
+
+@app.on_event("startup")
+async def _startup_status() -> None:
+    """Print a human-readable status overview when the server starts."""
+    separator = "=" * 50
+    print(separator, flush=True)
+    print("Doc-Worker starting up", flush=True)
+    print(separator, flush=True)
+
+    # GPU / engine info
+    gpu_info = _print_gpu_info()
+    print(f"  PaddleOCR engine ....... {gpu_info}", flush=True)
+    print(f"  OCR language ........... {OCR_LANG} (PaddleOCR: {paddleocr_lang_code()})", flush=True)
+    print(f"  Models dir ............. {PADDLEOCR_MODELS}", flush=True)
+
+    # Model status
+    print("  PaddleOCR models:", flush=True)
+    any_missing = False
+    for model_name, model_dir in _PADDLEOCR_MODELS_LIST:
+        status = _model_status(model_name, model_dir)
+        marker = "  ✓" if status == "✓" else "  ✗"
+        pad = " " * (max(len(n) for n, _ in _PADDLEOCR_MODELS_LIST) - len(model_name))
+        print(f"    {model_name}{pad} {marker} {status}", flush=True)
+        if status != "✓":
+            any_missing = True
+
+    # Docling sidecar
+    print("  Docling sidecar:", flush=True)
+    docling_url = os.getenv("DOCLING_BASE_URL", "")
+    if docling_url:
+        try:
+            import requests
+            health = requests.head(f"{docling_url}/health", timeout=5)
+            status = "✓ online" if health.status_code == 200 else f"✗ HTTP {health.status_code}"
+        except Exception:
+            status = "✗ offline (worker will wait up to 900s)"
+        print(f"    DOCLING_BASE_URL .... {docling_url}  {status}", flush=True)
+    else:
+        print("    DOCLING_BASE_URL .... (not configured)", flush=True)
+
+    # Paperless
+    print("  Paperless-ngx:", flush=True)
+    paperless = os.getenv("PAPERLESS_CONSUME", "")
+    if paperless:
+        print(f"    PAPERLESS_CONSUME ... {paperless}", flush=True)
+    else:
+        print("    PAPERLESS_CONSUME ... (not configured)", flush=True)
+
+    # API endpoints
+    print("  API endpoints:", flush=True)
+    print("    /layout-parsing (Open-WebUI)", flush=True)
+    print("    /extract (direct upload)", flush=True)
+    print("    /health", flush=True)
+
+    print(separator, flush=True)
+
+    # If critical models are missing, abort
+    if any_missing:
+        validate_paddleocr_models()  # Will raise; caught by startup event handler
 
 
 @app.middleware("http")
