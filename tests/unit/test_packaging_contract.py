@@ -19,7 +19,4 @@ def test_dockerfile_does_not_patch_inference_yml_to_infer_directory_names():
     assert "sed -i" not in dockerfile
     assert "PP-OCRv6_medium_det_infer PP-OCRv6_medium_det" in dockerfile
     assert "PP-OCRv6_medium_rec_infer PP-OCRv6_medium_rec" in dockerfile
-    assert (
-        "PP-LCNet_x1_0_textline_ori_infer PP-LCNet_x1_0_textline_ori"
-        in dockerfile
-    )
+    assert "PP-LCNet_x1_0_textline_ori_infer PP-LCNet_x1_0_textline_ori" in dockerfile

@@ -48,7 +48,9 @@ def _write_all_models(root: Path, **kwargs: Any) -> None:
         _write_model(root, logical_model_name, **kwargs)
 
 
-def test_constants_use_logical_model_names_not_infer_directory_names(tmp_path, monkeypatch):
+def test_constants_use_logical_model_names_not_infer_directory_names(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(helpers, "PADDLEOCR_MODELS", str(tmp_path))
 
     assert helpers.TEXT_DETECTION_MODEL == "PP-OCRv6_medium_det"
@@ -136,9 +138,9 @@ def test_validate_renames_legacy_orientation_directory(tmp_path, monkeypatch):
 
     helpers.validate_paddleocr_models()
 
-    expected_dir = tmp_path / helpers.PADDLEOCR_MODEL_DIRS[
-        helpers.TEXTLINE_ORIENTATION_MODEL
-    ]
+    expected_dir = (
+        tmp_path / helpers.PADDLEOCR_MODEL_DIRS[helpers.TEXTLINE_ORIENTATION_MODEL]
+    )
     assert expected_dir.is_dir()
     assert not legacy_dir.exists()
 
@@ -217,7 +219,11 @@ def test_run_paddleocr_converts_paddleocr3_predict_result_to_sidecar_pages(
                 {
                     "rec_texts": ["Hello", "", "World"],
                     "rec_scores": [0.98765, 0.5, 0.87654],
-                    "rec_boxes": [_ArrayLike([1, 2, 3, 4]), [5, 6, 7, 8], [9, 10, 11, 12]],
+                    "rec_boxes": [
+                        _ArrayLike([1, 2, 3, 4]),
+                        [5, 6, 7, 8],
+                        [9, 10, 11, 12],
+                    ],
                 }
             ]
         ),

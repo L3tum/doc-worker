@@ -97,9 +97,7 @@ class PaddleOcrEngine(OcrEngine):
         return SUPPORTED_LANGUAGES
 
     @staticmethod
-    def get_orientation(
-        input_file: Path, options: OcrOptions
-    ) -> OrientationConfidence:
+    def get_orientation(input_file: Path, options: OcrOptions) -> OrientationConfidence:
         # Avoid loading PaddleOCR's separate document-orientation model.  The
         # worker does not request OCRmyPDF page rotation, and returning a neutral
         # orientation keeps offline operation deterministic if OCRmyPDF asks.

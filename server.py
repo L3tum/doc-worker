@@ -37,6 +37,8 @@ import base64
 import logging
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 from typing import Awaitable, Callable
@@ -47,6 +49,7 @@ from starlette.responses import Response
 from pydantic import BaseModel
 
 from paddleocr_helpers import (
+    destroy_paddleocr_model,
     get_paddleocr_init_exception,
     paddleocr_lang_code,
     run_paddleocr,
@@ -62,17 +65,31 @@ PADDLEOCR_MODELS = os.getenv("PADDLEOCR_MODELS", "/app/models")
 # Max request body: 100 MB (base64-encoded PDFs can be ~33% larger than raw)
 MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", "104857600"))  # 100 MB default
 
+# Model idle timeout — destroy PaddleOCR model after N seconds of inactivity
+MODEL_IDLE_TIMEOUT = int(os.getenv("MODEL_IDLE_TIMEOUT", "30"))
+
 # Image extensions that Open-WebUI sends as fileType=1
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
 
 app = FastAPI(title="Doc-Worker (PaddleOCR-VL)", version="1.0.0")
 logger = logging.getLogger("doc-worker.api")
 
+# Track when the PaddleOCR model was last used (for idle-timeout destruction)
+_model_last_used = 0.0
+_model_last_used_lock = threading.Lock()
+
+
+def _mark_model_used() -> None:
+    """Update the model last-use timestamp (thread-safe)."""
+    with _model_last_used_lock:
+        _model_last_used = time.time()
+
 
 def _print_gpu_info() -> str:
     """Detect PaddleOCR GPU support at runtime and return a human-readable string."""
     try:
         import paddle
+
         has_cuda = paddle.device.is_compiled_with_cuda()
         if has_cuda and OCR_USE_GPU:
             # Try to get device count for extra info
@@ -106,11 +123,43 @@ def _model_status(model_name: str, model_dir_name: str) -> str:
         if not (model_path / fname).is_file():
             return f"✗ {fname} missing"
     if not any(
-        (model_path / f).is_file()
-        for f in ("inference.json", "inference.pdmodel")
+        (model_path / f).is_file() for f in ("inference.json", "inference.pdmodel")
     ):
         return "✗ no model definition file"
     return "✓"
+
+
+def _idle_timeout_checker() -> None:
+    """Background daemon thread: destroy the model after MODEL_IDLE_TIMEOUT seconds of inactivity.
+
+    Wakes every 5 seconds, checks if the model is loaded and the idle timeout
+    has elapsed, then calls `destroy_paddleocr_model()`.
+    """
+    global _model_last_used
+    logger.info(
+        f"Model idle timeout thread started (timeout={MODEL_IDLE_TIMEOUT}s, poll=5s)"
+    )
+    while True:
+        try:
+            time.sleep(5)
+            with _model_last_used_lock:
+                if (
+                    _model_last_used > 0
+                    and time.time() - _model_last_used > MODEL_IDLE_TIMEOUT
+                ):
+                    destroy_paddleocr_model()
+                    _model_last_used = 0  # reset so we don't re-destroy on next wake
+        except Exception:
+            logger.exception("Idle timeout thread encountered an error, continuing")
+
+
+def _start_idle_timeout_thread() -> None:
+    """Start the idle-timeout checker as a daemon thread."""
+    thread = threading.Thread(
+        target=_idle_timeout_checker, daemon=True, name="model-idle-timeout"
+    )
+    thread.start()
+    logger.info("Model idle-timeout background thread started")
 
 
 @app.on_event("startup")
@@ -124,7 +173,10 @@ async def _startup_status() -> None:
     # GPU / engine info
     gpu_info = _print_gpu_info()
     print(f"  PaddleOCR engine ....... {gpu_info}", flush=True)
-    print(f"  OCR language ........... {OCR_LANG} (PaddleOCR: {paddleocr_lang_code()})", flush=True)
+    print(
+        f"  OCR language ........... {OCR_LANG} (PaddleOCR: {paddleocr_lang_code()})",
+        flush=True,
+    )
     print(f"  Models dir ............. {PADDLEOCR_MODELS}", flush=True)
 
     # Model status
@@ -144,8 +196,13 @@ async def _startup_status() -> None:
     if docling_url:
         try:
             import requests
+
             health = requests.head(f"{docling_url}/health", timeout=5)
-            status = "✓ online" if health.status_code == 200 else f"✗ HTTP {health.status_code}"
+            status = (
+                "✓ online"
+                if health.status_code == 200
+                else f"✗ HTTP {health.status_code}"
+            )
         except Exception:
             status = "✗ offline (worker will wait up to 900s)"
         print(f"    DOCLING_BASE_URL .... {docling_url}  {status}", flush=True)
@@ -167,6 +224,9 @@ async def _startup_status() -> None:
     print("    /health", flush=True)
 
     print(separator, flush=True)
+
+    # Start the model idle-timeout background thread
+    _start_idle_timeout_thread()
 
     # If critical models are missing, abort
     if any_missing:
@@ -245,6 +305,7 @@ async def layout_parsing(
             tmp.write(file_bytes)
             tmp_path = tmp.name
 
+        _mark_model_used()
         pages = run_paddleocr(tmp_path)
 
         # Build Open-WebUI response format
@@ -317,6 +378,7 @@ async def extract_text(
             tmp.write(file_bytes)
             tmp_path = tmp.name
 
+        _mark_model_used()
         pages = run_paddleocr(tmp_path)
 
         full_text = "\n\n".join(p["text"] for p in pages if p["text"])

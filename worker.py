@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -27,7 +28,11 @@ import ocrmypdf
 import requests
 import json
 
-from paddleocr_helpers import run_paddleocr, validate_paddleocr_models
+from paddleocr_helpers import (
+    destroy_paddleocr_model,
+    run_paddleocr,
+    validate_paddleocr_models,
+)
 
 # ---------------------------------------------------------------------------
 # Configuration — all overridable via environment variables
@@ -45,9 +50,46 @@ DOCLING_MODE = os.getenv(
 )  # "off" | "best_effort" | "required" | "native"
 OCR_LANG = os.getenv("OCR_LANG", "deu")
 OCR_USE_GPU = os.getenv("OCR_USE_GPU", "false").lower() in ("true", "1", "yes")
+MODEL_IDLE_TIMEOUT = int(os.getenv("MODEL_IDLE_TIMEOUT", "30"))
 
 for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
     path.mkdir(parents=True, exist_ok=True)
+
+# Track when the PaddleOCR model was last used (for idle-timeout destruction)
+_model_last_used = 0.0
+_model_last_used_lock = threading.Lock()
+
+
+def _mark_model_used() -> None:
+    """Update the model last-use timestamp (thread-safe)."""
+    with _model_last_used_lock:
+        _model_last_used = time.time()
+
+
+def _worker_idle_timeout_checker() -> None:
+    """Background daemon thread: destroy the model after MODEL_IDLE_TIMEOUT seconds of inactivity.
+
+    Wakes every 5 seconds, checks if the model is loaded and the idle timeout
+    has elapsed, then calls `destroy_paddleocr_model()`.
+    """
+    global _model_last_used
+    log(
+        f"Worker model idle timeout thread started (timeout={MODEL_IDLE_TIMEOUT}s, poll=5s)"
+    )
+    while True:
+        try:
+            time.sleep(5)
+            with _model_last_used_lock:
+                if (
+                    _model_last_used > 0
+                    and time.time() - _model_last_used > MODEL_IDLE_TIMEOUT
+                ):
+                    destroy_paddleocr_model()
+                    _model_last_used = 0  # reset so we don't re-destroy on next wake
+        except Exception:
+            log_error("Worker idle timeout thread encountered an error, continuing")
+            import traceback
+            traceback.print_exc()
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +229,7 @@ def generate_native_sidecar(pdf_path: Path) -> bool:
     using the same naming convention as the Docling API.
     """
     try:
+        _mark_model_used()
         pages = run_paddleocr(str(pdf_path))
 
         filename_stem = pdf_path.stem
@@ -401,6 +444,15 @@ def main() -> None:
         log_error(f"PaddleOCR model validation failed: {exc}")
         sys.exit(1)
 
+    # Start the model idle-timeout background thread
+    idle_thread = threading.Thread(
+        target=_worker_idle_timeout_checker,
+        daemon=True,
+        name="worker-model-idle-timeout",
+    )
+    idle_thread.start()
+    log("Worker model idle-timeout background thread started")
+
     # Wait for Docling to become available (if configured)
     docling_timeout = int(os.getenv("DOCLING_TIMEOUT", "900"))
     wait_for_docling(docling_timeout)
@@ -434,7 +486,9 @@ def main() -> None:
                     # If a previous attempt already moved the file to PROCESSING,
                     # retry with that path instead of the original INBOX path.
                     current_path = (
-                        PROCESSING / pdf.name if (PROCESSING / pdf.name).exists() else pdf
+                        PROCESSING / pdf.name
+                        if (PROCESSING / pdf.name).exists()
+                        else pdf
                     )
 
                     try:
@@ -460,7 +514,9 @@ def main() -> None:
                     log_error(f"Max retries reached for {pdf.name}")
                     # Make sure the file ends up in ERROR/ after the final attempt.
                     failed_path = (
-                        PROCESSING / pdf.name if (PROCESSING / pdf.name).exists() else pdf
+                        PROCESSING / pdf.name
+                        if (PROCESSING / pdf.name).exists()
+                        else pdf
                     )
                     move_to_error(failed_path, "max retries reached")
 

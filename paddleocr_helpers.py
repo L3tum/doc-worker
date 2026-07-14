@@ -35,6 +35,7 @@ PADDLEOCR_MODEL_DIRS = {
     TEXTLINE_ORIENTATION_MODEL: "PP-LCNet_x1_0_textline_ori_infer",
 }
 
+
 # ── Language mapping ───────────────────────────────────────────────────
 def paddleocr_lang_code() -> str:
     """Map ocrmypdf/Tesseract language codes to PaddleOCR lang codes."""
@@ -251,6 +252,67 @@ def _get_paddleocr_model() -> Any:
             raise
 
         return _get_paddleocr_model._model  # type: ignore[attr-defined]
+
+
+# ── Model destruction (idle memory reclamation) ─────────────────────────
+def destroy_paddleocr_model() -> None:
+    """Destroy the cached PaddleOCR model and reclaim GPU/CPU memory.
+
+    This should be called after the model has been idle for a configurable
+    timeout to prevent unnecessary RAM/GPU usage between requests. The next
+    call to `_get_paddleocr_model()` will create a fresh instance.
+    """
+    import gc
+    import logging
+
+    logger = logging.getLogger("doc-worker.paddleocr_helpers")
+
+    try:
+        with _PADDLEOCR_MODEL_LOCK:
+            # Clear server's singleton
+            if hasattr(_get_paddleocr_model, "_model"):
+                del _get_paddleocr_model._model
+            if hasattr(_get_paddleocr_model, "_init_exception"):
+                del _get_paddleocr_model._init_exception
+
+        # Clear OCRmyPDF plugin's singleton to release its GPU predictor.
+        # The plugin uses a different PaddleOCR instance (use_textline_orientation=True)
+        # and holds its own C++ predictor in memory. We must reset it too.
+        # We use a dynamic import to avoid circular dependencies.
+        try:
+            engine_module = __import__(
+                "ocrmypdf_paddleocr.engine", fromlist=["_reset_paddle_engine"]
+            )
+            if hasattr(engine_module, "_reset_paddle_engine"):
+                engine_module._reset_paddle_engine()
+            logger.debug("Plugin engine (_paddle_engine) reset")
+        except ImportError:
+            # Plugin not installed or not yet imported — this is fine,
+            # just skip it.
+            logger.debug(
+                "ocrmypdf_paddleocr.engine not available, skipping plugin reset"
+            )
+
+        # Force garbage collection to release Python-side references
+        gc.collect()
+
+        # If GPU is enabled, explicitly empty the CUDA cache so the driver
+        # can reclaim memory. On CPU builds, this is a no-op.
+        if OCR_USE_GPU:
+            try:
+                import paddle.device
+
+                paddle.device.cuda.empty_cache()
+                logger.info("GPU memory cache cleared")
+            except Exception:
+                logger.exception("Failed to clear CUDA cache")
+                # Non-fatal; next request will just work
+
+        logger.info("PaddleOCR model destroyed — memory reclaimed")
+
+    except Exception:
+        # Never crash — log and move on. Next request will reload the model.
+        logger.exception("Error during PaddleOCR model destruction")
 
 
 # ── OCR extraction ─────────────────────────────────────────────────────
