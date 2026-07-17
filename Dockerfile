@@ -13,7 +13,7 @@
 # PaddlePaddle handles GPU detection internally. The PADDLE_GPU build arg
 # controls which PaddlePaddle package is installed:
 #   cpu  — paddlepaddle (CPU-only, smallest image)
-#   cuda — paddlepaddle-gpu (NVIDIA GPU, CUDA 12.x)
+#   cuda — paddlepaddle-gpu (NVIDIA GPU, CUDA 12.9)
 #
 # Note: ROCm (AMD GPU) is not supported — PaddlePaddle's ROCm wheels are only
 # available via their Docker images, not pip.
@@ -25,7 +25,7 @@ ARG PADDLE_GPU=cpu
 FROM python:3.12-slim-bookworm AS base-cpu
 
 # CUDA base (NVIDIA GPU)
-FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04 AS base-cuda
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS base-cuda
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 python3.12-venv python3-pip \
@@ -64,12 +64,11 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Swap in GPU PaddlePaddle if requested
-# Note: PaddlePaddle GPU wheels are built against CUDA 12.6 (cu126), but the
-# base image uses CUDA 12.8 for newer GPU support (e.g. Blackwell). CUDA is
-# backward-compatible within the 12.x series, so this works fine.
+# Note: PaddlePaddle GPU wheels are built against CUDA 12.9 (cu129), and the
+# base image uses CUDA 12.9.2 for compatible runtime.
 RUN if [ "$PADDLE_GPU" = "cuda" ]; then \
       pip uninstall -y paddlepaddle && \
-      pip install --no-cache-dir paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/; \
+      pip install --no-cache-dir paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/; \
     fi
 
 # ---------------------------------------------------------------------------
