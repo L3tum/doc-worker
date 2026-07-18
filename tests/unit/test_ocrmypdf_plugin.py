@@ -15,12 +15,14 @@ def test_ocrmypdf_engine_uses_shared_local_paddleocr_factory(monkeypatch):
     fake_model = object()
     calls: list[dict[str, Any]] = []
 
-    def fake_create_paddleocr_model(*, use_textline_orientation: bool) -> object:
+    def fake_create_paddlex_ocr_pipeline(
+        *, use_textline_orientation: bool = True
+    ) -> object:
         calls.append({"use_textline_orientation": use_textline_orientation})
         return fake_model
 
     monkeypatch.setattr(
-        "paddleocr_helpers.create_paddleocr_model", fake_create_paddleocr_model
+        "paddlex_helpers._create_paddlex_ocr_pipeline", fake_create_paddlex_ocr_pipeline
     )
     monkeypatch.setenv("OMP_THREAD_LIMIT", "1")
 

@@ -86,7 +86,7 @@ ENV PADDLE_PDX_CACHE_HOME=/tmp/.paddlex
 RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
     chmod 1777 "${PADDLE_PDX_CACHE_HOME}" && \
     base="https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0" && \
-    for name in PP-OCRv6_medium_det_infer PP-OCRv6_medium_rec_infer PP-LCNet_x1_0_textline_ori_infer; do \
+    for name in PP-OCRv6_medium_det_infer PP-OCRv6_medium_rec_infer PP-LCNet_x1_0_textline_ori_infer PP-DocLayout-L_infer; do \
         echo "Downloading ${name}..." && \
         wget -q "${base}/${name}.tar" -O "/tmp/${name}.tar" && \
         tar -xf "/tmp/${name}.tar" -C "${PADDLEOCR_MODELS}" && \
@@ -95,7 +95,8 @@ RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
     for spec in \
         "PP-OCRv6_medium_det_infer PP-OCRv6_medium_det" \
         "PP-OCRv6_medium_rec_infer PP-OCRv6_medium_rec" \
-        "PP-LCNet_x1_0_textline_ori_infer PP-LCNet_x1_0_textline_ori"; do \
+        "PP-LCNet_x1_0_textline_ori_infer PP-LCNet_x1_0_textline_ori" \
+        "PP-DocLayout-L_infer PP-DocLayout-L"; do \
         set -- ${spec}; dir="$1"; model="$2"; \
         if ! grep -Eq "^[[:space:]]*model_name:[[:space:]]*${model}$" "${PADDLEOCR_MODELS}/${dir}/inference.yml"; then \
             echo "ERROR: ${dir}/inference.yml does not declare model_name: ${model}" && exit 1; \
@@ -109,9 +110,9 @@ WORKDIR /app
 COPY . .
 
 # ---------------------------------------------------------------------------
-# Expose API port
+# Expose API ports
 # ---------------------------------------------------------------------------
-EXPOSE 8000
+EXPOSE 8000 8001
 
 # ---------------------------------------------------------------------------
 # Runtime metadata label
@@ -119,10 +120,10 @@ EXPOSE 8000
 LABEL paddle-gpu="${PADDLE_GPU}"
 
 # ---------------------------------------------------------------------------
-# Health check — verifies the API server is responsive
+# Health check — verifies the health check server (port 8001) is responsive
 # ---------------------------------------------------------------------------
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')" || exit 1
 
 # ---------------------------------------------------------------------------
 # Entrypoint — tini manages signals, shell script forwards to child processes
@@ -130,7 +131,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["sh", "-c", " \
     python -u server.py & SERVER_PID=$! && \
+    echo $SERVER_PID > /tmp/doc-server.pid && \
     python -u worker.py & WORKER_PID=$! && \
+    echo $WORKER_PID > /tmp/doc-worker.pid && \
     trap 'kill $SERVER_PID $WORKER_PID 2>/dev/null; wait' TERM INT && \
     wait \
 "]

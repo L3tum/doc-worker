@@ -30,3 +30,6 @@ paperless-consume/
 
 # Docker
 *.log
+
+# MagicMock directories (auto-created by tests, not needed in repo)
+MagicMock/

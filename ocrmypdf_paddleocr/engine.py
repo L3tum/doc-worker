@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,23 +22,26 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# Configure logger for the engine to output to stdout, immediately flushed
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setLevel(logging.INFO)
+_handler.setFormatter(logging.Formatter("%(name)s [%(levelname)s]: %(message)s"))
+log.addHandler(_handler)
+log.setLevel(logging.INFO)
+
 _paddle_engine = None
 _paddle_lang = None
 
 
 def _create_paddle_engine(lang: str):
-    """Create a new PaddleOCR engine instance using local PP-OCRv6 models."""
+    """Create a new PaddleX General OCR engine instance using local PP-OCRv6 models."""
     # Tesseract's plugin sets OMP_THREAD_LIMIT=1 which cripples PaddlePaddle.
     saved = os.environ.pop("OMP_THREAD_LIMIT", None)
 
-    from paddleocr_helpers import create_paddleocr_model
+    from paddlex_helpers import _get_paddlex_model
 
     try:
-        # PP-OCRv6 medium is a unified multilingual recognizer, so lang is not
-        # passed to PaddleOCR.  Passing explicit model names + local dirs is what
-        # prevents PaddleX from combining a PP-OCRv5 default name with our
-        # PP-OCRv6 directory for Latin languages such as German.
-        return create_paddleocr_model(use_textline_orientation=True)
+        return _get_paddlex_model()
     finally:
         if saved is not None:
             os.environ["OMP_THREAD_LIMIT"] = saved
@@ -81,16 +85,16 @@ class PaddleOcrEngine(OcrEngine):
 
     @staticmethod
     def version() -> str:
-        import paddleocr
+        import paddlex
 
-        return getattr(paddleocr, "__version__", "unknown")
+        return getattr(paddlex, "__version__", "unknown")
 
     @staticmethod
     def creator_tag(options: OcrOptions) -> str:
-        return f"PaddleOCR {PaddleOcrEngine.version()}"
+        return f"PaddleX {PaddleOcrEngine.version()}"
 
     def __str__(self) -> str:
-        return f"PaddleOCR {self.version()}"
+        return f"PaddleX {self.version()}"
 
     @staticmethod
     def languages(options: OcrOptions) -> set[str]:
@@ -162,16 +166,28 @@ class PaddleOcrEngine(OcrEngine):
             result = engine.predict(str(input_file), return_word_box=True)
         except KeyError:
             # PaddleOCR can raise on blank images with return_word_box=True.
+            log.warning(
+                f"PaddleOCR KeyError on page {page_number + 1} — using basic predict()"
+            )
             result = engine.predict(str(input_file))
         except RuntimeError:
             # PaddlePaddle's C++ predictor can become stale across
-            # ThreadPoolExecutor lifecycles. Recreate and retry once.
+            # ThreadPoolExecutor lifecycles. Destroy and recreate fully.
             log.debug("PaddlePaddle inference failed, recreating engine")
             _reset_paddle_engine()
+            # Also destroy the singleton model in paddlex_helpers to avoid
+            # a stale predictor from the shared pipeline
+            try:
+                from paddlex_helpers import destroy_paddlex_model
+
+                destroy_paddlex_model()
+            except Exception:
+                log.exception("Failed to destroy paddlex model during recovery")
             engine = _get_paddle_engine(options)
             result = engine.predict(str(input_file), return_word_box=True)
 
         if not result or not result[0]:
+            log.warning(f"No OCR result for page {page_number + 1} ({input_file})")
             return page, ""
 
         ocr_data = result[0]
@@ -182,6 +198,7 @@ class PaddleOcrEngine(OcrEngine):
         text_word_regions = ocr_data.get("text_word_region", [])
 
         if not rec_texts:
+            log.warning(f"Page {page_number + 1}: no text lines detected (blank page)")
             return page, ""
 
         has_word_boxes = bool(text_words and text_word_regions)
@@ -228,7 +245,11 @@ class PaddleOcrEngine(OcrEngine):
                 page.children.append(line)
                 text_parts.append(str(text))
 
-        return page, "\n".join(text_parts)
+        full_text = "\n".join(text_parts)
+        log.info(
+            f"Page {page_number + 1}: {len(text_parts)} lines, {len(full_text)} chars"
+        )
+        return page, full_text
 
     @staticmethod
     def generate_hocr(input_file, output_hocr, output_text, options):

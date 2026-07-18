@@ -24,14 +24,18 @@ import threading
 import time
 from pathlib import Path
 
-import ocrmypdf
-import requests
+# Note: ocrmypdf and requests are imported lazily inside their respective
+# functions to avoid import-time failures when those dependencies are not
+# installed (e.g., in the test environment).
+# ocrmypdf: used by run_ocrmypdf() — lazy imported below
+# requests: used by call_docling_convert() — lazy imported below
 import json
 
-from paddleocr_helpers import (
-    destroy_paddleocr_model,
-    run_paddleocr,
-    validate_paddleocr_models,
+from paddlex_helpers import (
+    blocks_to_markdown,
+    destroy_paddlex_model,
+    run_paddlex_structure_v3,
+    validate_paddlex_models,
 )
 
 # ---------------------------------------------------------------------------
@@ -52,8 +56,12 @@ OCR_LANG = os.getenv("OCR_LANG", "deu")
 OCR_USE_GPU = os.getenv("OCR_USE_GPU", "false").lower() in ("true", "1", "yes")
 MODEL_IDLE_TIMEOUT = int(os.getenv("MODEL_IDLE_TIMEOUT", "30"))
 
-for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
-    path.mkdir(parents=True, exist_ok=True)
+
+def _ensure_directories() -> None:
+    """Create required directories. Only called at worker startup (not on import)."""
+    for path in [INBOX, PROCESSING, DONE, ERROR, DOCLING_OUT, PAPERLESS_CONSUME]:
+        path.mkdir(parents=True, exist_ok=True)
+
 
 # Track when the PaddleOCR model was last used (for idle-timeout destruction)
 _model_last_used = 0.0
@@ -70,7 +78,7 @@ def _worker_idle_timeout_checker() -> None:
     """Background daemon thread: destroy the model after MODEL_IDLE_TIMEOUT seconds of inactivity.
 
     Wakes every 5 seconds, checks if the model is loaded and the idle timeout
-    has elapsed, then calls `destroy_paddleocr_model()`.
+    has elapsed, then calls `destroy_paddlex_model()`.
     """
     global _model_last_used
     log(
@@ -84,11 +92,12 @@ def _worker_idle_timeout_checker() -> None:
                     _model_last_used > 0
                     and time.time() - _model_last_used > MODEL_IDLE_TIMEOUT
                 ):
-                    destroy_paddleocr_model()
+                    destroy_paddlex_model()
                     _model_last_used = 0  # reset so we don't re-destroy on next wake
         except Exception:
             log_error("Worker idle timeout thread encountered an error, continuing")
             import traceback
+
             traceback.print_exc()
 
 
@@ -153,6 +162,14 @@ def recover_leftover_files() -> None:
 # ---------------------------------------------------------------------------
 def call_docling_convert(pdf_path: Path) -> bool:
     """Send a PDF to the Docling API and return True on success."""
+    try:
+        import requests
+    except ImportError:
+        raise RuntimeError(
+            "requests is required for Docling API calls but not installed. "
+            "Run `pip install requests`."
+        )
+
     url = f"{DOCLING_BASE_URL}/v1alpha/convert"
     try:
         with open(pdf_path, "rb") as f:
@@ -223,25 +240,34 @@ def handle_docling(pdf_path: Path) -> bool:
 # Native PaddleOCR sidecar generation
 # ---------------------------------------------------------------------------
 def generate_native_sidecar(pdf_path: Path) -> bool:
-    """Generate Markdown + JSON sidecar files using local PaddleOCR.
+    """Generate Markdown + JSON sidecar files using PaddleX PP-StructureV3.
 
-    Outputs to DOCLING_OUT/{stem}/{stem}.md and DOCLING_OUT/{stem}/{stem}.json
-    using the same naming convention as the Docling API.
+    Outputs to DOCLING_OUT/{stem}/{stem}.md (structured markdown) and
+    DOCLING_OUT/{stem}/{stem}.json (structured blocks + text).
+
+    Uses PP-StructureV3 for layout-aware extraction with block types
+    (title, paragraph_title, text, table, image, etc.).
     """
     try:
         _mark_model_used()
-        pages = run_paddleocr(str(pdf_path))
+        pages = run_paddlex_structure_v3(str(pdf_path))
 
         filename_stem = pdf_path.stem
         out_dir = DOCLING_OUT / filename_stem
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build JSON sidecar
+        # Build JSON sidecar with structured blocks
         full_text = "\n\n".join(p["text"] for p in pages if p["text"])
         sidecar_json = {
             "filename": pdf_path.name,
             "pages": [
-                {"page": p["page"], "text": p["text"], "blocks": p["blocks"]}
+                {
+                    "page": p["page"],
+                    "text": p["text"],
+                    "markdown": blocks_to_markdown(p.get("structured_blocks", [])),
+                    "blocks": p["blocks"],
+                    "structured_blocks": p.get("structured_blocks", []),
+                }
                 for p in pages
             ],
             "full_text": full_text,
@@ -251,12 +277,13 @@ def generate_native_sidecar(pdf_path: Path) -> bool:
             json.dump(sidecar_json, wf, ensure_ascii=False, indent=2)
         log(f"  Native JSON written: {json_out}")
 
-        # Build Markdown sidecar (simple page-by-page text)
+        # Build structured Markdown sidecar (page-by-page with headers)
         md_parts: list[str] = []
         for p in pages:
-            md_parts.append(f"## Page {p['page']}")
-            if p["text"]:
-                md_parts.append(p["text"])
+            md_parts.append(f"## Page {p['page']}\n")
+            md_text = blocks_to_markdown(p.get("structured_blocks", []))
+            if md_text.strip():
+                md_parts.append(md_text)
         md_out = out_dir / f"{filename_stem}.md"
         with open(md_out, "w", encoding="utf-8") as wf:
             wf.write("\n\n".join(md_parts))
@@ -278,6 +305,20 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
     Uses the local ocrmypdf_paddleocr plugin which implements the OcrEngine
     interface with the bundled local PP-OCRv6 model directories.
     """
+    import time as _time
+
+    file_size = input_pdf.stat().st_size
+    log(f"  OCR start: {input_pdf.name} ({file_size:,} bytes)")
+    start_time = _time.time()
+
+    try:
+        import ocrmypdf
+    except ImportError:
+        raise RuntimeError(
+            "ocrmypdf is required but not installed. "
+            "Run `pip install ocrmypdf` or check your environment."
+        )
+
     ocrmypdf.ocr(
         input_pdf,
         output_pdf,
@@ -286,6 +327,10 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
         force_ocr=True,
         paddle_use_gpu=OCR_USE_GPU,
     )
+
+    elapsed = _time.time() - start_time
+    output_size = output_pdf.stat().st_size
+    log(f"  OCR finished: {elapsed:.1f}s, output {output_size:,} bytes")
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +368,13 @@ def wait_for_docling(timeout: int = 120) -> None:
     """
     if DOCLING_MODE in ("off", "native"):
         return
+
+    try:
+        import requests
+    except ImportError:
+        raise RuntimeError(
+            "requests is required but not installed. Run `pip install requests`."
+        )
 
     log(f"Waiting for Docling at {DOCLING_BASE_URL}...")
     deadline = time.time() + timeout
@@ -433,15 +485,18 @@ def main() -> None:
     log(f"  OCR_USE_GPU: {OCR_USE_GPU}")
     log(f"  STABILITY_TIMEOUT: {os.getenv('STABILITY_TIMEOUT', '10')}s")
 
+    # Ensure all required directories exist
+    _ensure_directories()
+
     # Crash recovery
     recover_leftover_files()
 
-    # Validate PaddleOCR models — fail fast if they're missing or mismatched
+    # Validate PaddleX models — fail fast if they're missing or mismatched
     try:
-        validate_paddleocr_models()
-        log("PaddleOCR models validated successfully.")
+        validate_paddlex_models()
+        log("PaddleX models validated successfully.")
     except Exception as exc:
-        log_error(f"PaddleOCR model validation failed: {exc}")
+        log_error(f"PaddleX model validation failed: {exc}")
         sys.exit(1)
 
     # Start the model idle-timeout background thread
