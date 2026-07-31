@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Doc-Worker — OCR pipeline for PDFs
 ===================================
@@ -17,19 +16,18 @@ moved to ERROR/ so they are not silently lost.
 
 from __future__ import annotations
 
-import os
-import shutil
-import sys
-import threading
-import time
-from pathlib import Path
-
 # Note: ocrmypdf and requests are imported lazily inside their respective
 # functions to avoid import-time failures when those dependencies are not
 # installed (e.g., in the test environment).
 # ocrmypdf: used by run_ocrmypdf() — lazy imported below
 # requests: used by call_docling_convert() — lazy imported below
 import json
+import os
+import shutil
+import sys
+import threading
+import time
+from pathlib import Path
 
 from paddlex_helpers import (
     blocks_to_markdown,
@@ -384,7 +382,7 @@ def wait_for_docling(timeout: int = 120) -> None:
             if resp.status_code == 200:
                 log("Docling is ready.")
                 return
-        except Exception:
+        except Exception:  # noqa: S110 — expected during startup, logged at deadline
             pass
         time.sleep(2)
     log(f"WARNING: Docling did not become ready within {timeout}s — continuing anyway.")

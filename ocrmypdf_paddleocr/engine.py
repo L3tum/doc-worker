@@ -10,10 +10,9 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from PIL import Image
-
 from ocrmypdf.models.ocr_element import BoundingBox, OcrClass, OcrElement
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
+from PIL import Image
 
 from ocrmypdf_paddleocr.lang_map import SUPPORTED_LANGUAGES, tesseract_to_paddle
 

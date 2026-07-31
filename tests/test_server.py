@@ -7,10 +7,11 @@ Tests /layout-parsing, /extract, and /health with mocked PaddleX pipelines.
 from __future__ import annotations
 
 import base64
-import pytest
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
+
 import server
 from server import app
 
@@ -156,16 +157,18 @@ class TestLayoutParsing:
         """Test /layout-parsing returns 503 when model init failed."""
         import server
 
-        with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
-            with patch(
+        with (
+            patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"),
+            patch(
                 "server.get_paddlex_init_exception",
                 return_value=Exception("Model init failed"),
-            ):
-                response = test_client.post(
-                    "/layout-parsing",
-                    headers={"Authorization": "Bearer test-token"},
-                    json={"file": base64.b64encode(b"fake").decode()},
-                )
+            ),
+        ):
+            response = test_client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Bearer test-token"},
+                json={"file": base64.b64encode(b"fake").decode()},
+            )
         assert response.status_code == 503
         data = response.json()
         assert data["detail"]["status"] == "unhealthy"
@@ -297,16 +300,18 @@ class TestExtract:
         """Test /extract returns 503 when model init failed."""
         import server
 
-        with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
-            with patch(
+        with (
+            patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"),
+            patch(
                 "server.get_paddlex_init_exception",
                 return_value=Exception("Model init failed"),
-            ):
-                response = test_client.post(
-                    "/extract",
-                    headers={"Authorization": "Bearer test-token"},
-                    files={"file": ("test.pdf", b"fake pdf", "application/pdf")},
-                )
+            ),
+        ):
+            response = test_client.post(
+                "/extract",
+                headers={"Authorization": "Bearer test-token"},
+                files={"file": ("test.pdf", b"fake pdf", "application/pdf")},
+            )
         assert response.status_code == 503
         data = response.json()
         assert data["detail"]["status"] == "unhealthy"

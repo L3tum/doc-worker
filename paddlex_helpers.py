@@ -187,9 +187,7 @@ def _create_paddlex_ocr_pipeline(use_textline_orientation: bool = True) -> Any:
     from paddlex import create_pipeline
 
     # Suppress PaddleX internal logging noise
-    import paddlex._utils.logging as paddlex_logging
-
-    paddlex_logging.logger.setLevel(100)
+    logging.getLogger("paddlex").setLevel(100)
 
     return create_pipeline(
         "ocr",
@@ -364,9 +362,7 @@ def _create_structure_v3_pipeline() -> Any:
     from paddlex import create_pipeline
 
     # Suppress logging
-    import paddlex._utils.logging as paddlex_logging
-
-    paddlex_logging.logger.setLevel(100)
+    logging.getLogger("paddlex").setLevel(100)
 
     return create_pipeline(
         "layout_parsing",
@@ -585,8 +581,8 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
 # ── Markdown builder ─────────────────────────────────────────────────────
 def _convert_table_html_to_markdown(html_content: str) -> str:
     """Convert simple HTML table to Markdown table using html.parser."""
-    from html.parser import HTMLParser
     import html as html_module
+    from html.parser import HTMLParser
 
     class TableParser(HTMLParser):
         """Minimal HTML table parser that handles tr, td, colspan.
@@ -669,9 +665,7 @@ def _convert_table_html_to_markdown(html_content: str) -> str:
 
     # Expand colspans into empty placeholder columns and determine max column count
     # Note: The HTML parser duplicates text for colspan > 1, so we use that duplicated content.
-    expanded_rows: list[list[str]] = []
-    for row in rows:
-        expanded_rows.append(row)
+    expanded_rows: list[list[str]] = list(rows)
 
     max_cols = max(len(r) for r in expanded_rows) if expanded_rows else 1
 
@@ -803,7 +797,7 @@ def blocks_to_markdown(structured_blocks: list[dict]) -> str:
 
         elif block_type == "table":
             # Table: use block_content which may contain HTML
-            if content.startswith("<html") or content.startswith("<table"):
+            if content.startswith(("<html", "<table")):
                 table_md = _convert_table_html_to_markdown(content)
                 lines.append(f"\n{table_md}\n")
             else:

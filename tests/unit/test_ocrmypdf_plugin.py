@@ -26,7 +26,7 @@ def test_ocrmypdf_engine_uses_shared_local_paddleocr_factory(monkeypatch):
     )
     monkeypatch.setenv("OMP_THREAD_LIMIT", "1")
 
-    assert engine._create_paddle_engine("german") is fake_model  # noqa: SLF001
+    assert engine._create_paddle_engine("german") is fake_model
     assert calls == [{"use_textline_orientation": True}]
     assert os.environ["OMP_THREAD_LIMIT"] == "1"
 

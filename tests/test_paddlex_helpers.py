@@ -6,14 +6,15 @@ Tests blocks_to_markdown, run_paddlex_ocr (with mocks), and model validation.
 
 from __future__ import annotations
 
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 from paddlex_helpers import (
     blocks_to_markdown,
+    paddleocr_lang_code,
     run_paddleocr,
     run_paddlex_structure_v3,
-    paddleocr_lang_code,
     validate_paddlex_models,
 )
 

@@ -1,0 +1,7 @@
+target-version = "py312"
+
+[lint]
+# Disable overly-strict rules that generate noise for this codebase:
+#   BLE001 — broad `except Exception` is intentional in a resilient worker pipeline
+#   SIM117 — combining 3+ nested `with` statements reduces readability
+ignore = ["BLE001", "SIM117"]

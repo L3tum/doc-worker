@@ -34,23 +34,21 @@ Additional endpoints (not used by Open-WebUI, for direct API access):
 from __future__ import annotations
 
 import base64
-from contextlib import asynccontextmanager
+import http.server
+import json
 import logging
 import os
 import tempfile
 import threading
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
-
-from typing import AsyncIterator, Awaitable, Callable
-
-import http.server
-import json
 
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
-from starlette.responses import Response
 from pydantic import BaseModel
+from starlette.responses import Response
 
 from paddlex_helpers import (
     blocks_to_markdown,
@@ -194,7 +192,7 @@ class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
                     with open(WORKER_PID_FILE, "r") as f:
                         pid = int(f.read().strip())
                     worker_alive = _worker_is_alive(pid)
-                except (ValueError, IOError):
+                except (OSError, ValueError):
                     worker_alive = False
 
             if worker_alive:
@@ -217,7 +215,6 @@ class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: str) -> None:
         """Suppress noisy request logs."""
-        pass
 
 
 def _start_health_check_server() -> None:
@@ -270,7 +267,6 @@ def _stop_worker_threads() -> None:
     worker threads (e.g., for task queues), they should be added here.
     """
     # Currently no explicit worker threads beyond the background threads above
-    pass
 
 
 # ── Lifespan context manager (replaces deprecated on_event) ───────────────
@@ -312,7 +308,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             import requests
 
-            health = requests.head(f"{docling_url}/health", timeout=5)
+            health = requests.head(f"{docling_url}/health", timeout=5)  # noqa: ASYNC210 — startup check, not request handler
             status = (
                 "✓ online"
                 if health.status_code == 200
@@ -361,7 +357,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         destroy_paddlex_model()
         print("  PaddleX models destroyed", flush=True)
     except Exception:
-        logging.exception("Error during model destruction")
+        logger.exception("Error during model destruction")
     # Stop any running worker threads (for async tasks)
     _stop_worker_threads()
     print("Shutdown complete", flush=True)

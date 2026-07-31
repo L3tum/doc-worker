@@ -14,12 +14,12 @@ log = logging.getLogger(__name__)
 def initialize(plugin_manager):
     """Check that PaddleOCR is importable at startup."""
     try:
-        import paddleocr  # noqa: F401
+        import paddlex  # noqa: F401
     except ImportError:
         from ocrmypdf.exceptions import MissingDependencyError
 
         raise MissingDependencyError(
-            "PaddleOCR is required but not installed. Install with: pip install paddleocr paddlepaddle"
+            "PaddleX is required but not installed. Install with: pip install paddlex paddlepaddle"
         )
 
 

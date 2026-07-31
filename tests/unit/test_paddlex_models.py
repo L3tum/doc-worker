@@ -9,15 +9,15 @@ import pytest
 
 # Import from paddlex_helpers directly (paddleocr_helpers is a shim)
 from paddlex_helpers import (
-    create_paddleocr_model,
-    run_paddleocr,
-    validate_paddlex_models,
+    LAYOUT_DETECTION_MODEL,
+    PADDLEX_MODEL_DIRS,
     TEXT_DETECTION_MODEL,
     TEXT_RECOGNITION_MODEL,
     TEXTLINE_ORIENTATION_MODEL,
-    LAYOUT_DETECTION_MODEL,
-    PADDLEX_MODEL_DIRS,
     _model_dir,
+    create_paddleocr_model,
+    run_paddleocr,
+    validate_paddlex_models,
 )
 
 REQUIRED_MODELS = (
@@ -72,18 +72,14 @@ def test_constants_use_logical_model_names_not_infer_directory_names(
     assert LAYOUT_DETECTION_MODEL == "PP-DocLayout-L"
     assert all(not model_name.endswith("_infer") for model_name in REQUIRED_MODELS)
 
-    assert _model_dir(TEXT_DETECTION_MODEL) == (  # noqa: SLF001
-        tmp_path / "PP-OCRv6_medium_det_infer"
-    )
-    assert _model_dir(TEXT_RECOGNITION_MODEL) == (  # noqa: SLF001
+    assert _model_dir(TEXT_DETECTION_MODEL) == (tmp_path / "PP-OCRv6_medium_det_infer")
+    assert _model_dir(TEXT_RECOGNITION_MODEL) == (
         tmp_path / "PP-OCRv6_medium_rec_infer"
     )
-    assert _model_dir(TEXTLINE_ORIENTATION_MODEL) == (  # noqa: SLF001
+    assert _model_dir(TEXTLINE_ORIENTATION_MODEL) == (
         tmp_path / "PP-LCNet_x1_0_textline_ori_infer"
     )
-    assert _model_dir(LAYOUT_DETECTION_MODEL) == (  # noqa: SLF001
-        tmp_path / "PP-DocLayout-L_infer"
-    )
+    assert _model_dir(LAYOUT_DETECTION_MODEL) == (tmp_path / "PP-DocLayout-L_infer")
 
 
 def test_validate_accepts_official_infer_dirs_with_logical_model_names(
@@ -199,20 +195,11 @@ def test_create_paddleocr_model_pins_logical_names_and_local_dirs(
         calls.append(kwargs)
         return {}  # dummy pipeline
 
-    fake_logger = types.SimpleNamespace(setLevel=lambda _level: None)
     # Mock paddlex module
     pdx_module = types.ModuleType("paddlex")
     pdx_module.__path__ = []  # type: ignore[attr-defined]
     pdx_module.create_pipeline = fake_create_pipeline
-    pdx_module._utils = types.ModuleType("paddlex._utils")
-    pdx_module._utils.__path__ = []  # type: ignore[attr-defined]
-    pdx_module._utils.logging = types.ModuleType("paddlex._utils.logging")
-    pdx_module._utils.logging.logger = fake_logger
     monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
-    monkeypatch.setitem(sys.modules, "paddlex._utils", pdx_module._utils)
-    monkeypatch.setitem(
-        sys.modules, "paddlex._utils.logging", pdx_module._utils.logging
-    )
 
     create_paddleocr_model(use_textline_orientation=True)
 
