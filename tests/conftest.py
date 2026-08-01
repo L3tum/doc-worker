@@ -101,7 +101,7 @@ def mock_create_pipeline(
     def mock_create(name: str, **kwargs: Any) -> Any:  # type: ignore[no-untyped-def]
         if name == "layout_parsing":
             return mock_paddlex_structure_v3_pipeline
-        elif name == "ocr":
+        elif name == "OCR":
             return mock_paddlex_ocr_pipeline
         else:
             return mock_paddlex_ocr_pipeline

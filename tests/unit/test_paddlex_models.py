@@ -20,6 +20,34 @@ from paddlex_helpers import (
     validate_paddlex_models,
 )
 
+
+# ── Fixture: reset singleton state between tests ──────────────────────────
+@pytest.fixture(autouse=True)
+def _reset_paddlex_singleton():
+    """Clear cached PaddleX model state before each test."""
+    import paddlex_helpers
+
+    # Clear any cached model/exception state
+    for obj in (
+        paddlex_helpers._get_paddlex_model,
+        paddlex_helpers._get_paddlex_structure_v3_model,
+    ):
+        for attr in ("_model", "_init_exception"):
+            if hasattr(obj, attr):
+                delattr(obj, attr)
+
+    yield
+
+    # Also clear after test in case of leaks
+    for obj in (
+        paddlex_helpers._get_paddlex_model,
+        paddlex_helpers._get_paddlex_structure_v3_model,
+    ):
+        for attr in ("_model", "_init_exception"):
+            if hasattr(obj, attr):
+                delattr(obj, attr)
+
+
 REQUIRED_MODELS = (
     TEXT_DETECTION_MODEL,
     TEXT_RECOGNITION_MODEL,
@@ -189,10 +217,10 @@ def test_create_paddleocr_model_pins_logical_names_and_local_dirs(
     monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
     _write_all_models(tmp_path)
 
-    calls: list[dict[str, Any]] = []
+    calls: list[tuple[str, dict[str, Any]]] = []
 
     def fake_create_pipeline(name: str, **kwargs: Any) -> dict:
-        calls.append(kwargs)
+        calls.append((name, kwargs))
         return {}  # dummy pipeline
 
     # Mock paddlex module
@@ -204,7 +232,9 @@ def test_create_paddleocr_model_pins_logical_names_and_local_dirs(
     create_paddleocr_model(use_textline_orientation=True)
 
     assert len(calls) == 1
-    kwargs = calls[0]
+    pipeline_name, kwargs = calls[0]
+    # PaddleX 3.x pipeline registry is case-sensitive — "OCR" (uppercase) is correct
+    assert pipeline_name == "OCR"
     # The pipeline name is "ocr"
     assert "text_detection_model_name" in kwargs
     assert kwargs["text_detection_model_name"] == "PP-OCRv6_medium_det"
@@ -296,3 +326,142 @@ def test_run_paddleocr_falls_back_to_polygons_when_boxes_are_missing(monkeypatch
             "confidence": 0.91,
         }
     ]
+
+
+# ── Model lifecycle: destroy + recreate ──────────────────────────────────
+
+
+def test_destroy_and_recreate_paddlex_model(tmp_path, monkeypatch):
+    """Verify that destroy_paddlex_model() + _get_paddlex_model() recreates the pipeline."""
+    import paddlex_helpers
+
+    monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+    monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+    _write_all_models(tmp_path)
+
+    create_count = 0
+
+    def counting_create_pipeline(name: str, **kwargs: Any) -> dict:
+        nonlocal create_count
+        create_count += 1
+        return {}
+
+    pdx_module = types.ModuleType("paddlex")
+    pdx_module.__path__ = []  # type: ignore[attr-defined]
+    pdx_module.create_pipeline = counting_create_pipeline
+    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+    # 1st creation
+    paddlex_helpers._get_paddlex_model()
+    assert create_count == 1
+
+    # Destroy
+    paddlex_helpers.destroy_paddlex_model()
+
+    # Re-creation
+    paddlex_helpers._get_paddlex_model()
+    assert create_count == 2  # pipeline was recreated, not reused
+
+
+# ── Retry logic: transient error recovery ────────────────────────────────
+
+
+def test_retry_on_transient_error(tmp_path, monkeypatch):
+    """Transient errors (not 'already been initialized') trigger retries."""
+    import paddlex_helpers
+
+    monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+    monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+    _write_all_models(tmp_path)
+
+    attempts = 0
+
+    def flaky_create_pipeline(name: str, **kwargs: Any) -> dict:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("network timeout")  # transient
+        return {}  # succeeds on 2nd attempt
+
+    pdx_module = types.ModuleType("paddlex")
+    pdx_module.__path__ = []  # type: ignore[attr-defined]
+    pdx_module.create_pipeline = flaky_create_pipeline
+    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+    # Should succeed after retry
+    model = paddlex_helpers._get_paddlex_model()
+    assert attempts == 2  # exactly 2 attempts (1 transient + 1 success)
+    assert model == {}
+
+
+# ── Retry logic: permanent error caching ─────────────────────────────────
+
+
+def test_cache_permanent_error(tmp_path, monkeypatch):
+    """Permanent errors ('already been initialized') are cached and don't retry."""
+    import paddlex_helpers
+
+    monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+    monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+    _write_all_models(tmp_path)
+
+    attempts = 0
+    original_error = RuntimeError("PDX has already been initialized")
+
+    def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+        nonlocal attempts
+        attempts += 1
+        raise original_error
+
+    pdx_module = types.ModuleType("paddlex")
+    pdx_module.__path__ = []  # type: ignore[attr-defined]
+    pdx_module.create_pipeline = permanent_failure_create_pipeline
+    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+    # First call: should raise
+    with pytest.raises(RuntimeError, match="already been initialized"):
+        paddlex_helpers._get_paddlex_model()
+    assert attempts == 1  # only 1 attempt, no retries for permanent errors
+
+    # Second call: should re-raise the cached exception (not retry)
+    with pytest.raises(RuntimeError, match="already been initialized"):
+        paddlex_helpers._get_paddlex_model()
+    assert attempts == 1  # still 1 — the cached exception was re-raised, no new attempt
+
+
+# ── Pipeline name correctness regression test ────────────────────────────
+
+
+def test_ocr_pipeline_uses_uppercase_ocr_name(tmp_path, monkeypatch):
+    """Regression: ensure 'OCR' (uppercase) is used, not 'ocr' (lowercase).
+
+    PaddleX 3.x pipeline registry is case-sensitive. The name 'ocr' (lowercase)
+    was accepted by test mocks but rejected by the real PaddleX API.
+    """
+    import paddlex_helpers
+
+    monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+    monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+    _write_all_models(tmp_path)
+
+    captured_name: list[str] = []
+
+    def capturing_create_pipeline(name: str, **kwargs: Any) -> dict:
+        captured_name.append(name)
+        return {}
+
+    pdx_module = types.ModuleType("paddlex")
+    pdx_module.__path__ = []  # type: ignore[attr-defined]
+    pdx_module.create_pipeline = capturing_create_pipeline
+    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+    # Clear any cached model from previous tests
+    if hasattr(paddlex_helpers._get_paddlex_model, "_model"):
+        del paddlex_helpers._get_paddlex_model._model
+
+    paddlex_helpers._get_paddlex_model()
+    assert len(captured_name) == 1
+    # This assertion would fail if the code used lowercase "ocr"
+    assert captured_name[0] == "OCR", (
+        f"Pipeline name must be 'OCR' (uppercase), got '{captured_name[0]}'"
+    )

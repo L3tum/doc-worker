@@ -190,7 +190,7 @@ def _create_paddlex_ocr_pipeline(use_textline_orientation: bool = True) -> Any:
     logging.getLogger("paddlex").setLevel(100)
 
     return create_pipeline(
-        "ocr",
+        "OCR",
         text_detection_model_dir=str(_model_dir(TEXT_DETECTION_MODEL)),
         text_recognition_model_dir=str(_model_dir(TEXT_RECOGNITION_MODEL)),
         textline_orientation_model_dir=str(_model_dir(TEXTLINE_ORIENTATION_MODEL)),
