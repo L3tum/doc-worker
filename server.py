@@ -626,6 +626,26 @@ async def extract_text(
     tmp_path = None
     try:
         file_bytes = await file.read()
+
+        # ── Text file detection: if not an image and looks like text, return as-is ──
+        if not is_image and _is_text_content(file_bytes):
+            content = file_bytes.decode("utf-8", errors="replace")
+            return JSONResponse(
+                content={
+                    "filename": file.filename,
+                    "pages": [
+                        {
+                            "page": 1,
+                            "text": content,
+                            "markdown": content,
+                            "blocks": [],
+                            "structured_blocks": [],
+                        }
+                    ],
+                    "full_text": content,
+                }
+            )
+
         suffix = ext if ext else (".png" if is_image else ".pdf")
 
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:

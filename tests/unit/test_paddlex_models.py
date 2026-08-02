@@ -36,7 +36,14 @@ def _reset_paddlex_singleton():
             if hasattr(obj, attr):
                 delattr(obj, attr)
 
+    # Reset the patch flag so patch tests can apply cleanly
+    original_patched = paddlex_helpers._PADDLEX_PATCHED
+    paddlex_helpers._PADDLEX_PATCHED = False
+
     yield
+
+    # Restore the patch flag after test (in case of leaks)
+    paddlex_helpers._PADDLEX_PATCHED = original_patched
 
     # Also clear after test in case of leaks
     for obj in (
@@ -465,3 +472,373 @@ def test_ocr_pipeline_uses_uppercase_ocr_name(tmp_path, monkeypatch):
     assert captured_name[0] == "OCR", (
         f"Pipeline name must be 'OCR' (uppercase), got '{captured_name[0]}'"
     )
+
+
+# ── Monkey-patch for air-gapped operation ────────────────────────────────
+
+
+class TestPaddlexOfficialModelsPatch:
+    """Tests for _patch_paddlex_official_models() — air-gapped compatibility."""
+
+    def test_patch_returns_local_dir(self, tmp_path, monkeypatch):
+        """Patched __getitem__ returns our local model path for known model names."""
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+
+        # Create a mock official_models object
+        mock_class = type("MockOfficialModels", (), {})
+        mock_obj = mock_class()
+        mock_obj.__class__.__getitem__ = lambda self, name: f"original-{name}"
+
+        # Set up the full module hierarchy so `from ... import` works
+        mock_utils = types.ModuleType("paddlex.inference.utils")
+        mock_om_module = types.ModuleType("paddlex.inference.utils.official_models")
+        mock_om_module.official_models = mock_obj
+        mock_utils.official_models = mock_om_module
+
+        monkeypatch.setitem(sys.modules, "paddlex.inference.utils", mock_utils)
+        monkeypatch.setitem(
+            sys.modules, "paddlex.inference.utils.official_models", mock_om_module
+        )
+
+        # Reset patch flag so it gets applied
+        paddlex_helpers._PADDLEX_PATCHED = False
+        paddlex_helpers._patch_paddlex_official_models()
+
+        # Known model name should resolve to our local dir
+        result = mock_obj[TEXT_DETECTION_MODEL]
+        assert result == str(tmp_path / "PP-OCRv6_medium_det_infer")
+
+    def test_patch_falls_back_to_original(self, tmp_path, monkeypatch):
+        """Unknown model names fall back to original behavior."""
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+
+        mock_class = type("MockOfficialModels", (), {})
+        mock_obj = mock_class()
+        original_getitem = lambda self, name: f"original-{name}"
+        mock_obj.__class__.__getitem__ = original_getitem
+
+        mock_utils = types.ModuleType("paddlex.inference.utils")
+        mock_om_module = types.ModuleType("paddlex.inference.utils.official_models")
+        mock_om_module.official_models = mock_obj
+        mock_utils.official_models = mock_om_module
+
+        monkeypatch.setitem(sys.modules, "paddlex.inference.utils", mock_utils)
+        monkeypatch.setitem(
+            sys.modules, "paddlex.inference.utils.official_models", mock_om_module
+        )
+
+        paddlex_helpers._PADDLEX_PATCHED = False
+        paddlex_helpers._patch_paddlex_official_models()
+
+        # Unknown model name should use original behavior
+        result = mock_obj["UNKNOWN_MODEL_XYZ"]
+        assert result == "original-UNKNOWN_MODEL_XYZ"
+
+    def test_patch_is_idempotent(self, tmp_path, monkeypatch):
+        """Calling the patch multiple times doesn't break anything."""
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+
+        mock_class = type("MockOfficialModels", (), {})
+        mock_obj = mock_class()
+        mock_obj.__class__.__getitem__ = lambda self, name: f"original-{name}"
+
+        mock_utils = types.ModuleType("paddlex.inference.utils")
+        mock_om_module = types.ModuleType("paddlex.inference.utils.official_models")
+        mock_om_module.official_models = mock_obj
+        mock_utils.official_models = mock_om_module
+
+        monkeypatch.setitem(sys.modules, "paddlex.inference.utils", mock_utils)
+        monkeypatch.setitem(
+            sys.modules, "paddlex.inference.utils.official_models", mock_om_module
+        )
+
+        paddlex_helpers._PADDLEX_PATCHED = False
+
+        # Apply patch multiple times
+        paddlex_helpers._patch_paddlex_official_models()
+        paddlex_helpers._patch_paddlex_official_models()
+        paddlex_helpers._patch_paddlex_official_models()
+
+        # Should still work
+        result = mock_obj[TEXT_DETECTION_MODEL]
+        assert result == str(tmp_path / "PP-OCRv6_medium_det_infer")
+
+    def test_patch_handles_import_error(self, monkeypatch):
+        """Patch gracefully handles ImportError when PaddleX is not installed."""
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "_PADDLEX_PATCHED", False)
+
+        # Temporarily remove the module so import fails
+        saved = sys.modules.get("paddlex.inference.utils.official_models")
+        saved_utils = sys.modules.get("paddlex.inference.utils")
+        try:
+            if "paddlex.inference.utils.official_models" in sys.modules:
+                del sys.modules["paddlex.inference.utils.official_models"]
+            if "paddlex.inference.utils" in sys.modules:
+                del sys.modules["paddlex.inference.utils"]
+
+            # Patch should not raise when import fails
+            paddlex_helpers._patch_paddlex_official_models()
+        finally:
+            if saved is not None:
+                sys.modules["paddlex.inference.utils.official_models"] = saved
+            else:
+                sys.modules.pop("paddlex.inference.utils.official_models", None)
+            if saved_utils is not None:
+                sys.modules["paddlex.inference.utils"] = saved_utils
+            else:
+                sys.modules.pop("paddlex.inference.utils", None)
+
+
+# ── Retry logic: permanent error detection ───────────────────────────────
+
+
+class TestGetPaddlexModelPermanentError:
+    """Tests for permanent error detection in _get_paddlex_model()."""
+
+    def test_permanent_error_no_retry(self, tmp_path, monkeypatch):
+        """ "No available model hosting platforms" fails immediately without retry."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        attempts = 0
+
+        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError(
+                "No available model hosting platforms detected. Please check "
+                "your network connection."
+            )
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = permanent_failure_create_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        # First call: should raise immediately (no retries)
+        with pytest.raises(RuntimeError, match="No available model hosting platforms"):
+            paddlex_helpers._get_paddlex_model()
+        assert attempts == 1  # only 1 attempt, no retries
+
+    def test_permanent_error_cached(self, tmp_path, monkeypatch):
+        """Second call re-raises the cached exception without a new attempt."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        attempts = 0
+
+        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("No available model hosting platforms detected.")
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = permanent_failure_create_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        # First call: should raise
+        with pytest.raises(RuntimeError, match="No available model hosting platforms"):
+            paddlex_helpers._get_paddlex_model()
+        assert attempts == 1
+
+        # Second call: should re-raise the cached exception (not retry)
+        with pytest.raises(RuntimeError, match="No available model hosting platforms"):
+            paddlex_helpers._get_paddlex_model()
+        assert attempts == 1  # still 1 — cached exception re-raised
+
+    def test_permanent_error_clear_message(self, tmp_path, monkeypatch):
+        """Exception from permanent error is preserved with original message."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        original_error = RuntimeError(
+            "No available model hosting platforms detected. Please check "
+            "your network connection."
+        )
+
+        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+            raise original_error
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = permanent_failure_create_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        with pytest.raises(RuntimeError, match="No available model hosting"):
+            paddlex_helpers._get_paddlex_model()
+
+        # Verify the cached exception preserves the original message
+        cached = paddlex_helpers.get_paddlex_init_exception()
+        assert cached is not None
+        assert "No available model hosting" in str(cached)
+
+
+# ── Structure V3 retry logic ─────────────────────────────────────────────
+
+
+class TestStructureV3RetryLogic:
+    """Tests for retry logic in _get_paddlex_structure_v3_model()."""
+
+    def test_structure_v3_transient_retry(self, tmp_path, monkeypatch):
+        """Transient errors in Structure V3 retry up to 3 times."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        attempts = 0
+
+        def flaky_create_pipeline(name: str, **kwargs: Any) -> dict:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise RuntimeError("network timeout")  # transient
+            return {}  # succeeds on 3rd attempt
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = flaky_create_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        model = paddlex_helpers._get_paddlex_structure_v3_model()
+        assert attempts == 3  # 2 failures + 1 success
+        assert model == {}
+
+    def test_structure_v3_permanent_no_retry(self, tmp_path, monkeypatch):
+        """Permanent errors in Structure V3 fail immediately without retry."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        attempts = 0
+
+        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("No available model hosting platforms detected.")
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = permanent_failure_create_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        with pytest.raises(RuntimeError, match="No available model hosting platforms"):
+            paddlex_helpers._get_paddlex_structure_v3_model()
+        assert attempts == 1  # only 1 attempt
+
+    def test_structure_v3_permanent_cached(self, tmp_path, monkeypatch):
+        """Second Structure V3 call re-raises cached permanent exception."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        attempts = 0
+
+        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("No available model hosting platforms detected.")
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = permanent_failure_create_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        # First call
+        with pytest.raises(RuntimeError, match="No available model hosting platforms"):
+            paddlex_helpers._get_paddlex_structure_v3_model()
+        assert attempts == 1
+
+        # Second call — should re-raise cached exception
+        with pytest.raises(RuntimeError, match="No available model hosting platforms"):
+            paddlex_helpers._get_paddlex_structure_v3_model()
+        assert attempts == 1  # still 1
+
+    def test_structure_v3_exhausts_retries(self, tmp_path, monkeypatch):
+        """Structure V3 exhausts all 3 retry attempts on persistent transient error."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        attempts = 0
+
+        def always_fails(name: str, **kwargs: Any) -> dict:
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("persistent network error")
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = always_fails
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        with pytest.raises(RuntimeError, match="persistent network error"):
+            paddlex_helpers._get_paddlex_structure_v3_model()
+        assert attempts == 3  # exhausted all retries
+
+
+# ── Structure V3 destroy and recreate ────────────────────────────────────
+
+
+class TestStructureV3DestroyAndRecreate:
+    """Tests for Structure V3 model lifecycle."""
+
+    def test_destroy_and_recreate_structure_v3(self, tmp_path, monkeypatch):
+        """Verify that destroy_paddlex_model() + _get_paddlex_structure_v3_model()
+        recreates the pipeline."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        create_count = 0
+
+        def counting_create_pipeline(name: str, **kwargs: Any) -> dict:
+            nonlocal create_count
+            create_count += 1
+            return {}
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = counting_create_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        # 1st creation
+        paddlex_helpers._get_paddlex_structure_v3_model()
+        assert create_count == 1
+
+        # Destroy
+        paddlex_helpers.destroy_paddlex_model()
+
+        # Re-creation
+        paddlex_helpers._get_paddlex_structure_v3_model()
+        assert create_count == 2  # pipeline was recreated, not reused

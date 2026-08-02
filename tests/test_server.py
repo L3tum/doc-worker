@@ -210,12 +210,16 @@ class TestExtract:
                         "true" if key == "USE_STRUCTURE_V3" else default
                     )
                     with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
-                        # Create a fake file upload
+                        # Create a fake file upload with PDF signature to bypass text detection
                         response = test_client.post(
                             "/extract",
                             headers={"Authorization": "Bearer test-token"},
                             files={
-                                "file": ("test.pdf", b"fake pdf", "application/pdf")
+                                "file": (
+                                    "test.pdf",
+                                    b"%PDF-1.4 fake pdf content",
+                                    "application/pdf",
+                                )
                             },
                         )
 
@@ -256,7 +260,7 @@ class TestExtract:
                             files={
                                 "file": (
                                     "test.pdf",
-                                    b"fake pdf content",
+                                    b"%PDF-1.4 fake pdf content",
                                     "application/pdf",
                                 )
                             },
@@ -281,7 +285,13 @@ class TestExtract:
                     response = test_client.post(
                         "/extract",
                         headers={"Authorization": "Bearer test-token"},
-                        files={"file": ("test.pdf", b"fake pdf", "application/pdf")},
+                        files={
+                            "file": (
+                                "test.pdf",
+                                b"%PDF-1.4 fake pdf content",
+                                "application/pdf",
+                            )
+                        },
                     )
 
         assert response.status_code == 200
@@ -316,3 +326,95 @@ class TestExtract:
         data = response.json()
         assert data["detail"]["status"] == "unhealthy"
         assert data["detail"]["component"] == "paddlex"
+
+
+# ── Extract: text file fallback tests ────────────────────────────────────
+class TestExtractTextFileFallback:
+    """Tests for text file detection and fallback in /layout-parsing and /extract."""
+
+    def test_layout_parsing_text_file_returns_as_is(self, test_client):
+        """Text files sent to /layout-parsing are returned without OCR."""
+        import base64
+
+        import server
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", ""):
+            # Pure text content (no binary signatures)
+            text_content = b"This is a plain text document with some content."
+            text_b64 = base64.b64encode(text_content).decode()
+
+            response = test_client.post(
+                "/layout-parsing",
+                json={"file": text_b64, "fileType": 0},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        results = data["result"]["layoutParsingResults"]
+        assert len(results) == 1
+        assert "This is a plain text document" in results[0]["markdown"]["text"]
+
+    def test_extract_text_file_returns_as_is(self, test_client):
+        """Text files sent to /extract are returned without OCR."""
+        import server
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", ""):
+            # Pure text content (no binary signatures)
+            text_content = b"This is a plain text document with some content."
+
+            response = test_client.post(
+                "/extract",
+                files={"file": ("test.txt", text_content, "text/plain")},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["filename"] == "test.txt"
+        pages = data["pages"]
+        assert len(pages) == 1
+        assert "This is a plain text document" in pages[0]["text"]
+        assert "This is a plain text document" in data["full_text"]
+
+    def test_layout_parsing_text_file_auth(self, test_client):
+        """Text file endpoint respects auth token requirement."""
+        import base64
+
+        import server
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", "secret"):
+            text_content = b"Just some text content."
+            text_b64 = base64.b64encode(text_content).decode()
+
+            response = test_client.post(
+                "/layout-parsing",
+                json={"file": text_b64, "fileType": 0},
+            )
+
+        assert response.status_code == 401  # Missing auth header
+
+
+# ── Health check endpoint detail tests ───────────────────────────────────
+class TestHealthCheckEndpoint:
+    """Tests for /health endpoint details."""
+
+    def test_health_includes_use_structure_v3(self, test_client):
+        """Health endpoint reports Structure V3 status."""
+        with patch("server.get_paddlex_init_exception", return_value=None):
+            response = test_client.get("/health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "use_structure_v3" in data
+        assert isinstance(data["use_structure_v3"], bool)
+
+    def test_health_includes_endpoints(self, test_client):
+        """Health endpoint lists available endpoints."""
+        with patch("server.get_paddlex_init_exception", return_value=None):
+            response = test_client.get("/health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "endpoints" in data
+        assert "/layout-parsing" in data["endpoints"]
+        assert "/extract" in data["endpoints"]
+        assert "/health" in data["endpoints"]

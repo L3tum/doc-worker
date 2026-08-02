@@ -158,6 +158,56 @@ def validate_paddlex_models() -> None:
         )
 
 
+# ── Offline / air-gapped compatibility ────────────────────────────────────
+_PADDLEX_PATCHED = False
+
+
+def _patch_paddlex_official_models() -> None:
+    """Monkey-patch PaddleX official_models to return our local model dirs.
+
+    PaddleX 3.x always calls ``official_models[model_name]`` internally, even when
+    explicit ``model_dir`` parameters are passed to ``create_pipeline()``.  In
+    air-gapped environments (or when the hosting platforms are geo-blocked), this
+    fails with ``"No available model hosting platforms detected"`` because
+    PaddleX cannot reach its hosting platforms (HuggingFace, ModelScope,
+    AIStudio, BOS).
+
+    This patch intercepts the ``official_models.__getitem__`` lookup so that
+    model names we know about resolve to our pre-bundled local directories.
+    Unknown names fall back to the original PaddleX behavior (which may trigger
+    a download attempt if network is available).
+
+    See: PaddleX#4578, PaddleOCR#16620, PaddleOCR#16639
+    """
+    global _PADDLEX_PATCHED
+
+    if _PADDLEX_PATCHED:
+        return  # Already patched — idempotent
+
+    try:
+        from paddlex.inference.utils import official_models as _om_module
+    except ImportError:
+        # PaddleX may not be installed (e.g. test env without paddlex)
+        return
+
+    official_models = _om_module.official_models
+    original_getitem = official_models.__class__.__getitem__
+
+    def _patched_getitem(self, model_name: str):  # type: ignore[no-untyped-def]
+        # Check our local model dirs first
+        local_dir = _model_dir(model_name)
+        if local_dir.is_dir():
+            return str(local_dir)
+        # Fall back to original behavior (may trigger download or raise)
+        return original_getitem(self, model_name)
+
+    official_models.__class__.__getitem__ = _patched_getitem  # type: ignore[attr-defined]
+    _PADDLEX_PATCHED = True
+    logging.getLogger("doc-worker.paddlex_helpers").debug(
+        "Patched paddlex.inference.utils.official_models for offline operation"
+    )
+
+
 def _ensure_paddlex_cache_home() -> None:
     """Set PADDLE_PDX_CACHE_HOME to a writable directory before PaddleX import."""
     configured_cache = Path(
@@ -173,6 +223,34 @@ def _ensure_paddlex_cache_home() -> None:
         os.environ["PADDLE_PDX_CACHE_HOME"] = str(configured_cache)
 
 
+def _ensure_paddlex_offline_compat() -> None:
+    """Ensure PaddleX is ready for offline / air-gapped operation.
+
+    Calls ``_ensure_paddlex_cache_home()`` and then monkey-patches PaddleX's
+    ``official_models`` registry so that model lookups resolve to our
+    pre-bundled local directories instead of trying to download from the
+    hosting platforms.
+
+    This must be called before any ``create_pipeline()`` invocation.
+    """
+    _ensure_paddlex_cache_home()
+    _patch_paddlex_official_models()
+
+
+def _is_permanent_model_init_error(exc: Exception) -> bool:
+    """Return True if the model initialization error is permanent (not retryable).
+
+    Permanent errors indicate conditions that won't be fixed by retrying:
+    - PaddleX hosting platforms unreachable when models should be local
+    - PDX internal state conflict (already initialized)
+
+    Transient errors (network timeout, temporary file access issues) return False
+    so they can be retried.
+    """
+    msg = str(exc).lower()
+    return "no available model hosting" in msg or "already been initialized" in msg
+
+
 # ── General OCR pipeline ──────────────────────────────────────────────────
 def _create_paddlex_ocr_pipeline(use_textline_orientation: bool = True) -> Any:
     """Create a PaddleX General OCR pipeline with bundled models.
@@ -182,7 +260,7 @@ def _create_paddlex_ocr_pipeline(use_textline_orientation: bool = True) -> Any:
             Improves accuracy for rotated text at a slight performance cost.
             Default is True (improved accuracy), set to False for faster processing.
     """
-    _ensure_paddlex_cache_home()
+    _ensure_paddlex_offline_compat()
 
     from paddlex import create_pipeline
 
@@ -232,23 +310,21 @@ def _get_paddlex_model() -> Any:
             raise exc
 
         # Retry mechanism: up to 3 attempts with exponential backoff.
-        # PaddleX's PDX reinitialization errors (already initialized) are permanent.
+        # Permanent errors (hosting unreachable, PDX conflict) skip retry.
         max_retries = 3
         base_delay = 0.1  # seconds
         for attempt in range(max_retries):
             try:
                 _get_paddlex_model._model = _create_paddlex_ocr_pipeline()  # type: ignore[attr-defined]
             except Exception as e:
-                # If PDX is already initialized, don't retry — it's a permanent error
-                if "already been initialized" in str(e):
+                # Permanent errors: don't retry — cache and fail fast
+                if _is_permanent_model_init_error(e):
                     _get_paddlex_model._init_exception = e  # type: ignore[attr-defined]
                     raise
                 if attempt == max_retries - 1:
                     _get_paddlex_model._init_exception = e  # type: ignore[attr-defined]
                     raise
                 delay = base_delay * (2**attempt)  # 0.1s, 0.2s, 0.4s
-                import logging
-
                 logging.getLogger("doc-worker.paddlex_helpers").warning(
                     "PaddleX model initialization failed (attempt %d/%d): %s. Retrying in %.1fs",
                     attempt + 1,
@@ -357,7 +433,7 @@ def _pdf_to_images(pdf_path: str, tmp_dir: str) -> list[str]:
 # ── Structure V3 pipeline ────────────────────────────────────────────────
 def _create_structure_v3_pipeline() -> Any:
     """Create a PaddleX PP-StructureV3 pipeline with bundled models."""
-    _ensure_paddlex_cache_home()
+    _ensure_paddlex_offline_compat()
 
     from paddlex import create_pipeline
 
@@ -382,7 +458,11 @@ def _create_structure_v3_pipeline() -> Any:
 
 
 def _get_paddlex_structure_v3_model() -> Any:
-    """Return a cached (singleton) PaddleX PP-StructureV3 pipeline."""
+    """Return a cached (singleton) PaddleX PP-StructureV3 pipeline.
+
+    If initialization fails, the exception is cached and re-raised on subsequent
+    calls. Uses retry logic with exponential backoff for transient errors.
+    """
     with _PADDLEX_MODEL_LOCK:
         if hasattr(_get_paddlex_structure_v3_model, "_model"):  # type: ignore[attr-defined]
             return _get_paddlex_structure_v3_model._model  # type: ignore[attr-defined]
@@ -391,11 +471,32 @@ def _get_paddlex_structure_v3_model() -> Any:
         if exc is not None:
             raise exc
 
-        try:
-            _get_paddlex_structure_v3_model._model = _create_structure_v3_pipeline()  # type: ignore[attr-defined]
-        except Exception as exc:
-            _get_paddlex_structure_v3_model._init_exception = exc  # type: ignore[attr-defined]
-            raise
+        # Retry mechanism: up to 3 attempts with exponential backoff.
+        # Permanent errors skip retry.
+        max_retries = 3
+        base_delay = 0.1  # seconds
+        for attempt in range(max_retries):
+            try:
+                _get_paddlex_structure_v3_model._model = _create_structure_v3_pipeline()  # type: ignore[attr-defined]
+            except Exception as e:
+                # Permanent errors: don't retry — cache and fail fast
+                if _is_permanent_model_init_error(e):
+                    _get_paddlex_structure_v3_model._init_exception = e  # type: ignore[attr-defined]
+                    raise
+                if attempt == max_retries - 1:
+                    _get_paddlex_structure_v3_model._init_exception = e  # type: ignore[attr-defined]
+                    raise
+                delay = base_delay * (2**attempt)  # 0.1s, 0.2s, 0.4s
+                logging.getLogger("doc-worker.paddlex_helpers").warning(
+                    "PaddleX Structure V3 model initialization failed (attempt %d/%d): %s. Retrying in %.1fs",
+                    attempt + 1,
+                    max_retries,
+                    e,
+                    delay,
+                )
+                time.sleep(delay)
+            else:
+                break
 
         return _get_paddlex_structure_v3_model._model  # type: ignore[attr-defined]
 

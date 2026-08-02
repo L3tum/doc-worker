@@ -379,3 +379,49 @@ class TestValidatePaddlexModels:
             with pytest.raises(ValueError) as exc_info:
                 validate_paddlex_models()
             assert "mismatch" in str(exc_info.value).lower()
+
+
+# ── Permanent error detection ─────────────────────────────────────────────
+class TestPermanentErrorDetection:
+    """Tests for _is_permanent_model_init_error()."""
+
+    def test_detects_no_available_hosting(self):
+        """'No available model hosting platforms' is permanent."""
+        from paddlex_helpers import _is_permanent_model_init_error
+
+        assert _is_permanent_model_init_error(
+            RuntimeError(
+                "No available model hosting platforms detected. Please check "
+                "your network connection."
+            )
+        )
+
+    def test_detects_already_initialized(self):
+        """'already been initialized' is permanent."""
+        from paddlex_helpers import _is_permanent_model_init_error
+
+        assert _is_permanent_model_init_error(
+            RuntimeError("PDX has already been initialized")
+        )
+
+    def test_network_timeout_is_transient(self):
+        """Generic network errors are NOT permanent."""
+        from paddlex_helpers import _is_permanent_model_init_error
+
+        assert not _is_permanent_model_init_error(RuntimeError("network timeout"))
+
+    def test_file_not_found_is_transient(self):
+        """File errors are NOT permanent (could be temporary)."""
+        from paddlex_helpers import _is_permanent_model_init_error
+
+        assert not _is_permanent_model_init_error(
+            FileNotFoundError("Model file not found")
+        )
+
+    def test_generic_exception_is_transient(self):
+        """Unknown exceptions default to transient (retryable)."""
+        from paddlex_helpers import _is_permanent_model_init_error
+
+        assert not _is_permanent_model_init_error(
+            RuntimeError("something unexpected happened")
+        )
