@@ -24,7 +24,17 @@ from paddlex_helpers import (
 # ── Fixture: reset singleton state between tests ──────────────────────────
 @pytest.fixture(autouse=True)
 def _reset_paddlex_singleton():
-    """Clear cached PaddleX model state before each test."""
+    """Clear cached PaddleX model state and submodules between tests.
+
+    When the real PaddleX is installed (e.g. CI), importing paddlex_helpers
+    at module level triggers _patch_paddlex_official_models() which caches
+    references to real PaddleX submodules in sys.modules.  Subsequent tests
+    that monkeypatch sys.modules["paddlex"] with a fake module can still
+    reach the real submodules through Python's import fallback logic.
+
+    This fixture removes all paddlex.* entries from sys.modules so that
+    monkeypatches take full effect.
+    """
     import paddlex_helpers
 
     # Clear any cached model/exception state
@@ -40,7 +50,20 @@ def _reset_paddlex_singleton():
     original_patched = paddlex_helpers._PADDLEX_PATCHED
     paddlex_helpers._PADDLEX_PATCHED = False
 
+    # Remove cached PaddleX submodules so test monkeypatches take effect.
+    # Keep the top-level "paddlex" key — tests may or may not replace it.
+    _saved_paddlex_modules: dict[str, Any] = {}
+    for _key in list(sys.modules):
+        if _key == "paddlex":
+            continue
+        if _key.startswith("paddlex."):
+            _saved_paddlex_modules[_key] = sys.modules[_key]
+            del sys.modules[_key]
+
     yield
+
+    # Restore saved submodules
+    sys.modules.update(_saved_paddlex_modules)
 
     # Restore the patch flag after test (in case of leaks)
     paddlex_helpers._PADDLEX_PATCHED = original_patched
