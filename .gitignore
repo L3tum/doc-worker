@@ -1,3 +1,6 @@
+# Plans & docs
+plans/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -54,6 +54,7 @@ from paddlex_helpers import (
     blocks_to_markdown,
     destroy_paddlex_model,
     get_paddlex_init_exception,
+    migrate_legacy_model_dirs,
     paddleocr_lang_code,
     run_paddleocr,
     run_paddlex_structure_v3,
@@ -343,6 +344,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Validate models — abort if critical ones are missing
     if any_missing:
+        migrate_legacy_model_dirs()  # rename legacy dirs before validation
         validate_paddlex_models()  # Raises FileNotFoundError or ValueError
 
     yield  # app runs here

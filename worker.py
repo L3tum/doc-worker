@@ -30,10 +30,13 @@ import time
 from pathlib import Path
 
 from paddlex_helpers import (
+    _is_model_error,
     blocks_to_markdown,
     destroy_paddlex_model,
+    migrate_legacy_model_dirs,
     run_paddlex_structure_v3,
     validate_paddlex_models,
+    warmup_paddlex_models,
 )
 
 # ---------------------------------------------------------------------------
@@ -489,6 +492,13 @@ def main() -> None:
     # Crash recovery
     recover_leftover_files()
 
+    # Migrate legacy model directories (e.g. lowercase lcnet -> LCNet)
+    try:
+        migrate_legacy_model_dirs()
+    except Exception as exc:
+        log_error(f"Model directory migration failed: {exc}")
+        sys.exit(1)
+
     # Validate PaddleX models — fail fast if they're missing or mismatched
     try:
         validate_paddlex_models()
@@ -496,6 +506,14 @@ def main() -> None:
     except Exception as exc:
         log_error(f"PaddleX model validation failed: {exc}")
         sys.exit(1)
+
+    # Warm up model pipelines — surfaces errors before first file arrives
+    try:
+        warmup_paddlex_models()
+        log("PaddleX models warmed up successfully.")
+    except Exception as exc:
+        log_error(f"PaddleX model warm-up failed: {exc}")
+        log("Continuing anyway — models will be initialized lazily on first use.")
 
     # Start the model idle-timeout background thread
     idle_thread = threading.Thread(
@@ -546,8 +564,10 @@ def main() -> None:
 
                     try:
                         success = process_file(current_path)
+                        last_exc: Exception | None = None
                     except Exception as exc:
                         success = False
+                        last_exc = exc
                         log_error(
                             f"Processing attempt {attempt}/{attempts} for {pdf.name} "
                             f"raised: {exc}"
@@ -557,10 +577,18 @@ def main() -> None:
                         break  # Success — move to next file
 
                     if attempt < attempts:
-                        log_error(
-                            f"Processing attempt {attempt}/{attempts} failed for "
-                            f"{pdf.name}; retrying in {retry_delay}s"
-                        )
+                        # Only destroy model if the error is model-related
+                        if last_exc is not None and _is_model_error(last_exc):
+                            destroy_paddlex_model()
+                            log_error(
+                                f"Processing attempt {attempt}/{attempts} failed for "
+                                f"{pdf.name} (model error); destroying model and retrying in {retry_delay}s"
+                            )
+                        else:
+                            log_error(
+                                f"Processing attempt {attempt}/{attempts} failed for "
+                                f"{pdf.name}; retrying in {retry_delay}s"
+                            )
                         time.sleep(retry_delay)
                         continue
 

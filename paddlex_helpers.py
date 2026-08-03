@@ -15,8 +15,12 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+# ── Logging ───────────────────────────────────────────────────────────────
+logger = logging.getLogger("doc-worker.paddlex_helpers")
 
 # ── Config ────────────────────────────────────────────────────────────────
 OCR_LANG = os.getenv("OCR_LANG", "deu")
@@ -38,6 +42,14 @@ PADDLEX_MODEL_DIRS = {
     TEXTLINE_ORIENTATION_MODEL: "PP-LCNet_x1_0_textline_ori_infer",
     LAYOUT_DETECTION_MODEL: "PP-DocLayout-L_infer",
 }
+
+# Ordered tuple of all required model logical names
+REQUIRED_MODEL_NAMES: tuple[str, ...] = (
+    TEXT_DETECTION_MODEL,
+    TEXT_RECOGNITION_MODEL,
+    TEXTLINE_ORIENTATION_MODEL,
+    LAYOUT_DETECTION_MODEL,
+)
 
 
 # ── Language mapping ──────────────────────────────────────────────────────
@@ -81,37 +93,53 @@ def _assert_writable_directory(path: Path) -> None:
 
 
 def _model_dir(model_name: str) -> Path:
-    """Return the local directory for a bundled PaddleX model."""
-    return Path(PADDLEOCR_MODELS) / PADDLEX_MODEL_DIRS.get(model_name, model_name)
+    """Return the local directory for a bundled PaddleX model.
+
+    Only accepts model names that are registered in PADDLEX_MODEL_DIRS to
+    prevent path traversal via crafted model names.
+    """
+    if model_name not in PADDLEX_MODEL_DIRS:
+        raise ValueError(
+            f"Unknown model name: {model_name!r}. "
+            f"Expected one of: {list(PADDLEX_MODEL_DIRS.keys())}"
+        )
+    return Path(PADDLEOCR_MODELS) / PADDLEX_MODEL_DIRS[model_name]
+
+
+def migrate_legacy_model_dirs() -> None:
+    """Rename legacy model directories to their correct names.
+
+    Specifically handles the legacy lowercase 'lcnet' orientation directory name.
+    Should be called once at startup before validate_paddlex_models().
+    """
+    models_dir = Path(PADDLEOCR_MODELS)
+    legacy_orientation_dir = models_dir / "PP-OCRv6_lcnet_x1_0_textline_ori_infer"
+    orientation_dir = _model_dir(TEXTLINE_ORIENTATION_MODEL)
+
+    if legacy_orientation_dir.is_dir() and not orientation_dir.exists():
+        os.rename(str(legacy_orientation_dir), str(orientation_dir))
+        logger.info(
+            "Renamed legacy model directory: %s -> %s",
+            legacy_orientation_dir,
+            orientation_dir,
+        )
 
 
 def validate_paddlex_models() -> None:
-    """Validate that required PaddleX model directories are present."""
+    """Validate that required PaddleX model directories are present.
+
+    Read-only — does not modify the filesystem. Call migrate_legacy_model_dirs()
+    first if you need to rename legacy directories.
+    """
     models_dir = Path(PADDLEOCR_MODELS)
     if not models_dir.is_dir():
         raise FileNotFoundError(
             f"PADDLEOCR_MODELS directory does not exist: {models_dir}"
         )
 
-    # Legacy rename: rename the incorrect orientation directory name if present
-    legacy_orientation_dir = models_dir / "PP-OCRv6_lcnet_x1_0_textline_ori_infer"
-    orientation_dir = _model_dir(TEXTLINE_ORIENTATION_MODEL)
-    if legacy_orientation_dir.is_dir() and not orientation_dir.exists():
-        os.rename(str(legacy_orientation_dir), str(orientation_dir))
-        logging.getLogger("doc-worker.paddlex_helpers").info(
-            "Renamed legacy model directory: %s -> %s",
-            legacy_orientation_dir,
-            orientation_dir,
-        )
-
     missing: list[str] = []
     yml_mismatches: list[str] = []
-    for model_name in (
-        TEXT_DETECTION_MODEL,
-        TEXT_RECOGNITION_MODEL,
-        TEXTLINE_ORIENTATION_MODEL,
-        LAYOUT_DETECTION_MODEL,
-    ):
+    for model_name in REQUIRED_MODEL_NAMES:
         model_dir = _model_dir(model_name)
         if not model_dir.is_dir():
             missing.append(f"{model_name}/")
@@ -159,11 +187,90 @@ def validate_paddlex_models() -> None:
 
 
 # ── Offline / air-gapped compatibility ────────────────────────────────────
+# MUST be before any PaddleX import — tells PaddleX to skip its health-check
+# of hosting platforms, preventing the fail-fast "No available model hosting
+# platforms detected" path in air-gapped / geo-blocked environments.
+os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "1")
+
 _PADDLEX_PATCHED = False
 
 
+class _LocalModelResolver:
+    """Proxy wrapper that resolves known model names to local directories.
+
+    Replaces PaddleX's official_models object. Intercepts all access patterns
+    ([], .get(), in, __getattr__) to ensure local models are always preferred
+    over network downloads. Unknown names fall back to the original PaddleX
+    behavior.
+    """
+
+    __slots__ = ("_data", "_original")
+
+    def __init__(self, original: Any) -> None:
+        self._original = original
+        self._data: dict[str, Any] = {}
+
+    def _resolve_local(self, model_name: str) -> str | None:
+        try:
+            local_dir = _model_dir(model_name)
+        except ValueError:
+            return None
+        if local_dir.is_dir():
+            return str(local_dir)
+        return None
+
+    def __getitem__(self, model_name: str) -> str:
+        local = self._resolve_local(model_name)
+        if local:
+            return local
+        return self._original[model_name]  # type: ignore[index,no-any-return]
+
+    def get(self, model_name: str, default: Any = None) -> Any:
+        local = self._resolve_local(model_name)
+        if local:
+            return local
+        return self._original.get(model_name, default)  # type: ignore[attr-defined]
+
+    def __contains__(self, model_name: object) -> bool:
+        if isinstance(model_name, str) and self._resolve_local(model_name):
+            return True
+        return model_name in self._original  # type: ignore[arg-type]
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate unknown attributes to the original object.
+        # Underscore-prefixed names raise AttributeError to prevent
+        # accidental filesystem I/O from _resolve_local() on private attrs.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        local_val = self._resolve_local(name)
+        if local_val:
+            return local_val
+        return getattr(self._original, name)  # type: ignore[attr-defined]
+
+    def __iter__(self) -> Any:
+        return iter(self._original)  # type: ignore[attr-defined]
+
+    def keys(self) -> Any:
+        return self._original.keys()  # type: ignore[attr-defined]
+
+    def values(self) -> Any:
+        return self._original.values()  # type: ignore[attr-defined]
+
+    def items(self) -> Any:
+        return self._original.items()  # type: ignore[attr-defined]
+
+    def pop(self, key: str, default: Any = ...) -> Any:
+        return self._original.pop(key, default)  # type: ignore[attr-defined]
+
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        return self._original.setdefault(key, default)  # type: ignore[attr-defined]
+
+    def update(self, other: Any = None, **kwargs: Any) -> None:
+        self._original.update(other, **kwargs)  # type: ignore[attr-defined]
+
+
 def _patch_paddlex_official_models() -> None:
-    """Monkey-patch PaddleX official_models to return our local model dirs.
+    """Replace PaddleX official_models with _LocalModelResolver wrapper.
 
     PaddleX 3.x always calls ``official_models[model_name]`` internally, even when
     explicit ``model_dir`` parameters are passed to ``create_pipeline()``.  In
@@ -172,10 +279,10 @@ def _patch_paddlex_official_models() -> None:
     PaddleX cannot reach its hosting platforms (HuggingFace, ModelScope,
     AIStudio, BOS).
 
-    This patch intercepts the ``official_models.__getitem__`` lookup so that
-    model names we know about resolve to our pre-bundled local directories.
-    Unknown names fall back to the original PaddleX behavior (which may trigger
-    a download attempt if network is available).
+    Unlike the previous class-level __getitem__ patch, this replaces the
+    **module-level variable** so ALL imports of official_models
+    (via ``from X import official_models``) see the patched version.
+    The _LocalModelResolver intercepts [], .get(), in, and __getattr__ access.
 
     See: PaddleX#4578, PaddleOCR#16620, PaddleOCR#16639
     """
@@ -190,20 +297,23 @@ def _patch_paddlex_official_models() -> None:
         # PaddleX may not be installed (e.g. test env without paddlex)
         return
 
-    official_models = _om_module.official_models
-    original_getitem = official_models.__class__.__getitem__
+    original = _om_module.official_models
+    resolver = _LocalModelResolver(original)
 
-    def _patched_getitem(self, model_name: str):  # type: ignore[no-untyped-def]
-        # Check our local model dirs first
-        local_dir = _model_dir(model_name)
-        if local_dir.is_dir():
-            return str(local_dir)
-        # Fall back to original behavior (may trigger download or raise)
-        return original_getitem(self, model_name)
+    # Replace module-level variable — covers both direct access and re-imports
+    _om_module.official_models = resolver
 
-    official_models.__class__.__getitem__ = _patched_getitem  # type: ignore[attr-defined]
+    # Also patch any already-imported references in the inference package
+    try:
+        from paddlex import inference
+
+        if hasattr(inference, "official_models"):
+            inference.official_models = resolver
+    except (ImportError, AttributeError):
+        pass
+
     _PADDLEX_PATCHED = True
-    logging.getLogger("doc-worker.paddlex_helpers").debug(
+    logger.debug(
         "Patched paddlex.inference.utils.official_models for offline operation"
     )
 
@@ -249,6 +359,149 @@ def _is_permanent_model_init_error(exc: Exception) -> bool:
     """
     msg = str(exc).lower()
     return "no available model hosting" in msg or "already been initialized" in msg
+
+
+def _build_model_dir_status() -> str:
+    """Build a diagnostic string showing local model directory status.
+
+    Returns a compact summary like:
+        "PP-OCRv6_medium_det: ✓ PP-OCRv6_medium_rec: ✓ PP-LCNet_x1_0_textline_ori: ✓ PP-DocLayout-L: ✗"
+    """
+    status_parts: list[str] = []
+    for model_name in REQUIRED_MODEL_NAMES:
+        local = _model_dir(model_name)
+        marker = "✓" if local.is_dir() else "✗"
+        status_parts.append(f"{model_name}: {marker}")
+    return " ".join(status_parts)
+
+
+def _build_enriched_permanent_error(e: Exception) -> RuntimeError:
+    """Build an enriched permanent model init error with diagnostic context.
+
+    Returns a RuntimeError wrapping the original error, augmented with local
+    model directory status and patch-applied flag for better troubleshooting.
+    """
+    model_status = _build_model_dir_status()
+    models_basename = Path(PADDLEOCR_MODELS).name
+    enriched = RuntimeError(
+        f"PaddleX model initialization failed (permanent): {e}\n"
+        f"Local model directories: {model_status}\n"
+        f"Patch applied: {_PADDLEX_PATCHED}\n"
+        f"PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK={os.environ.get('PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK', 'not set')}\n"
+        f"Models directory: {models_basename}"
+    )
+    enriched.__cause__ = e
+    return enriched
+
+
+def warmup_paddlex_models() -> None:
+    """Eagerly initialize both PaddleX pipelines to detect errors early.
+
+    Called during worker startup after validate_paddlex_models().
+    Non-fatal for regular errors: logs warnings and lets lazy initialization
+    handle subsequent calls. SystemExit and KeyboardInterrupt are propagated.
+    """
+    # Warm up General OCR pipeline
+    try:
+        _get_paddlex_model()
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except Exception as e:
+        logger.warning("PaddleX General OCR warm-up failed (will retry lazily): %s", e)
+        with _PADDLEX_MODEL_LOCK:
+            if hasattr(_get_paddlex_model, "_init_exception"):
+                delattr(_get_paddlex_model, "_init_exception")  # type: ignore[attr-defined]
+
+    # Warm up Structure V3 pipeline
+    try:
+        _get_paddlex_structure_v3_model()
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except Exception as e:
+        logger.warning("PaddleX Structure V3 warm-up failed (will retry lazily): %s", e)
+        with _PADDLEX_MODEL_LOCK:
+            if hasattr(_get_paddlex_structure_v3_model, "_init_exception"):
+                delattr(_get_paddlex_structure_v3_model, "_init_exception")  # type: ignore[attr-defined]
+
+
+def _is_model_error(exc: Exception) -> bool:
+    """Return True if the exception is likely related to PaddleX model state.
+
+    Used by worker retry logic to decide whether to destroy and reinitialize
+    the model. Non-model errors (Docling, OCRmyPDF, filesystem) should not
+    trigger model destruction.
+    """
+    msg = str(exc).lower()
+    model_keywords = [
+        "paddle",
+        "model",
+        "predictor",
+        "inference",
+        "cuda",
+        "pdx",
+        "paddlex",
+    ]
+    return any(kw in msg for kw in model_keywords)
+
+
+def _retry_model_init(
+    factory_fn: Callable[[], Any],
+    cache_fn: Callable[[], Any],
+    pipeline_label: str,
+    max_retries: int = 3,
+    base_delay: float = 0.1,
+) -> Any:
+    """Execute *factory_fn* with retry logic and cache the result on *cache_fn*.
+
+    Permanent errors (hosting unreachable, PDX conflict) skip retry and are
+    cached as enriched exceptions. Transient errors retry up to *max_retries*
+    times with exponential backoff.
+
+    Args:
+        factory_fn: Callable that creates the pipeline.
+        cache_fn: The getter function whose ``_model`` attr stores the result.
+        pipeline_label: Human-readable label for log messages.
+        max_retries: Maximum number of attempts.
+        base_delay: Initial delay in seconds between retries.
+
+    Returns:
+        The created pipeline object.
+
+    Raises:
+        RuntimeError: On permanent error (enriched with diagnostics).
+        Exception: On exhausted transient retries.
+    """
+    if hasattr(cache_fn, "_model"):  # type: ignore[attr-defined]
+        return cache_fn._model  # type: ignore[attr-defined]
+
+    exc = getattr(cache_fn, "_init_exception", None)
+    if exc is not None:
+        raise exc
+
+    for attempt in range(max_retries):
+        try:
+            cache_fn._model = factory_fn()  # type: ignore[attr-defined]
+        except Exception as e:
+            if _is_permanent_model_init_error(e):
+                cache_fn._init_exception = _build_enriched_permanent_error(e)  # type: ignore[attr-defined]
+                raise cache_fn._init_exception from e  # type: ignore[misc,attr-defined]
+            if attempt == max_retries - 1:
+                cache_fn._init_exception = e  # type: ignore[attr-defined]
+                raise
+            delay = base_delay * (2**attempt)
+            logger.warning(
+                "PaddleX %s model initialization failed (attempt %d/%d): %s. Retrying in %.1fs",
+                pipeline_label,
+                attempt + 1,
+                max_retries,
+                e,
+                delay,
+            )
+            time.sleep(delay)
+        else:
+            break
+
+    return cache_fn._model  # type: ignore[attr-defined]
 
 
 # ── General OCR pipeline ──────────────────────────────────────────────────
@@ -302,50 +555,17 @@ def _get_paddlex_model() -> Any:
     to clear the cache.
     """
     with _PADDLEX_MODEL_LOCK:
-        if hasattr(_get_paddlex_model, "_model"):  # type: ignore[attr-defined]
-            return _get_paddlex_model._model  # type: ignore[attr-defined]
-
-        exc = get_paddlex_init_exception()
-        if exc is not None:
-            raise exc
-
-        # Retry mechanism: up to 3 attempts with exponential backoff.
-        # Permanent errors (hosting unreachable, PDX conflict) skip retry.
-        max_retries = 3
-        base_delay = 0.1  # seconds
-        for attempt in range(max_retries):
-            try:
-                _get_paddlex_model._model = _create_paddlex_ocr_pipeline()  # type: ignore[attr-defined]
-            except Exception as e:
-                # Permanent errors: don't retry — cache and fail fast
-                if _is_permanent_model_init_error(e):
-                    _get_paddlex_model._init_exception = e  # type: ignore[attr-defined]
-                    raise
-                if attempt == max_retries - 1:
-                    _get_paddlex_model._init_exception = e  # type: ignore[attr-defined]
-                    raise
-                delay = base_delay * (2**attempt)  # 0.1s, 0.2s, 0.4s
-                logging.getLogger("doc-worker.paddlex_helpers").warning(
-                    "PaddleX model initialization failed (attempt %d/%d): %s. Retrying in %.1fs",
-                    attempt + 1,
-                    max_retries,
-                    e,
-                    delay,
-                )
-                time.sleep(delay)
-            else:
-                break
-
-        return _get_paddlex_model._model  # type: ignore[attr-defined]
+        return _retry_model_init(
+            factory_fn=_create_paddlex_ocr_pipeline,
+            cache_fn=_get_paddlex_model,
+            pipeline_label="General OCR",
+        )
 
 
 # ── Model destruction ────────────────────────────────────────────────────
 def destroy_paddlex_model() -> None:
     """Destroy cached PaddleX models and reclaim memory."""
     import gc
-    import logging
-
-    logger = logging.getLogger("doc-worker.paddlex_helpers")
 
     try:
         with _PADDLEX_MODEL_LOCK:
@@ -417,9 +637,7 @@ def _pdf_to_images(pdf_path: str, tmp_dir: str) -> list[str]:
 
     # Warn on stderr output, but elevate to error if no pages were produced
     if result.stderr:
-        logging.getLogger("doc-worker.paddlex_helpers").warning(
-            "pdftoppm stderr: %s", result.stderr
-        )
+        logger.warning("pdftoppm stderr: %s", result.stderr)
 
     png_files = sorted(Path(tmp_dir).glob("page-*.png"))
     if not png_files:
@@ -464,41 +682,11 @@ def _get_paddlex_structure_v3_model() -> Any:
     calls. Uses retry logic with exponential backoff for transient errors.
     """
     with _PADDLEX_MODEL_LOCK:
-        if hasattr(_get_paddlex_structure_v3_model, "_model"):  # type: ignore[attr-defined]
-            return _get_paddlex_structure_v3_model._model  # type: ignore[attr-defined]
-
-        exc = getattr(_get_paddlex_structure_v3_model, "_init_exception", None)
-        if exc is not None:
-            raise exc
-
-        # Retry mechanism: up to 3 attempts with exponential backoff.
-        # Permanent errors skip retry.
-        max_retries = 3
-        base_delay = 0.1  # seconds
-        for attempt in range(max_retries):
-            try:
-                _get_paddlex_structure_v3_model._model = _create_structure_v3_pipeline()  # type: ignore[attr-defined]
-            except Exception as e:
-                # Permanent errors: don't retry — cache and fail fast
-                if _is_permanent_model_init_error(e):
-                    _get_paddlex_structure_v3_model._init_exception = e  # type: ignore[attr-defined]
-                    raise
-                if attempt == max_retries - 1:
-                    _get_paddlex_structure_v3_model._init_exception = e  # type: ignore[attr-defined]
-                    raise
-                delay = base_delay * (2**attempt)  # 0.1s, 0.2s, 0.4s
-                logging.getLogger("doc-worker.paddlex_helpers").warning(
-                    "PaddleX Structure V3 model initialization failed (attempt %d/%d): %s. Retrying in %.1fs",
-                    attempt + 1,
-                    max_retries,
-                    e,
-                    delay,
-                )
-                time.sleep(delay)
-            else:
-                break
-
-        return _get_paddlex_structure_v3_model._model  # type: ignore[attr-defined]
+        return _retry_model_init(
+            factory_fn=_create_structure_v3_pipeline,
+            cache_fn=_get_paddlex_structure_v3_model,
+            pipeline_label="Structure V3",
+        )
 
 
 # ── OCR extraction (backward compatible) ─────────────────────────────────
@@ -920,3 +1108,9 @@ def blocks_to_markdown(structured_blocks: list[dict]) -> str:
         lines.append(f"\n*{last_figure_title}*\n")
 
     return "\n".join(lines)
+
+
+# ── Eager patching at import time ──────────────────────────────────────
+# Apply the monkey-patch immediately so it covers ALL PaddleX internal
+# code paths, including those triggered during import.
+_patch_paddlex_official_models()

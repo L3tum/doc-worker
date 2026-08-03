@@ -55,12 +55,25 @@ def _reset_paddlex_singleton():
                 delattr(obj, attr)
 
 
-REQUIRED_MODELS = (
+REQUIRED_MODEL_NAMES = (
     TEXT_DETECTION_MODEL,
     TEXT_RECOGNITION_MODEL,
     TEXTLINE_ORIENTATION_MODEL,
     LAYOUT_DETECTION_MODEL,
 )
+
+
+class _MockOfficialModels:
+    """Shared mock for PaddleX's official_models object in tests."""
+
+    def __getitem__(self, name: str) -> str:
+        return f"original-{name}"
+
+    def get(self, name: str, default=None):
+        return f"original-{name}"
+
+    def __contains__(self, name: object) -> bool:
+        return False
 
 
 def _write_model(
@@ -90,7 +103,7 @@ def _write_model(
 
 
 def _write_all_models(root: Path, **kwargs: Any) -> None:
-    for logical_model_name in REQUIRED_MODELS:
+    for logical_model_name in REQUIRED_MODEL_NAMES:
         _write_model(root, logical_model_name, **kwargs)
 
 
@@ -105,7 +118,7 @@ def test_constants_use_logical_model_names_not_infer_directory_names(
     assert TEXT_RECOGNITION_MODEL == "PP-OCRv6_medium_rec"
     assert TEXTLINE_ORIENTATION_MODEL == "PP-LCNet_x1_0_textline_ori"
     assert LAYOUT_DETECTION_MODEL == "PP-DocLayout-L"
-    assert all(not model_name.endswith("_infer") for model_name in REQUIRED_MODELS)
+    assert all(not model_name.endswith("_infer") for model_name in REQUIRED_MODEL_NAMES)
 
     assert _model_dir(TEXT_DETECTION_MODEL) == (tmp_path / "PP-OCRv6_medium_det_infer")
     assert _model_dir(TEXT_RECOGNITION_MODEL) == (
@@ -184,8 +197,8 @@ def test_validate_reports_missing_required_model_files(tmp_path, monkeypatch):
         validate_paddlex_models()
 
 
-def test_validate_renames_legacy_orientation_directory(tmp_path, monkeypatch):
-    """Test that validation renames the legacy orientation directory (lowercase lcnet)."""
+def test_migrate_renames_legacy_orientation_directory(tmp_path, monkeypatch):
+    """Test that migrate_legacy_model_dirs() renames the legacy orientation directory."""
     import paddlex_helpers
 
     monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
@@ -201,20 +214,36 @@ def test_validate_renames_legacy_orientation_directory(tmp_path, monkeypatch):
     (legacy_dir / "inference.json").write_text("{}")
     _write_model(tmp_path, LAYOUT_DETECTION_MODEL)
 
-    # Before validation: legacy dir exists, expected dir doesn't
+    # Before migration: legacy dir exists, expected dir doesn't
     expected_dir = tmp_path / "PP-LCNet_x1_0_textline_ori_infer"
     assert legacy_dir.exists()
     assert not expected_dir.exists()
 
-    validate_paddlex_models()
+    paddlex_helpers.migrate_legacy_model_dirs()
 
-    # After validation, the rename should have happened
+    # After migration
     assert expected_dir.exists()
     assert not legacy_dir.exists()
-    # After rename, expected_dir should exist (even though we mocked, the actual
-    # dir exists because rename was called)
-    # Note: we can't assert expected_dir.exists() since rename was mocked,
-    # but the rename call proves the logic works.
+
+
+def test_validate_does_not_rename_legacy_directory(tmp_path, monkeypatch):
+    """validate_paddlex_models() should be read-only — no os.rename()."""
+    import paddlex_helpers
+
+    monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+    _write_model(tmp_path, TEXT_DETECTION_MODEL)
+    _write_model(tmp_path, TEXT_RECOGNITION_MODEL)
+    # Create the legacy directory
+    legacy_dir = tmp_path / "PP-OCRv6_lcnet_x1_0_textline_ori_infer"
+    legacy_dir.mkdir()
+    _write_model(tmp_path, LAYOUT_DETECTION_MODEL)
+
+    # validate should fail (missing the expected dir) and NOT rename
+    with pytest.raises(FileNotFoundError):
+        paddlex_helpers.validate_paddlex_models()
+
+    # Legacy dir should still exist (no rename happened)
+    assert legacy_dir.exists()
 
 
 def test_create_paddleocr_model_pins_logical_names_and_local_dirs(
@@ -481,18 +510,15 @@ class TestPaddlexOfficialModelsPatch:
     """Tests for _patch_paddlex_official_models() — air-gapped compatibility."""
 
     def test_patch_returns_local_dir(self, tmp_path, monkeypatch):
-        """Patched __getitem__ returns our local model path for known model names."""
+        """Patched official_models resolves known model names to local dirs."""
         import paddlex_helpers
 
         monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
         _write_all_models(tmp_path)
 
-        # Create a mock official_models object
-        mock_class = type("MockOfficialModels", (), {})
-        mock_obj = mock_class()
-        mock_obj.__class__.__getitem__ = lambda self, name: f"original-{name}"
+        mock_obj = _MockOfficialModels()
 
-        # Set up the full module hierarchy so `from ... import` works
+        # Set up BOTH the parent module AND the submodule so the import works
         mock_utils = types.ModuleType("paddlex.inference.utils")
         mock_om_module = types.ModuleType("paddlex.inference.utils.official_models")
         mock_om_module.official_models = mock_obj
@@ -503,12 +529,12 @@ class TestPaddlexOfficialModelsPatch:
             sys.modules, "paddlex.inference.utils.official_models", mock_om_module
         )
 
-        # Reset patch flag so it gets applied
+        # Manually apply the patch now that mocks are in place
         paddlex_helpers._PADDLEX_PATCHED = False
         paddlex_helpers._patch_paddlex_official_models()
 
-        # Known model name should resolve to our local dir
-        result = mock_obj[TEXT_DETECTION_MODEL]
+        # The module-level variable should now be our _LocalModelResolver
+        result = mock_om_module.official_models[TEXT_DETECTION_MODEL]
         assert result == str(tmp_path / "PP-OCRv6_medium_det_infer")
 
     def test_patch_falls_back_to_original(self, tmp_path, monkeypatch):
@@ -518,10 +544,7 @@ class TestPaddlexOfficialModelsPatch:
         monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
         _write_all_models(tmp_path)
 
-        mock_class = type("MockOfficialModels", (), {})
-        mock_obj = mock_class()
-        original_getitem = lambda self, name: f"original-{name}"
-        mock_obj.__class__.__getitem__ = original_getitem
+        mock_obj = _MockOfficialModels()
 
         mock_utils = types.ModuleType("paddlex.inference.utils")
         mock_om_module = types.ModuleType("paddlex.inference.utils.official_models")
@@ -537,7 +560,7 @@ class TestPaddlexOfficialModelsPatch:
         paddlex_helpers._patch_paddlex_official_models()
 
         # Unknown model name should use original behavior
-        result = mock_obj["UNKNOWN_MODEL_XYZ"]
+        result = mock_om_module.official_models["UNKNOWN_MODEL_XYZ"]
         assert result == "original-UNKNOWN_MODEL_XYZ"
 
     def test_patch_is_idempotent(self, tmp_path, monkeypatch):
@@ -547,9 +570,7 @@ class TestPaddlexOfficialModelsPatch:
         monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
         _write_all_models(tmp_path)
 
-        mock_class = type("MockOfficialModels", (), {})
-        mock_obj = mock_class()
-        mock_obj.__class__.__getitem__ = lambda self, name: f"original-{name}"
+        mock_obj = _MockOfficialModels()
 
         mock_utils = types.ModuleType("paddlex.inference.utils")
         mock_om_module = types.ModuleType("paddlex.inference.utils.official_models")
@@ -569,7 +590,7 @@ class TestPaddlexOfficialModelsPatch:
         paddlex_helpers._patch_paddlex_official_models()
 
         # Should still work
-        result = mock_obj[TEXT_DETECTION_MODEL]
+        result = mock_om_module.official_models[TEXT_DETECTION_MODEL]
         assert result == str(tmp_path / "PP-OCRv6_medium_det_infer")
 
     def test_patch_handles_import_error(self, monkeypatch):
@@ -842,3 +863,277 @@ class TestStructureV3DestroyAndRecreate:
         # Re-creation
         paddlex_helpers._get_paddlex_structure_v3_model()
         assert create_count == 2  # pipeline was recreated, not reused
+
+
+# ── _LocalModelResolver tests ────────────────────────────────────────────
+
+
+class TestLocalModelResolver:
+    """Tests for _LocalModelResolver composition-based wrapper."""
+
+    def test_raises_attribute_error_for_underscore_names(self, tmp_path, monkeypatch):
+        """__getattr__ raises AttributeError for ALL underscore-prefixed names."""
+        import paddlex_helpers
+
+        resolver = paddlex_helpers._LocalModelResolver(_MockOfficialModels())
+
+        with pytest.raises(AttributeError):
+            _ = resolver._nonexistent
+        with pytest.raises(AttributeError):
+            _ = resolver.__custom_dunder__
+
+    def test_get_delegates_to_original_on_miss(self, tmp_path, monkeypatch):
+        """get() falls back to original when model is not local."""
+        import paddlex_helpers
+
+        resolver = paddlex_helpers._LocalModelResolver(_MockOfficialModels())
+        assert resolver.get("unknown") == "original-unknown"
+        assert resolver.get("unknown", "fallback") == "original-unknown"
+
+    def test_contains_checks_original(self, tmp_path, monkeypatch):
+        """__contains__ checks both local and original."""
+        import paddlex_helpers
+
+        class MockWithContains(_MockOfficialModels):
+            def __contains__(self, name):
+                return name == "known_model"
+
+        resolver = paddlex_helpers._LocalModelResolver(MockWithContains())
+        assert "known_model" in resolver
+        assert "unknown_model" not in resolver
+
+    def test_items_delegates_to_original(self, tmp_path, monkeypatch):
+        """items() delegates to the original object."""
+        import paddlex_helpers
+
+        class MockWithItems(_MockOfficialModels):
+            def items(self):
+                return [("a", 1), ("b", 2)]
+
+        resolver = paddlex_helpers._LocalModelResolver(MockWithItems())
+        assert list(resolver.items()) == [("a", 1), ("b", 2)]
+
+    def test_pop_delegates_to_original(self, tmp_path, monkeypatch):
+        """pop() delegates to the original object."""
+        import paddlex_helpers
+
+        class MockWithPop(_MockOfficialModels):
+            def pop(self, key, default=None):
+                return f"popped-{key}"
+
+        resolver = paddlex_helpers._LocalModelResolver(MockWithPop())
+        assert resolver.pop("key") == "popped-key"
+
+    def test_setdefault_delegates_to_original(self, tmp_path, monkeypatch):
+        """setdefault() delegates to the original object."""
+        import paddlex_helpers
+
+        class MockWithSetdefault(_MockOfficialModels):
+            def setdefault(self, key, default=None):
+                return f"default-{key}"
+
+        resolver = paddlex_helpers._LocalModelResolver(MockWithSetdefault())
+        assert resolver.setdefault("key") == "default-key"
+
+    def test_update_delegates_to_original(self, tmp_path, monkeypatch):
+        """update() delegates to the original object."""
+        import paddlex_helpers
+
+        class MockWithUpdate(_MockOfficialModels):
+            def update(self, other=None, **kwargs):
+                self._updated = True
+
+        mock = MockWithUpdate()
+        resolver = paddlex_helpers._LocalModelResolver(mock)
+        resolver.update({})
+        assert mock._updated is True
+
+
+# ── _build_model_dir_status and _build_enriched_permanent_error tests ────
+
+
+class TestModelDirStatusHelper:
+    """Tests for _build_model_dir_status() and _build_enriched_permanent_error()."""
+
+    def test_model_dir_status_shows_checkmarks(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+
+        status = paddlex_helpers._build_model_dir_status()
+        assert "PP-OCRv6_medium_det: ✓" in status
+        assert "PP-OCRv6_medium_rec: ✓" in status
+        assert "PP-LCNet_x1_0_textline_ori: ✓" in status
+        assert "PP-DocLayout-L: ✓" in status
+
+    def test_model_dir_status_shows_x_for_missing(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+        _write_model(tmp_path, TEXT_DETECTION_MODEL)
+        _write_model(tmp_path, TEXT_RECOGNITION_MODEL)
+
+        status = paddlex_helpers._build_model_dir_status()
+        assert "PP-OCRv6_medium_det: ✓" in status
+        assert "PP-DocLayout-L: ✗" in status
+
+    def test_enriched_error_contains_diagnostics(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+        original_error = RuntimeError("No available model hosting platforms detected")
+
+        enriched = paddlex_helpers._build_enriched_permanent_error(original_error)
+        assert "PaddleX model initialization failed (permanent)" in str(enriched)
+        assert "No available model hosting platforms" in str(enriched)
+        assert "Local model directories:" in str(enriched)
+        assert "Patch applied:" in str(enriched)
+        assert "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=" in str(enriched)
+        assert "Models directory:" in str(enriched)
+        assert "PADDLEOCR_MODELS=" not in str(enriched)  # full path redacted
+
+    def test_enriched_error_preserves_cause_chain(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+        original_error = RuntimeError("original cause")
+
+        enriched = paddlex_helpers._build_enriched_permanent_error(original_error)
+        assert enriched.__cause__ is original_error
+
+
+# ── warmup_paddlex_models tests ──────────────────────────────────────────
+
+
+class TestWarmup:
+    """Tests for warmup_paddlex_models()."""
+
+    def test_warmup_succeeds_for_both_pipelines(self, tmp_path, monkeypatch):
+        """Warmup completes successfully when both pipelines initialize."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        create_count = 0
+
+        def counting_create_pipeline(name: str, **kwargs: Any) -> dict:
+            nonlocal create_count
+            create_count += 1
+            return {}
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = counting_create_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        paddlex_helpers.warmup_paddlex_models()
+        assert create_count == 2  # OCR + Structure V3
+
+    def test_warmup_clears_cached_exception_on_failure(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Warmup clears _init_exception so first real use gets a fresh attempt."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        attempts = 0
+
+        def failing_create_pipeline(name: str, **kwargs: Any) -> dict:
+            nonlocal attempts
+            attempts += 1
+            # Always fail with transient error — warmup will exhaust retries
+            raise RuntimeError("warmup fails initially")
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = failing_create_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        with caplog.at_level("WARNING"):
+            paddlex_helpers.warmup_paddlex_models()
+
+        # Warmup logged warning about failure (outer warning, not retry warnings)
+        assert "warm-up failed" in caplog.text
+
+    def test_warmup_propagates_system_exit(self, tmp_path, monkeypatch):
+        """SystemExit and KeyboardInterrupt should not be swallowed by warmup."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _write_all_models(tmp_path)
+
+        def system_exit_pipeline(name: str, **kwargs: Any) -> dict:
+            raise SystemExit("forced shutdown")
+
+        pdx_module = types.ModuleType("paddlex")
+        pdx_module.__path__ = []  # type: ignore[attr-defined]
+        pdx_module.create_pipeline = system_exit_pipeline
+        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+
+        with pytest.raises(SystemExit):
+            paddlex_helpers.warmup_paddlex_models()
+
+
+# ── _is_model_error tests ────────────────────────────────────────────────
+
+
+class TestIsModelError:
+    """Tests for _is_model_error() classification."""
+
+    def test_paddle_error_is_model_error(self):
+        from paddlex_helpers import _is_model_error
+
+        assert _is_model_error(RuntimeError("PaddleX failed to initialize"))
+        assert _is_model_error(RuntimeError("CUDA out of memory"))
+        assert _is_model_error(RuntimeError("Predictor inference failed"))
+
+    def test_docling_error_is_not_model_error(self):
+        from paddlex_helpers import _is_model_error
+
+        assert not _is_model_error(RuntimeError("Docling API timeout"))
+        assert not _is_model_error(RuntimeError("HTTP 503"))
+        assert not _is_model_error(FileNotFoundError("file.pdf not found"))
+
+    def test_ocrmypdf_error_is_not_model_error(self):
+        from paddlex_helpers import _is_model_error
+
+        assert not _is_model_error(RuntimeError("ocrmypdf exit code 1"))
+        assert not _is_model_error(RuntimeError("paperless push failed"))
+
+
+# ── _model_dir security tests ────────────────────────────────────────────
+
+
+class TestModelDirSecurity:
+    """Tests for _model_dir() path traversal protection."""
+
+    def test_model_dir_raises_for_unknown_name(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+
+        with pytest.raises(ValueError, match="Unknown model name"):
+            paddlex_helpers._model_dir("../../etc/passwd")
+
+    def test_model_dir_raises_for_traversal_attempt(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+
+        with pytest.raises(ValueError, match="Unknown model name"):
+            paddlex_helpers._model_dir("PP-OCRv6_medium_det/../../etc")
+
+    def test_model_dir_returns_valid_path_for_known_model(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+
+        result = paddlex_helpers._model_dir(TEXT_DETECTION_MODEL)
+        assert result == tmp_path / "PP-OCRv6_medium_det_infer"
