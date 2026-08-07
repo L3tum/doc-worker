@@ -92,6 +92,15 @@ RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
         tar -xf "/tmp/${name}.tar" -C "${PADDLEOCR_MODELS}" && \
         rm "/tmp/${name}.tar"; \
     done && \
+    # Verify each model directory exists at the expected path (catches nested tarball structures)
+    for name in PP-OCRv6_medium_det_infer PP-OCRv6_medium_rec_infer PP-LCNet_x1_0_textline_ori_infer PP-LCNet_x1_0_doc_ori_infer PP-DocLayout-L_infer; do \
+        if [ ! -d "${PADDLEOCR_MODELS}/${name}" ]; then \
+            echo "ERROR: Model directory not found after extraction: ${PADDLEOCR_MODELS}/${name}" && \
+            echo "Contents of ${PADDLEOCR_MODELS}:" && ls -la "${PADDLEOCR_MODELS}/" && \
+            exit 1; \
+        fi && \
+        echo "  ✓ ${name} directory verified"; \
+    done && \
     for spec in \
         "PP-OCRv6_medium_det_infer PP-OCRv6_medium_det" \
         "PP-OCRv6_medium_rec_infer PP-OCRv6_medium_rec" \

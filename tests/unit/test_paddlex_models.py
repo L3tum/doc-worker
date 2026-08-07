@@ -566,8 +566,8 @@ class TestPaddlexOfficialModelsPatch:
         result = mock_om_module.official_models[TEXT_DETECTION_MODEL]
         assert result == str(tmp_path / "PP-OCRv6_medium_det_infer")
 
-    def test_patch_falls_back_to_original(self, tmp_path, monkeypatch):
-        """Unknown model names fall back to original behavior."""
+    def test_patch_raises_for_unknown_model(self, tmp_path, monkeypatch):
+        """Unknown model names raise RuntimeError instead of falling back to PaddleX."""
         import paddlex_helpers
 
         monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
@@ -588,9 +588,10 @@ class TestPaddlexOfficialModelsPatch:
         paddlex_helpers._PADDLEX_PATCHED = False
         paddlex_helpers._patch_paddlex_official_models()
 
-        # Unknown model name should use original behavior
-        result = mock_om_module.official_models["UNKNOWN_MODEL_XYZ"]
-        assert result == "original-UNKNOWN_MODEL_XYZ"
+        # Unknown model name should raise RuntimeError, not delegate to original
+        resolver = mock_om_module.official_models
+        with pytest.raises(RuntimeError, match="not available locally"):
+            _ = resolver["UNKNOWN_MODEL_XYZ"]
 
     def test_patch_is_idempotent(self, tmp_path, monkeypatch):
         """Calling the patch multiple times doesn't break anything."""
@@ -911,24 +912,46 @@ class TestLocalModelResolver:
         with pytest.raises(AttributeError):
             _ = resolver.__custom_dunder__
 
-    def test_get_delegates_to_original_on_miss(self, tmp_path, monkeypatch):
-        """get() falls back to original when model is not local."""
+    def test_raises_for_unknown_model_via_getitem(self, tmp_path, monkeypatch):
+        """__getitem__ raises RuntimeError for unknown models instead of falling back."""
         import paddlex_helpers
 
         resolver = paddlex_helpers._LocalModelResolver(_MockOfficialModels())
-        assert resolver.get("unknown") == "original-unknown"
-        assert resolver.get("unknown", "fallback") == "original-unknown"
+        with pytest.raises(RuntimeError, match="not available locally"):
+            _ = resolver["UNKNOWN_MODEL_XYZ"]
 
-    def test_contains_checks_original(self, tmp_path, monkeypatch):
-        """__contains__ checks both local and original."""
+    def test_get_raises_when_no_default(self, tmp_path, monkeypatch):
+        """get() with no default raises RuntimeError for unknown models."""
         import paddlex_helpers
+
+        resolver = paddlex_helpers._LocalModelResolver(_MockOfficialModels())
+        with pytest.raises(RuntimeError, match="not available locally"):
+            resolver.get("unknown")
+
+    def test_get_returns_explicit_default(self, tmp_path, monkeypatch):
+        """get() with an explicit default returns that default instead of raising."""
+        import paddlex_helpers
+
+        resolver = paddlex_helpers._LocalModelResolver(_MockOfficialModels())
+        assert resolver.get("unknown", "my-fallback") == "my-fallback"
+        assert resolver.get("unknown", None) is None
+
+    def test_contains_only_checks_local(self, tmp_path, monkeypatch):
+        """__contains__ only checks local models, never the original (prevents network probes)."""
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
 
         class MockWithContains(_MockOfficialModels):
             def __contains__(self, name):
                 return name == "known_model"
 
         resolver = paddlex_helpers._LocalModelResolver(MockWithContains())
-        assert "known_model" in resolver
+        # Local models are found
+        assert "PP-OCRv6_medium_det" in resolver
+        # Unknown models are NOT found (no fallback to original)
+        assert "known_model" not in resolver
         assert "unknown_model" not in resolver
 
     def test_items_delegates_to_original(self, tmp_path, monkeypatch):

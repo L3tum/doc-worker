@@ -109,6 +109,11 @@ def _model_dir(model_name: str) -> Path:
     return Path(PADDLEOCR_MODELS) / PADDLEX_MODEL_DIRS[model_name]
 
 
+def _list_available_models() -> list[str]:
+    """Return names of models that have local directories."""
+    return [name for name in PADDLEX_MODEL_DIRS if _model_dir(name).is_dir()]
+
+
 def migrate_legacy_model_dirs() -> None:
     """Rename legacy model directories to their correct names.
 
@@ -209,6 +214,9 @@ class _LocalModelResolver:
 
     __slots__ = ("_data", "_original")
 
+    # Sentinel to distinguish "no default" from "default is None"
+    _MISSING = object()
+
     def __init__(self, original: Any) -> None:
         self._original = original
         self._data: dict[str, Any] = {}
@@ -226,18 +234,33 @@ class _LocalModelResolver:
         local = self._resolve_local(model_name)
         if local:
             return local
-        return self._original[model_name]  # type: ignore[index,no-any-return]
+        # Never fall back to original — prevents network downloads in air-gapped envs.
+        available = _list_available_models()
+        raise RuntimeError(
+            f"Model '{model_name}' is not available locally. "
+            f"Local models: {', '.join(available) if available else '(none)'}\n"
+            f"This prevents network downloads in air-gapped environments. "
+            f"If this model is needed, add it to the Docker image and "
+            f"PADDLEX_MODEL_DIRS registry."
+        )
 
-    def get(self, model_name: str, default: Any = None) -> Any:
+    def get(self, model_name: str, default: Any = _MISSING) -> Any:
         local = self._resolve_local(model_name)
         if local:
             return local
-        return self._original.get(model_name, default)  # type: ignore[attr-defined]
+        if default is not _LocalModelResolver._MISSING:
+            return default
+        # For .get() with no default, raise same error as __getitem__
+        available = _list_available_models()
+        raise RuntimeError(
+            f"Model '{model_name}' is not available locally. "
+            f"Local models: {', '.join(available) if available else '(none)'}\n"
+            f"This prevents network downloads in air-gapped environments."
+        )
 
     def __contains__(self, model_name: object) -> bool:
-        if isinstance(model_name, str) and self._resolve_local(model_name):
-            return True
-        return model_name in self._original  # type: ignore[arg-type]
+        # Never check the original — prevents network probes in air-gapped envs.
+        return bool(isinstance(model_name, str) and self._resolve_local(model_name))
 
     def __getattr__(self, name: str) -> Any:
         # Delegate unknown attributes to the original object.
