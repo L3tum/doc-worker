@@ -33,6 +33,7 @@ USE_STRUCTURE_V3 = os.getenv("USE_STRUCTURE_V3", "true").lower() in ("true", "1"
 TEXT_DETECTION_MODEL = "PP-OCRv6_medium_det"
 TEXT_RECOGNITION_MODEL = "PP-OCRv6_medium_rec"
 TEXTLINE_ORIENTATION_MODEL = "PP-LCNet_x1_0_textline_ori"
+DOC_ORIENTATION_MODEL = "PP-LCNet_x1_0_doc_ori"
 LAYOUT_DETECTION_MODEL = "PP-DocLayout-L"
 
 # Model directories (extracted tarball names)
@@ -40,6 +41,7 @@ PADDLEX_MODEL_DIRS = {
     TEXT_DETECTION_MODEL: "PP-OCRv6_medium_det_infer",
     TEXT_RECOGNITION_MODEL: "PP-OCRv6_medium_rec_infer",
     TEXTLINE_ORIENTATION_MODEL: "PP-LCNet_x1_0_textline_ori_infer",
+    DOC_ORIENTATION_MODEL: "PP-LCNet_x1_0_doc_ori_infer",
     LAYOUT_DETECTION_MODEL: "PP-DocLayout-L_infer",
 }
 
@@ -48,6 +50,7 @@ REQUIRED_MODEL_NAMES: tuple[str, ...] = (
     TEXT_DETECTION_MODEL,
     TEXT_RECOGNITION_MODEL,
     TEXTLINE_ORIENTATION_MODEL,
+    DOC_ORIENTATION_MODEL,
     LAYOUT_DETECTION_MODEL,
 )
 

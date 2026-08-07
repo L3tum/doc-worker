@@ -118,6 +118,7 @@ _PADDLEOCR_MODELS_LIST = [
     ("PP-OCRv6_medium_det", "PP-OCRv6_medium_det_infer"),
     ("PP-OCRv6_medium_rec", "PP-OCRv6_medium_rec_infer"),
     ("PP-LCNet_x1_0_textline_ori", "PP-LCNet_x1_0_textline_ori_infer"),
+    ("PP-LCNet_x1_0_doc_ori", "PP-LCNet_x1_0_doc_ori_infer"),
     ("PP-DocLayout-L", "PP-DocLayout-L_infer"),
 ]
 

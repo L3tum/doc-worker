@@ -86,7 +86,7 @@ ENV PADDLE_PDX_CACHE_HOME=/tmp/.paddlex
 RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
     chmod 1777 "${PADDLE_PDX_CACHE_HOME}" && \
     base="https://paddle-model-ecology.bj.bcebos.com/paddlex/official_inference_model/paddle3.0.0" && \
-    for name in PP-OCRv6_medium_det_infer PP-OCRv6_medium_rec_infer PP-LCNet_x1_0_textline_ori_infer PP-DocLayout-L_infer; do \
+    for name in PP-OCRv6_medium_det_infer PP-OCRv6_medium_rec_infer PP-LCNet_x1_0_textline_ori_infer PP-LCNet_x1_0_doc_ori_infer PP-DocLayout-L_infer; do \
         echo "Downloading ${name}..." && \
         wget -q "${base}/${name}.tar" -O "/tmp/${name}.tar" && \
         tar -xf "/tmp/${name}.tar" -C "${PADDLEOCR_MODELS}" && \
@@ -96,6 +96,7 @@ RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
         "PP-OCRv6_medium_det_infer PP-OCRv6_medium_det" \
         "PP-OCRv6_medium_rec_infer PP-OCRv6_medium_rec" \
         "PP-LCNet_x1_0_textline_ori_infer PP-LCNet_x1_0_textline_ori" \
+        "PP-LCNet_x1_0_doc_ori_infer PP-LCNet_x1_0_doc_ori" \
         "PP-DocLayout-L_infer PP-DocLayout-L"; do \
         set -- ${spec}; dir="$1"; model="$2"; \
         if ! grep -Eq "^[[:space:]]*model_name:[[:space:]]*${model}$" "${PADDLEOCR_MODELS}/${dir}/inference.yml"; then \

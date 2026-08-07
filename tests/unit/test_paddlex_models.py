@@ -9,6 +9,7 @@ import pytest
 
 # Import from paddlex_helpers directly (paddleocr_helpers is a shim)
 from paddlex_helpers import (
+    DOC_ORIENTATION_MODEL,
     LAYOUT_DETECTION_MODEL,
     PADDLEX_MODEL_DIRS,
     TEXT_DETECTION_MODEL,
@@ -82,6 +83,7 @@ REQUIRED_MODEL_NAMES = (
     TEXT_DETECTION_MODEL,
     TEXT_RECOGNITION_MODEL,
     TEXTLINE_ORIENTATION_MODEL,
+    DOC_ORIENTATION_MODEL,
     LAYOUT_DETECTION_MODEL,
 )
 
@@ -140,6 +142,7 @@ def test_constants_use_logical_model_names_not_infer_directory_names(
     assert TEXT_DETECTION_MODEL == "PP-OCRv6_medium_det"
     assert TEXT_RECOGNITION_MODEL == "PP-OCRv6_medium_rec"
     assert TEXTLINE_ORIENTATION_MODEL == "PP-LCNet_x1_0_textline_ori"
+    assert paddlex_helpers.DOC_ORIENTATION_MODEL == "PP-LCNet_x1_0_doc_ori"
     assert LAYOUT_DETECTION_MODEL == "PP-DocLayout-L"
     assert all(not model_name.endswith("_infer") for model_name in REQUIRED_MODEL_NAMES)
 
@@ -149,6 +152,9 @@ def test_constants_use_logical_model_names_not_infer_directory_names(
     )
     assert _model_dir(TEXTLINE_ORIENTATION_MODEL) == (
         tmp_path / "PP-LCNet_x1_0_textline_ori_infer"
+    )
+    assert _model_dir(paddlex_helpers.DOC_ORIENTATION_MODEL) == (
+        tmp_path / "PP-LCNet_x1_0_doc_ori_infer"
     )
     assert _model_dir(LAYOUT_DETECTION_MODEL) == (tmp_path / "PP-DocLayout-L_infer")
 
@@ -988,6 +994,7 @@ class TestModelDirStatusHelper:
         assert "PP-OCRv6_medium_det: ✓" in status
         assert "PP-OCRv6_medium_rec: ✓" in status
         assert "PP-LCNet_x1_0_textline_ori: ✓" in status
+        assert "PP-LCNet_x1_0_doc_ori: ✓" in status
         assert "PP-DocLayout-L: ✓" in status
 
     def test_model_dir_status_shows_x_for_missing(self, tmp_path, monkeypatch):
