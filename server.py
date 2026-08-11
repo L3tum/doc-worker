@@ -59,6 +59,7 @@ from paddlex_helpers import (
     run_paddleocr,
     run_paddlex_structure_v3,
     validate_paddlex_models,
+    warmup_paddlex_models,
 )
 
 # ── Config ────────────────────────────────────────────────────────────
@@ -294,14 +295,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Model status
     print("  PaddleX models:", flush=True)
-    any_missing = False
     for model_name, model_dir in _PADDLEOCR_MODELS_LIST:
         status = _model_status(model_name, model_dir)
         marker = "  ✓" if status == "✓" else "  ✗"
         pad = " " * (max(len(n) for n, _ in _PADDLEOCR_MODELS_LIST) - len(model_name))
         print(f"    {model_name}{pad} {marker} {status}", flush=True)
-        if status != "✓":
-            any_missing = True
+
+    # Validate models — always run, not just when the status table finds gaps
+    migrate_legacy_model_dirs()
+    validate_paddlex_models()  # Raises FileNotFoundError or ValueError
+
+    # Warm up model pipelines — surfaces errors before first request arrives
+    try:
+        warmup_paddlex_models()
+        print("  PaddleX models warmed up successfully.", flush=True)
+    except Exception as exc:
+        print(
+            f"  PaddleX model warm-up failed: {exc}",
+            flush=True,
+        )
+        print(
+            "  Continuing anyway — models will be initialized lazily on first use.",
+            flush=True,
+        )
 
     # Docling sidecar
     print("  Docling sidecar:", flush=True)
@@ -342,11 +358,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     _start_idle_timeout_thread()
     _launch_health_check_thread()
     print(f"  Health check server on port {HEALTH_CHECK_PORT}", flush=True)
-
-    # Validate models — abort if critical ones are missing
-    if any_missing:
-        migrate_legacy_model_dirs()  # rename legacy dirs before validation
-        validate_paddlex_models()  # Raises FileNotFoundError or ValueError
 
     yield  # app runs here
 

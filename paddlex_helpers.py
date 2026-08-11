@@ -221,6 +221,19 @@ class _LocalModelResolver:
         self._original = original
         self._data: dict[str, Any] = {}
 
+        # Pre-populate _data with all known local model paths.
+        # This ensures that even if PaddleX accesses .keys(), .items(),
+        # or iterates over official_models, local models are included.
+        for model_name in PADDLEX_MODEL_DIRS:
+            local = self._resolve_local(model_name)
+            if local:
+                self._data[model_name] = local
+
+        # Inject local paths into the original object if it is dict-like.
+        # Catches PaddleX code paths that hold references to the original
+        # official_models object from before our module-level replacement.
+        self._inject_local_into_original(original)
+
     def _resolve_local(self, model_name: str) -> str | None:
         try:
             local_dir = _model_dir(model_name)
@@ -229,6 +242,26 @@ class _LocalModelResolver:
         if local_dir.is_dir():
             return str(local_dir)
         return None
+
+    def _inject_local_into_original(self, original: Any) -> None:
+        """Inject local model paths into the original official_models object.
+
+        If the original is dict-like, we directly populate it with local paths.
+        This catches PaddleX code paths that hold stale references to the
+        original official_models object from before our module-level replacement.
+        """
+        if hasattr(original, "__setitem__"):
+            try:
+                for model_name, local_path in self._data.items():
+                    original[model_name] = local_path
+                logger.debug(
+                    "Injected %d local model paths into original official_models",
+                    len(self._data),
+                )
+            except Exception:
+                logger.debug(
+                    "Could not inject local models into original official_models"
+                )
 
     def __getitem__(self, model_name: str) -> str:
         local = self._resolve_local(model_name)
@@ -551,9 +584,11 @@ def _create_paddlex_ocr_pipeline(use_textline_orientation: bool = True) -> Any:
         text_detection_model_dir=str(_model_dir(TEXT_DETECTION_MODEL)),
         text_recognition_model_dir=str(_model_dir(TEXT_RECOGNITION_MODEL)),
         textline_orientation_model_dir=str(_model_dir(TEXTLINE_ORIENTATION_MODEL)),
+        doc_orientation_model_dir=str(_model_dir(DOC_ORIENTATION_MODEL)),
         text_detection_model_name=TEXT_DETECTION_MODEL,
         text_recognition_model_name=TEXT_RECOGNITION_MODEL,
         textline_orientation_model_name=TEXTLINE_ORIENTATION_MODEL,
+        doc_orientation_model_name=DOC_ORIENTATION_MODEL,
         use_textline_orientation=use_textline_orientation,
         lang=paddleocr_lang_code(),
     )
@@ -691,9 +726,11 @@ def _create_structure_v3_pipeline() -> Any:
         text_detection_model_dir=str(_model_dir(TEXT_DETECTION_MODEL)),
         text_recognition_model_dir=str(_model_dir(TEXT_RECOGNITION_MODEL)),
         textline_orientation_model_dir=str(_model_dir(TEXTLINE_ORIENTATION_MODEL)),
+        doc_orientation_model_dir=str(_model_dir(DOC_ORIENTATION_MODEL)),
         text_detection_model_name=TEXT_DETECTION_MODEL,
         text_recognition_model_name=TEXT_RECOGNITION_MODEL,
         textline_orientation_model_name=TEXTLINE_ORIENTATION_MODEL,
+        doc_orientation_model_name=DOC_ORIENTATION_MODEL,
         use_textline_orientation=True,
         lang=paddleocr_lang_code(),
         # Disable table recognition (not yet needed, can be added later)

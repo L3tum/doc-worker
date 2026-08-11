@@ -99,7 +99,21 @@ RUN mkdir -p "${PADDLEOCR_MODELS}" "${PADDLE_PDX_CACHE_HOME}" && \
             echo "Contents of ${PADDLEOCR_MODELS}:" && ls -la "${PADDLEOCR_MODELS}/" && \
             exit 1; \
         fi && \
-        echo "  ✓ ${name} directory verified"; \
+        # Verify critical model files exist (catches corrupt/incomplete downloads)
+        for req_file in inference.pdiparams inference.yml; do \
+            if [ ! -f "${PADDLEOCR_MODELS}/${name}/${req_file}" ]; then \
+                echo "ERROR: Missing model file: ${PADDLEOCR_MODELS}/${name}/${req_file}" && \
+                echo "Contents of ${PADDLEOCR_MODELS}/${name}:" && ls -la "${PADDLEOCR_MODELS}/${name}/" && \
+                exit 1; \
+            fi; \
+        done && \
+        # Verify at least one model definition file exists
+        if [ ! -f "${PADDLEOCR_MODELS}/${name}/inference.json" ] && [ ! -f "${PADDLEOCR_MODELS}/${name}/inference.pdmodel" ]; then \
+            echo "ERROR: No model definition file in ${PADDLEOCR_MODELS}/${name}/ (expected inference.json or inference.pdmodel)" && \
+            echo "Contents of ${PADDLEOCR_MODELS}/${name}:" && ls -la "${PADDLEOCR_MODELS}/${name}/" && \
+            exit 1; \
+        fi && \
+        echo "  ✓ ${name} verified (dir + files)"; \
     done && \
     for spec in \
         "PP-OCRv6_medium_det_infer PP-OCRv6_medium_det" \
