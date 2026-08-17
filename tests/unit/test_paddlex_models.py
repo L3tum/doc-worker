@@ -132,6 +132,151 @@ def _write_all_models(root: Path, **kwargs: Any) -> None:
         _write_model(root, logical_model_name, **kwargs)
 
 
+def _ocr_config_fixture() -> dict[str, Any]:
+    """Mirror of PaddleX's default OCR.yaml (nested DocPreprocessor sub-pipeline)."""
+    return {
+        "pipeline_name": "OCR",
+        "text_type": "general",
+        "use_doc_preprocessor": True,
+        "use_textline_orientation": True,
+        "SubPipelines": {
+            "DocPreprocessor": {
+                "pipeline_name": "doc_preprocessor",
+                "use_doc_orientation_classify": True,
+                "use_doc_unwarping": True,
+                "SubModules": {
+                    "DocOrientationClassify": {
+                        "module_name": "doc_text_orientation",
+                        "model_name": DOC_ORIENTATION_MODEL,
+                        "model_dir": None,
+                    },
+                    "DocUnwarping": {
+                        "module_name": "image_unwarping",
+                        "model_name": "UVDoc",
+                        "model_dir": None,
+                    },
+                },
+            }
+        },
+        "SubModules": {
+            "TextDetection": {
+                "module_name": "text_detection",
+                "model_name": TEXT_DETECTION_MODEL,
+                "model_dir": None,
+            },
+            "TextLineOrientation": {
+                "module_name": "textline_orientation",
+                "model_name": TEXTLINE_ORIENTATION_MODEL,
+                "model_dir": None,
+            },
+            "TextRecognition": {
+                "module_name": "text_recognition",
+                "model_name": TEXT_RECOGNITION_MODEL,
+                "model_dir": None,
+            },
+        },
+    }
+
+
+def _layout_parsing_config_fixture() -> dict[str, Any]:
+    """Mirror of PaddleX's default layout_parsing.yaml (heavier, non-bundled defaults)."""
+    return {
+        "pipeline_name": "layout_parsing",
+        "use_doc_preprocessor": True,
+        "use_seal_recognition": True,
+        "use_table_recognition": True,
+        "use_formula_recognition": False,
+        "SubModules": {
+            "LayoutDetection": {
+                "module_name": "layout_detection",
+                "model_name": "RT-DETR-H_layout_17cls",
+                "model_dir": None,
+            },
+        },
+        "SubPipelines": {
+            "DocPreprocessor": {
+                "pipeline_name": "doc_preprocessor",
+                "use_doc_orientation_classify": True,
+                "use_doc_unwarping": True,
+                "SubModules": {
+                    "DocOrientationClassify": {
+                        "module_name": "doc_text_orientation",
+                        "model_name": DOC_ORIENTATION_MODEL,
+                        "model_dir": None,
+                    },
+                    "DocUnwarping": {
+                        "module_name": "image_unwarping",
+                        "model_name": "UVDoc",
+                        "model_dir": None,
+                    },
+                },
+            },
+            "GeneralOCR": {
+                "pipeline_name": "OCR",
+                "use_doc_preprocessor": False,
+                "SubModules": {
+                    "TextDetection": {
+                        "module_name": "text_detection",
+                        "model_name": "PP-OCRv4_server_det",
+                        "model_dir": None,
+                    },
+                    "TextRecognition": {
+                        "module_name": "text_recognition",
+                        "model_name": "PP-OCRv4_server_rec",
+                        "model_dir": None,
+                    },
+                },
+            },
+        },
+    }
+
+
+def _install_fake_paddlex(
+    monkeypatch,
+    config_by_name: dict[str, dict],
+    create_pipeline: Any = None,
+) -> dict:
+    """Install a fake ``paddlex`` + ``paddlex.inference.pipelines`` into sys.modules.
+
+    The fake ``load_pipeline_config`` returns the config fixture for the requested
+    pipeline name (and records the call). ``create_pipeline`` defaults to a capture
+    stub; pass a custom callable to control counting / flaky / permanent behaviour
+    (it will be invoked as ``create_pipeline(config=cfg)``). Returns a captured dict
+    with keys ``pipeline`` / ``config`` (last call) and ``load_calls`` (a list).
+    """
+    captured: dict[str, Any] = {"load_calls": []}
+
+    def _default_create_pipeline(pipeline=None, *, config=None, **kwargs: Any) -> dict:
+        captured["pipeline"] = pipeline
+        captured["config"] = config
+        return {}  # dummy pipeline
+
+    def fake_load_pipeline_config(pipeline: str) -> dict:
+        captured["load_calls"].append(pipeline)
+        return config_by_name[pipeline]
+
+    pdx_module = types.ModuleType("paddlex")
+    pdx_module.__path__ = []  # type: ignore[attr-defined]
+    pdx_module.create_pipeline = (
+        create_pipeline if create_pipeline is not None else _default_create_pipeline
+    )
+
+    inference_mod = types.ModuleType("paddlex.inference")
+    inference_mod.__path__ = []  # type: ignore[attr-defined]
+
+    pipelines_mod = types.ModuleType("paddlex.inference.pipelines")
+    pipelines_mod.load_pipeline_config = fake_load_pipeline_config
+
+    inference_mod.pipelines = pipelines_mod  # type: ignore[attr-defined]
+    pdx_module.inference = inference_mod  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+    monkeypatch.setitem(sys.modules, "paddlex.inference", inference_mod)
+    monkeypatch.setitem(sys.modules, "paddlex.inference.pipelines", pipelines_mod)
+
+    return captured
+
+
 def test_constants_use_logical_model_names_not_infer_directory_names(
     tmp_path, monkeypatch
 ):
@@ -282,38 +427,84 @@ def test_create_paddleocr_model_pins_logical_names_and_local_dirs(
     monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
     _write_all_models(tmp_path)
 
-    calls: list[tuple[str, dict[str, Any]]] = []
-
-    def fake_create_pipeline(name: str, **kwargs: Any) -> dict:
-        calls.append((name, kwargs))
-        return {}  # dummy pipeline
-
-    # Mock paddlex module
-    pdx_module = types.ModuleType("paddlex")
-    pdx_module.__path__ = []  # type: ignore[attr-defined]
-    pdx_module.create_pipeline = fake_create_pipeline
-    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+    captured = _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
 
     create_paddleocr_model(use_textline_orientation=True)
 
-    assert len(calls) == 1
-    pipeline_name, kwargs = calls[0]
-    # PaddleX 3.x pipeline registry is case-sensitive — "OCR" (uppercase) is correct
-    assert pipeline_name == "OCR"
-    # The pipeline name is "ocr"
-    assert "text_detection_model_name" in kwargs
-    assert kwargs["text_detection_model_name"] == "PP-OCRv6_medium_det"
-    assert kwargs["text_recognition_model_name"] == "PP-OCRv6_medium_rec"
-    assert kwargs["textline_orientation_model_name"] == "PP-LCNet_x1_0_textline_ori"
-    assert kwargs["text_detection_model_dir"].endswith("PP-OCRv6_medium_det_infer")
-    assert kwargs["text_recognition_model_dir"].endswith("PP-OCRv6_medium_rec_infer")
-    assert kwargs["textline_orientation_model_dir"].endswith(
+    # create_pipeline is now called with the built config, not dropped kwargs.
+    assert captured["pipeline"] is None
+    assert "config" in captured
+    cfg = captured["config"]
+    assert cfg["pipeline_name"] == "OCR"
+
+    # Top-level model dirs point at the bundled local weights.
+    assert cfg["SubModules"]["TextDetection"]["model_dir"].endswith(
+        "PP-OCRv6_medium_det_infer"
+    )
+    assert cfg["SubModules"]["TextRecognition"]["model_dir"].endswith(
+        "PP-OCRv6_medium_rec_infer"
+    )
+    assert cfg["SubModules"]["TextLineOrientation"]["model_dir"].endswith(
         "PP-LCNet_x1_0_textline_ori_infer"
     )
-    assert kwargs["use_textline_orientation"] is True
-    # Language should be present
-    assert "lang" in kwargs
-    assert kwargs["lang"] == "german"  # default OCR_LANG=deu
+
+    # The nested doc-preprocessor orientation model dir points at bundled doc_ori.
+    doc_pre = cfg["SubPipelines"]["DocPreprocessor"]
+    assert doc_pre["SubModules"]["DocOrientationClassify"]["model_dir"].endswith(
+        "PP-LCNet_x1_0_doc_ori_infer"
+    )
+
+    # The (un-bundled) doc-unwarping model is disabled so it is never downloaded.
+    assert doc_pre["use_doc_unwarping"] is False
+
+    assert cfg["use_textline_orientation"] is True
+    assert cfg["lang"] == "german"  # legacy no-op key, kept for parity
+
+
+def test_structure_v3_uses_bundled_models_and_disables_unbundled(tmp_path, monkeypatch):
+    """layout_parsing must resolve to the bundled set and never need UVDoc/tables/seal."""
+    import paddlex_helpers
+
+    monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+    monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+    _write_all_models(tmp_path)
+
+    captured = _install_fake_paddlex(
+        monkeypatch, {"layout_parsing": _layout_parsing_config_fixture()}
+    )
+
+    paddlex_helpers._create_structure_v3_pipeline()
+
+    assert captured["pipeline"] is None
+    cfg = captured["config"]
+    assert cfg["pipeline_name"] == "layout_parsing"
+
+    # Layout detection is overridden to the bundled PP-DocLayout-L (default RT-DETR-H).
+    layout = cfg["SubModules"]["LayoutDetection"]
+    assert layout["model_name"] == "PP-DocLayout-L"
+    assert layout["model_dir"].endswith("PP-DocLayout-L_infer")
+
+    # GeneralOCR sub-pipeline is overridden to the bundled PP-OCRv6_medium_* set.
+    general_ocr = cfg["SubPipelines"]["GeneralOCR"]["SubModules"]
+    assert general_ocr["TextDetection"]["model_name"] == "PP-OCRv6_medium_det"
+    assert general_ocr["TextDetection"]["model_dir"].endswith(
+        "PP-OCRv6_medium_det_infer"
+    )
+    assert general_ocr["TextRecognition"]["model_dir"].endswith(
+        "PP-OCRv6_medium_rec_infer"
+    )
+
+    # Nested doc-preprocessor orientation model is local and unwarping is disabled.
+    doc_pre = cfg["SubPipelines"]["DocPreprocessor"]
+    assert doc_pre["SubModules"]["DocOrientationClassify"]["model_dir"].endswith(
+        "PP-LCNet_x1_0_doc_ori_infer"
+    )
+    assert doc_pre["use_doc_unwarping"] is False
+
+    # Optional sub-pipelines whose models are not bundled are disabled.
+    assert cfg["use_table_recognition"] is False
+    assert cfg["use_seal_recognition"] is False
+    assert cfg["use_formula_recognition"] is False
 
 
 class _ArrayLike:
@@ -406,15 +597,19 @@ def test_destroy_and_recreate_paddlex_model(tmp_path, monkeypatch):
 
     create_count = 0
 
-    def counting_create_pipeline(name: str, **kwargs: Any) -> dict:
+    def counting_create_pipeline(*args: Any, **kwargs: Any) -> dict:
         nonlocal create_count
         create_count += 1
         return {}
 
-    pdx_module = types.ModuleType("paddlex")
-    pdx_module.__path__ = []  # type: ignore[attr-defined]
-    pdx_module.create_pipeline = counting_create_pipeline
-    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+    _install_fake_paddlex(
+        monkeypatch,
+        {
+            "OCR": _ocr_config_fixture(),
+            "layout_parsing": _layout_parsing_config_fixture(),
+        },
+        create_pipeline=counting_create_pipeline,
+    )
 
     # 1st creation
     paddlex_helpers._get_paddlex_model()
@@ -441,17 +636,18 @@ def test_retry_on_transient_error(tmp_path, monkeypatch):
 
     attempts = 0
 
-    def flaky_create_pipeline(name: str, **kwargs: Any) -> dict:
+    def flaky_create_pipeline(*args: Any, **kwargs: Any) -> dict:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             raise RuntimeError("network timeout")  # transient
         return {}  # succeeds on 2nd attempt
 
-    pdx_module = types.ModuleType("paddlex")
-    pdx_module.__path__ = []  # type: ignore[attr-defined]
-    pdx_module.create_pipeline = flaky_create_pipeline
-    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+    _install_fake_paddlex(
+        monkeypatch,
+        {"OCR": _ocr_config_fixture()},
+        create_pipeline=flaky_create_pipeline,
+    )
 
     # Should succeed after retry
     model = paddlex_helpers._get_paddlex_model()
@@ -473,15 +669,16 @@ def test_cache_permanent_error(tmp_path, monkeypatch):
     attempts = 0
     original_error = RuntimeError("PDX has already been initialized")
 
-    def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+    def permanent_failure_create_pipeline(*args: Any, **kwargs: Any) -> dict:
         nonlocal attempts
         attempts += 1
         raise original_error
 
-    pdx_module = types.ModuleType("paddlex")
-    pdx_module.__path__ = []  # type: ignore[attr-defined]
-    pdx_module.create_pipeline = permanent_failure_create_pipeline
-    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+    _install_fake_paddlex(
+        monkeypatch,
+        {"OCR": _ocr_config_fixture()},
+        create_pipeline=permanent_failure_create_pipeline,
+    )
 
     # First call: should raise
     with pytest.raises(RuntimeError, match="already been initialized"):
@@ -509,26 +706,17 @@ def test_ocr_pipeline_uses_uppercase_ocr_name(tmp_path, monkeypatch):
     monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
     _write_all_models(tmp_path)
 
-    captured_name: list[str] = []
-
-    def capturing_create_pipeline(name: str, **kwargs: Any) -> dict:
-        captured_name.append(name)
-        return {}
-
-    pdx_module = types.ModuleType("paddlex")
-    pdx_module.__path__ = []  # type: ignore[attr-defined]
-    pdx_module.create_pipeline = capturing_create_pipeline
-    monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+    captured = _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
 
     # Clear any cached model from previous tests
     if hasattr(paddlex_helpers._get_paddlex_model, "_model"):
         del paddlex_helpers._get_paddlex_model._model
 
     paddlex_helpers._get_paddlex_model()
-    assert len(captured_name) == 1
-    # This assertion would fail if the code used lowercase "ocr"
-    assert captured_name[0] == "OCR", (
-        f"Pipeline name must be 'OCR' (uppercase), got '{captured_name[0]}'"
+    # The pipeline name is passed to load_pipeline_config (case-sensitive in PaddleX).
+    # This assertion would fail if the code used lowercase "ocr".
+    assert captured["load_calls"] == ["OCR"], (
+        f"Pipeline name must be 'OCR' (uppercase), got {captured['load_calls']!r}"
     )
 
 
@@ -667,7 +855,7 @@ class TestGetPaddlexModelPermanentError:
 
         attempts = 0
 
-        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+        def permanent_failure_create_pipeline(*args: Any, **kwargs: Any) -> dict:
             nonlocal attempts
             attempts += 1
             raise RuntimeError(
@@ -675,10 +863,11 @@ class TestGetPaddlexModelPermanentError:
                 "your network connection."
             )
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = permanent_failure_create_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"OCR": _ocr_config_fixture()},
+            create_pipeline=permanent_failure_create_pipeline,
+        )
 
         # First call: should raise immediately (no retries)
         with pytest.raises(RuntimeError, match="No available model hosting platforms"):
@@ -695,15 +884,16 @@ class TestGetPaddlexModelPermanentError:
 
         attempts = 0
 
-        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+        def permanent_failure_create_pipeline(*args: Any, **kwargs: Any) -> dict:
             nonlocal attempts
             attempts += 1
             raise RuntimeError("No available model hosting platforms detected.")
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = permanent_failure_create_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"OCR": _ocr_config_fixture()},
+            create_pipeline=permanent_failure_create_pipeline,
+        )
 
         # First call: should raise
         with pytest.raises(RuntimeError, match="No available model hosting platforms"):
@@ -728,13 +918,14 @@ class TestGetPaddlexModelPermanentError:
             "your network connection."
         )
 
-        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+        def permanent_failure_create_pipeline(*args: Any, **kwargs: Any) -> dict:
             raise original_error
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = permanent_failure_create_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"OCR": _ocr_config_fixture()},
+            create_pipeline=permanent_failure_create_pipeline,
+        )
 
         with pytest.raises(RuntimeError, match="No available model hosting"):
             paddlex_helpers._get_paddlex_model()
@@ -761,17 +952,18 @@ class TestStructureV3RetryLogic:
 
         attempts = 0
 
-        def flaky_create_pipeline(name: str, **kwargs: Any) -> dict:
+        def flaky_create_pipeline(*args: Any, **kwargs: Any) -> dict:
             nonlocal attempts
             attempts += 1
             if attempts < 3:
                 raise RuntimeError("network timeout")  # transient
             return {}  # succeeds on 3rd attempt
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = flaky_create_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"layout_parsing": _layout_parsing_config_fixture()},
+            create_pipeline=flaky_create_pipeline,
+        )
 
         model = paddlex_helpers._get_paddlex_structure_v3_model()
         assert attempts == 3  # 2 failures + 1 success
@@ -787,15 +979,16 @@ class TestStructureV3RetryLogic:
 
         attempts = 0
 
-        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+        def permanent_failure_create_pipeline(*args: Any, **kwargs: Any) -> dict:
             nonlocal attempts
             attempts += 1
             raise RuntimeError("No available model hosting platforms detected.")
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = permanent_failure_create_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"layout_parsing": _layout_parsing_config_fixture()},
+            create_pipeline=permanent_failure_create_pipeline,
+        )
 
         with pytest.raises(RuntimeError, match="No available model hosting platforms"):
             paddlex_helpers._get_paddlex_structure_v3_model()
@@ -811,15 +1004,16 @@ class TestStructureV3RetryLogic:
 
         attempts = 0
 
-        def permanent_failure_create_pipeline(name: str, **kwargs: Any) -> dict:
+        def permanent_failure_create_pipeline(*args: Any, **kwargs: Any) -> dict:
             nonlocal attempts
             attempts += 1
             raise RuntimeError("No available model hosting platforms detected.")
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = permanent_failure_create_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"layout_parsing": _layout_parsing_config_fixture()},
+            create_pipeline=permanent_failure_create_pipeline,
+        )
 
         # First call
         with pytest.raises(RuntimeError, match="No available model hosting platforms"):
@@ -841,15 +1035,16 @@ class TestStructureV3RetryLogic:
 
         attempts = 0
 
-        def always_fails(name: str, **kwargs: Any) -> dict:
+        def always_fails(*args: Any, **kwargs: Any) -> dict:
             nonlocal attempts
             attempts += 1
             raise RuntimeError("persistent network error")
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = always_fails
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"layout_parsing": _layout_parsing_config_fixture()},
+            create_pipeline=always_fails,
+        )
 
         with pytest.raises(RuntimeError, match="persistent network error"):
             paddlex_helpers._get_paddlex_structure_v3_model()
@@ -873,15 +1068,16 @@ class TestStructureV3DestroyAndRecreate:
 
         create_count = 0
 
-        def counting_create_pipeline(name: str, **kwargs: Any) -> dict:
+        def counting_create_pipeline(*args: Any, **kwargs: Any) -> dict:
             nonlocal create_count
             create_count += 1
             return {}
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = counting_create_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"layout_parsing": _layout_parsing_config_fixture()},
+            create_pipeline=counting_create_pipeline,
+        )
 
         # 1st creation
         paddlex_helpers._get_paddlex_structure_v3_model()
@@ -1072,15 +1268,19 @@ class TestWarmup:
 
         create_count = 0
 
-        def counting_create_pipeline(name: str, **kwargs: Any) -> dict:
+        def counting_create_pipeline(*args: Any, **kwargs: Any) -> dict:
             nonlocal create_count
             create_count += 1
             return {}
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = counting_create_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {
+                "OCR": _ocr_config_fixture(),
+                "layout_parsing": _layout_parsing_config_fixture(),
+            },
+            create_pipeline=counting_create_pipeline,
+        )
 
         paddlex_helpers.warmup_paddlex_models()
         assert create_count == 2  # OCR + Structure V3
@@ -1097,16 +1297,17 @@ class TestWarmup:
 
         attempts = 0
 
-        def failing_create_pipeline(name: str, **kwargs: Any) -> dict:
+        def failing_create_pipeline(*args: Any, **kwargs: Any) -> dict:
             nonlocal attempts
             attempts += 1
             # Always fail with transient error — warmup will exhaust retries
             raise RuntimeError("warmup fails initially")
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = failing_create_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"OCR": _ocr_config_fixture()},
+            create_pipeline=failing_create_pipeline,
+        )
 
         with caplog.at_level("WARNING"):
             paddlex_helpers.warmup_paddlex_models()
@@ -1122,13 +1323,14 @@ class TestWarmup:
         monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
         _write_all_models(tmp_path)
 
-        def system_exit_pipeline(name: str, **kwargs: Any) -> dict:
+        def system_exit_pipeline(*args: Any, **kwargs: Any) -> dict:
             raise SystemExit("forced shutdown")
 
-        pdx_module = types.ModuleType("paddlex")
-        pdx_module.__path__ = []  # type: ignore[attr-defined]
-        pdx_module.create_pipeline = system_exit_pipeline
-        monkeypatch.setitem(sys.modules, "paddlex", pdx_module)
+        _install_fake_paddlex(
+            monkeypatch,
+            {"OCR": _ocr_config_fixture()},
+            create_pipeline=system_exit_pipeline,
+        )
 
         with pytest.raises(SystemExit):
             paddlex_helpers.warmup_paddlex_models()

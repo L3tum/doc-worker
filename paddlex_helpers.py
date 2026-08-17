@@ -54,6 +54,17 @@ REQUIRED_MODEL_NAMES: tuple[str, ...] = (
     LAYOUT_DETECTION_MODEL,
 )
 
+# module_name -> bundled logical model to force when a pipeline's default
+# references a model we do NOT bundle. For the "OCR" (General OCR) pipeline
+# these are no-ops because its defaults already match the bundled set; they only
+# take effect for pipelines such as layout_parsing, whose defaults ship heavier
+# models (RT-DETR-H_layout_17cls, PP-OCRv4_server_det/rec) that are not bundled.
+_LAYOUT_OVERRIDES: dict[str, str] = {
+    "layout_detection": LAYOUT_DETECTION_MODEL,  # default: RT-DETR-H_layout_17cls
+    "text_detection": TEXT_DETECTION_MODEL,  # layout_parsing default: PP-OCRv4_server_det
+    "text_recognition": TEXT_RECOGNITION_MODEL,  # layout_parsing default: PP-OCRv4_server_rec
+}
+
 
 # ── Language mapping ──────────────────────────────────────────────────────
 def paddleocr_lang_code() -> str:
@@ -112,6 +123,77 @@ def _model_dir(model_name: str) -> Path:
 def _list_available_models() -> list[str]:
     """Return names of models that have local directories."""
     return [name for name in PADDLEX_MODEL_DIRS if _model_dir(name).is_dir()]
+
+
+# ── Pipeline config builder (air-gapped, no model downloads) ─────────────
+def _stamp_model_dirs(node: Any) -> None:
+    """Recursively point every registered submodule's ``model_dir`` at the local bundle.
+
+    A "submodule dict" is any dict with a ``model_name`` key. If its
+    ``module_name`` is in ``_LAYOUT_OVERRIDES`` and the override target is a
+    bundled model, ``model_name`` is first forced to the bundled model (this only
+    matters for pipelines whose defaults reference models we do not ship, e.g. the
+    ``layout_parsing`` defaults). ``model_dir`` is then set so PaddleX loads the
+    pre-downloaded weights instead of taking the official-models download path.
+
+    This reaches both top-level ``SubModules`` and nested sub-pipelines such as
+    ``SubPipelines.DocPreprocessor.SubModules``.
+    """
+    if isinstance(node, dict):
+        if "model_name" in node:
+            module_name = node.get("module_name")
+            override = (
+                _LAYOUT_OVERRIDES.get(module_name)
+                if isinstance(module_name, str)
+                else None
+            )
+            if override is not None and override in PADDLEX_MODEL_DIRS:
+                node["model_name"] = override
+            name = node.get("model_name")
+            if isinstance(name, str) and name in PADDLEX_MODEL_DIRS:
+                node["model_dir"] = str(_model_dir(name))
+        for value in node.values():
+            _stamp_model_dirs(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            _stamp_model_dirs(item)
+
+
+def _disable_doc_unwarping(node: Any) -> None:
+    """Recursively set ``use_doc_unwarping`` to False on any config dict that has
+    the key, so the (un-bundled) UVDoc model is never instantiated or downloaded."""
+    if isinstance(node, dict):
+        if "use_doc_unwarping" in node:
+            node["use_doc_unwarping"] = False
+        for value in node.values():
+            _disable_doc_unwarping(value)
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            _disable_doc_unwarping(item)
+
+
+def _build_pipeline_config(pipeline_name: str) -> dict:
+    """Load a PaddleX pipeline's default config and make it fully local + air-gap safe.
+
+    Loads the installed version's real default config (so the nested sub-pipeline
+    structure always matches the version in use), stamps every instantiated
+    submodule's ``model_dir`` at the bundled local weights, and disables doc
+    unwarping (UVDoc), which is not bundled. Returns a fresh config dict suitable
+    for ``create_pipeline(config=...)``.
+    """
+    from paddlex.inference.pipelines import load_pipeline_config
+
+    cfg = load_pipeline_config(pipeline_name)
+    if not isinstance(cfg, dict):
+        raise TypeError(
+            f"load_pipeline_config({pipeline_name!r}) did not return a dict, "
+            f"got {type(cfg).__name__}"
+        )
+
+    _stamp_model_dirs(cfg)
+    _disable_doc_unwarping(cfg)
+
+    return cfg
 
 
 def migrate_legacy_model_dirs() -> None:
@@ -579,19 +661,16 @@ def _create_paddlex_ocr_pipeline(use_textline_orientation: bool = True) -> Any:
     # Suppress PaddleX internal logging noise
     logging.getLogger("paddlex").setLevel(100)
 
-    return create_pipeline(
-        "OCR",
-        text_detection_model_dir=str(_model_dir(TEXT_DETECTION_MODEL)),
-        text_recognition_model_dir=str(_model_dir(TEXT_RECOGNITION_MODEL)),
-        textline_orientation_model_dir=str(_model_dir(TEXTLINE_ORIENTATION_MODEL)),
-        doc_orientation_model_dir=str(_model_dir(DOC_ORIENTATION_MODEL)),
-        text_detection_model_name=TEXT_DETECTION_MODEL,
-        text_recognition_model_name=TEXT_RECOGNITION_MODEL,
-        textline_orientation_model_name=TEXTLINE_ORIENTATION_MODEL,
-        doc_orientation_model_name=DOC_ORIENTATION_MODEL,
-        use_textline_orientation=use_textline_orientation,
-        lang=paddleocr_lang_code(),
-    )
+    # Build the real pipeline config and point every model (top-level and the
+    # nested DocPreprocessor) at its bundled local dir. PaddleX 3.x silently
+    # drops the *_model_dir / *_model_name keyword args, so the config dict is
+    # the only reliable way to force local weights (no download) in air-gapped
+    # environments.
+    cfg = _build_pipeline_config("OCR")
+    cfg["use_textline_orientation"] = use_textline_orientation
+    # Legacy top-level key (no-op in PaddleX 3.x, kept for parity with prior behavior).
+    cfg["lang"] = paddleocr_lang_code()
+    return create_pipeline(config=cfg)
 
 
 def create_paddleocr_model(*, use_textline_orientation: bool = True) -> Any:
@@ -719,23 +798,19 @@ def _create_structure_v3_pipeline() -> Any:
     # Suppress logging
     logging.getLogger("paddlex").setLevel(100)
 
-    return create_pipeline(
-        "layout_parsing",
-        layout_detection_model_dir=str(_model_dir(LAYOUT_DETECTION_MODEL)),
-        layout_detection_model_name=LAYOUT_DETECTION_MODEL,
-        text_detection_model_dir=str(_model_dir(TEXT_DETECTION_MODEL)),
-        text_recognition_model_dir=str(_model_dir(TEXT_RECOGNITION_MODEL)),
-        textline_orientation_model_dir=str(_model_dir(TEXTLINE_ORIENTATION_MODEL)),
-        doc_orientation_model_dir=str(_model_dir(DOC_ORIENTATION_MODEL)),
-        text_detection_model_name=TEXT_DETECTION_MODEL,
-        text_recognition_model_name=TEXT_RECOGNITION_MODEL,
-        textline_orientation_model_name=TEXTLINE_ORIENTATION_MODEL,
-        doc_orientation_model_name=DOC_ORIENTATION_MODEL,
-        use_textline_orientation=True,
-        lang=paddleocr_lang_code(),
-        # Disable table recognition (not yet needed, can be added later)
-        use_table_recognition=False,
-    )
+    # Build the real config and point every bundled model at its local dir.
+    # layout_parsing's defaults reference heavier models we do not ship
+    # (RT-DETR-H_layout_17cls, PP-OCRv4_server_det/rec); _stamp_model_dirs
+    # overrides those to the bundled PP-DocLayout-L / PP-OCRv6_medium_* set.
+    cfg = _build_pipeline_config("layout_parsing")
+    # Legacy top-level key (no-op in PaddleX 3.x, kept for parity with prior behavior).
+    cfg["lang"] = paddleocr_lang_code()
+    # Disable optional sub-pipelines whose models are NOT bundled, so they are
+    # never instantiated and never trigger a download in air-gapped operation.
+    cfg["use_table_recognition"] = False
+    cfg["use_seal_recognition"] = False
+    cfg["use_formula_recognition"] = False
+    return create_pipeline(config=cfg)
 
 
 def _get_paddlex_structure_v3_model() -> Any:
