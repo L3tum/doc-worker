@@ -836,7 +836,9 @@ def run_paddleocr(file_path: str) -> list[dict]:
     confidence).
     """
     model = _get_paddlex_model()
-    result = model.predict(file_path)
+    # PaddleX >=3.0 predict() returns a generator (one result per sample/page);
+    # materialize it so the isinstance(list,tuple) guard and per-page .get() work.
+    result = list(model.predict(file_path))
 
     # Safeguard: model.predict should return a list, but check anyway
     if not isinstance(result, (list, tuple)):
@@ -935,7 +937,9 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
     """
     pages: list[dict] = []
     for page_idx, img_path in enumerate(images):
-        page_result = model.predict(img_path)
+        # predict(single_image) yields exactly one result dict; take the first
+        # element ({} on a blank/empty page) so the downstream .get() calls work.
+        page_result: dict[str, Any] = next(iter(model.predict(img_path)), {})
 
         # Extract flat text/blocks from the overall OCR result
         overall = page_result.get("overall_ocr_res", {})

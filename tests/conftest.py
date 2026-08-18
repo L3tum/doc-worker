@@ -73,7 +73,10 @@ def mock_paddlex_ocr_pipeline(
 ) -> Generator[MagicMock, None, None]:
     """Create and patch a mock PaddleX General OCR pipeline."""
     pipeline: MagicMock = MagicMock()
-    pipeline.predict.return_value = [mock_paddlex_ocr_result]  # single page
+    # PaddleX >=3.0 predict() returns a *generator* (one result per page); model that
+    # so tests exercise the real consumption path. side_effect yields a fresh
+    # iterator each call (a plain return_value generator would be exhausted once).
+    pipeline.predict.side_effect = lambda _path: iter([mock_paddlex_ocr_result])
     with patch("paddlex_helpers._get_paddlex_model", return_value=pipeline):
         yield pipeline
 
@@ -84,7 +87,12 @@ def mock_paddlex_structure_v3_pipeline(
 ) -> Generator[MagicMock, None, None]:
     """Create and patch a mock PaddleX PP-StructureV3 pipeline."""
     pipeline: MagicMock = MagicMock()
-    pipeline.predict.return_value = mock_paddlex_structure_v3_result
+    # PaddleX >=3.0 predict() returns a *generator* (one result per page); model that
+    # so tests exercise the real consumption path. side_effect yields a fresh
+    # iterator each call (a plain return_value generator would be exhausted once).
+    pipeline.predict.side_effect = lambda _path: iter(
+        [mock_paddlex_structure_v3_result]
+    )
     with patch(
         "paddlex_helpers._get_paddlex_structure_v3_model", return_value=pipeline
     ):

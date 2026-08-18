@@ -18,6 +18,7 @@ from paddlex_helpers import (
     _model_dir,
     create_paddleocr_model,
     run_paddleocr,
+    run_paddlex_structure_v3,
     validate_paddlex_models,
 )
 
@@ -524,6 +525,21 @@ class _FakePredictModel:
         return self.result
 
 
+class _GeneratorPredictModel:
+    """Mimic PaddleX >=3.0: ``predict`` returns a *generator* (one result per sample).
+
+    Real PaddleX 3.x ``pipeline.predict()`` is a generator; this fake *yields* dicts
+    (instead of returning a list) so the tests exercise the materialization path that
+    the production bug broke. No real model is loaded or downloaded.
+    """
+
+    def __init__(self, pages: list[dict[str, Any]]) -> None:
+        self._pages = pages
+
+    def predict(self, file_path: str):
+        yield from self._pages
+
+
 def test_run_paddleocr_converts_paddlex_predict_result_to_sidecar_pages(
     monkeypatch,
 ):
@@ -580,6 +596,129 @@ def test_run_paddleocr_falls_back_to_polygons_when_boxes_are_missing(monkeypatch
             "text": "Only polygon",
             "bbox": [[1, 1], [2, 1], [2, 2], [1, 2]],
             "confidence": 0.91,
+        }
+    ]
+
+
+# ── Generator-consumption regression (PaddleX >=3.0 predict() yields a generator) ──
+# The last "fix model loading" commit made predict() reachable; these tests pin the
+# consumption contract so a regression (treating the generator as a list/dict) fails in
+# CI WITHOUT downloading any real models (the model factory is monkeypatched directly).
+
+
+def test_run_paddleocr_consumes_generator_predict_result(monkeypatch):
+    """run_paddleocr must handle predict() returning a generator (PaddleX >=3.0)."""
+    monkeypatch.setattr(
+        "paddlex_helpers._get_paddlex_model",
+        lambda: _GeneratorPredictModel(
+            [
+                {
+                    "rec_texts": ["Hello", "", "World"],
+                    "rec_scores": [0.98765, 0.5, 0.87654],
+                    "rec_boxes": [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]],
+                }
+            ]
+        ),
+    )
+
+    pages = run_paddleocr("document.pdf")
+
+    assert pages == [
+        {
+            "page": 1,
+            "text": "Hello\nWorld",
+            "blocks": [
+                {"text": "Hello", "bbox": [1, 2, 3, 4], "confidence": 0.9877},
+                {"text": "World", "bbox": [9, 10, 11, 12], "confidence": 0.8765},
+            ],
+        }
+    ]
+
+
+def test_run_paddlex_structure_v3_consumes_generator_predict_result(
+    monkeypatch, mock_pdf_to_images
+):
+    """run_paddlex_structure_v3 must handle predict() yielding a generator.
+
+    Reproduces the production error "'generator' object has no attribute 'get'": a real
+    PDF path is converted to images (mocked, so no pdftoppm and no model download) and
+    each page result is produced by a generator.
+    """
+    monkeypatch.setattr(
+        "paddlex_helpers._get_paddlex_structure_v3_model",
+        lambda: _GeneratorPredictModel(
+            [
+                {
+                    "overall_ocr_res": {
+                        "rec_texts": ["Title", "Body", "Sub"],
+                        "rec_scores": [0.99, 0.95, 0.92],
+                        "rec_boxes": [
+                            [50, 50, 200, 70],
+                            [50, 90, 300, 130],
+                            [50, 150, 180, 170],
+                        ],
+                        "rec_polys": [],
+                    },
+                    "parsing_res_list": [
+                        {
+                            "block_label": "title",
+                            "block_content": "Title",
+                            "block_bbox": [50, 50, 200, 70],
+                        },
+                        {
+                            "block_label": "text",
+                            "block_content": "Body",
+                            "block_bbox": [50, 90, 300, 130],
+                        },
+                        {
+                            "block_label": "paragraph_title",
+                            "block_content": "Sub",
+                            "block_bbox": [50, 150, 180, 170],
+                        },
+                    ],
+                    "layout_det_res": {
+                        "boxes": [
+                            {"label": "title", "score": 0.99},
+                            {"label": "text", "score": 0.97},
+                            {"label": "paragraph_title", "score": 0.96},
+                        ],
+                    },
+                }
+            ]
+        ),
+    )
+
+    pages = run_paddlex_structure_v3("document.pdf")
+
+    assert pages == [
+        {
+            "page": 1,
+            "text": "Title\nBody\nSub",
+            "blocks": [
+                {"text": "Title", "bbox": [50, 50, 200, 70], "confidence": 0.99},
+                {"text": "Body", "bbox": [50, 90, 300, 130], "confidence": 0.95},
+                {"text": "Sub", "bbox": [50, 150, 180, 170], "confidence": 0.92},
+            ],
+            "structured_blocks": [
+                {
+                    "type": "title",
+                    "bbox": [50, 50, 200, 70],
+                    "text": "Title",
+                    "confidence": 0.99,
+                },
+                {
+                    "type": "text",
+                    "bbox": [50, 90, 300, 130],
+                    "text": "Body",
+                    "confidence": 0.97,
+                },
+                {
+                    "type": "paragraph_title",
+                    "bbox": [50, 150, 180, 170],
+                    "text": "Sub",
+                    "confidence": 0.96,
+                },
+            ],
         }
     ]
 

@@ -109,7 +109,9 @@ class PaddleOcrEngine(OcrEngine):
     @staticmethod
     def get_deskew(input_file: Path, options: OcrOptions) -> float:
         engine = _get_paddle_engine(options)
-        result = engine.predict(str(input_file))
+        # PaddleX >=3.0 predict() returns a generator; materialize to a list so
+        # result[0] / result[0].get(...) work (an empty list is caught by `not result`).
+        result = list(engine.predict(str(input_file)))
         if not result or not result[0]:
             return 0.0
 
@@ -162,13 +164,15 @@ class PaddleOcrEngine(OcrEngine):
         )
 
         try:
-            result = engine.predict(str(input_file), return_word_box=True)
+            # PaddleX >=3.0 predict() returns a generator; list() materializes it so
+            # result[0] works. Keep inside the try so recovery paths wrap consumption.
+            result = list(engine.predict(str(input_file), return_word_box=True))
         except KeyError:
             # PaddleOCR can raise on blank images with return_word_box=True.
             log.warning(
                 f"PaddleOCR KeyError on page {page_number + 1} — using basic predict()"
             )
-            result = engine.predict(str(input_file))
+            result = list(engine.predict(str(input_file)))
         except RuntimeError:
             # PaddlePaddle's C++ predictor can become stale across
             # ThreadPoolExecutor lifecycles. Destroy and recreate fully.
@@ -183,7 +187,7 @@ class PaddleOcrEngine(OcrEngine):
             except Exception:
                 log.exception("Failed to destroy paddlex model during recovery")
             engine = _get_paddle_engine(options)
-            result = engine.predict(str(input_file), return_word_box=True)
+            result = list(engine.predict(str(input_file), return_word_box=True))
 
         if not result or not result[0]:
             log.warning(f"No OCR result for page {page_number + 1} ({input_file})")
