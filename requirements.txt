@@ -1,5 +1,5 @@
 ocrmypdf>=17.4.1,<18
-paddlex[base]>=3.0.0,<4.0.0
+paddlex[base]>=3.2.0,<4.0.0
 paddlepaddle==3.3.0
 fastapi
 uvicorn[standard]
