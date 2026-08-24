@@ -305,6 +305,61 @@ class TestRunPaddlexStructureV3:
         assert len(pages[0]["structured_blocks"]) == 3
 
 
+# ── Numpy-typed structured_blocks serializability ─────────────────────────
+class TestStructuredBlocksNumpySerializability:
+    """Regression: PaddleX returns numpy float32 scores + np.array bboxes.
+
+    The structured_blocks path in _process_structure_v3_pages must convert
+    these to plain Python types so the sidecar JSON (worker.py) and the
+    server.py /layout-parsing endpoint can serialize without default=.
+    """
+
+    def test_structured_blocks_numpy_types_json_serializable(self):
+        import json
+
+        import numpy as np
+
+        from paddlex_helpers import _process_structure_v3_pages
+
+        result_dict = {
+            "overall_ocr_res": {
+                "rec_texts": ["Hello"],
+                "rec_scores": [np.float32(0.95)],
+                "rec_boxes": [np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)],
+                "rec_polys": [],
+            },
+            "layout_det_res": {
+                "boxes": [{"label": "text", "score": np.float32(0.90)}],
+            },
+            "parsing_res_list": [
+                {
+                    "block_label": "text",
+                    "block_content": "Hello",
+                    "block_bbox": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+                }
+            ],
+        }
+
+        class _FakeModel:
+            def predict(self, _path):
+                yield result_dict
+
+        pages = _process_structure_v3_pages(_FakeModel(), ["/tmp/dummy.png"])
+        assert len(pages) == 1
+        sb = pages[0]["structured_blocks"]
+        assert len(sb) == 1
+
+        # confidence must be a Python float (not np.float32)
+        assert type(sb[0]["confidence"]) is float
+        # bbox must be a plain list (not an ndarray)
+        assert isinstance(sb[0]["bbox"], list)
+        assert all(type(v) is float for v in sb[0]["bbox"])
+
+        # The full page dict must serialize with json.dumps and NO default=.
+        # This is the exact failure mode from the production incident.
+        json.dumps(pages)  # raises TypeError if any numpy type leaked
+
+
 # ── Model validation tests ────────────────────────────────────────────────
 class TestValidatePaddlexModels:
     def test_valid_models(self):

@@ -827,6 +827,17 @@ def _get_paddlex_structure_v3_model() -> Any:
         )
 
 
+def _jsonable(value: Any) -> Any:
+    """Convert numpy arrays/scalars to JSON-serializable Python types.
+
+    Calls .tolist() when available (ndarray, numpy scalar); otherwise returns
+    the value unchanged. Safe for plain Python types (str, int, float, list).
+    """
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
+
+
 # ── OCR extraction (backward compatible) ─────────────────────────────────
 def run_paddleocr(file_path: str) -> list[dict]:
     """Run PaddleX General OCR and return list of page dicts.
@@ -979,13 +990,18 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
         for layout_box in page_result.get("layout_det_res", {}).get("boxes", []):
             label = layout_box.get("label")
             if label and label not in layout_confidence:
-                layout_confidence[label] = layout_box.get("score", 0.0)
+                # float(): PaddleX layout scores arrive as numpy float32; the
+                # sidecar JSON (worker.py) and server.py /layout-parsing must
+                # serialize plain Python floats.
+                layout_confidence[label] = float(layout_box.get("score", 0.0))
 
         structured_blocks: list[dict] = []
         for block in page_result.get("parsing_res_list", []):
             block_label = block.get("block_label", "unknown")
             block_content = block.get("block_content", "")
-            block_bbox = block.get("block_bbox", [0, 0, 0, 0])
+            # _jsonable(): block_bbox can be an ndarray (or list of numpy
+            # floats); convert to a plain list for JSON serialization.
+            block_bbox = _jsonable(block.get("block_bbox", [0, 0, 0, 0]))
             confidence = layout_confidence.get(block_label, 0.0)
 
             structured_blocks.append(
@@ -993,7 +1009,8 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
                     "type": block_label,
                     "bbox": block_bbox,
                     "text": str(block_content),
-                    "confidence": round(confidence, 4),
+                    # float(): round() on a numpy float32 returns float32
+                    "confidence": round(float(confidence), 4),
                 }
             )
 

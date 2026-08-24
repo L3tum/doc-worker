@@ -237,6 +237,32 @@ def handle_docling(pdf_path: Path) -> bool:
     return True
 
 
+def _json_default(obj: object) -> object:
+    """json.dump default= fallback: convert numpy types to Python equivalents.
+
+    Handles numpy arrays/scalars (via .tolist()) and other objects that expose
+    an .item(). Safety net for the sidecar JSON — the primary fix converts
+    values at the source in paddlex_helpers._process_structure_v3_pages, but
+    this catches any future numpy-typed field before it crashes the dump.
+    """
+    if hasattr(obj, "tolist"):
+        return obj.tolist()
+    if hasattr(obj, "item"):
+        return obj.item()
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
+def _is_non_retryable_error(exc: Exception) -> bool:
+    """Return True for deterministic errors that a retry cannot fix.
+
+    ZeroDivisionError: ocrmypdf CoordinateTransform divides by dpi, which is
+    0.0 when a PDF page has no renderable images (upstream ocrmypdf bug,
+    distinct from #761 which fixed the scanning phase). The same input page
+    always yields the same dpi, so retrying is pointless.
+    """
+    return isinstance(exc, ZeroDivisionError)
+
+
 # ---------------------------------------------------------------------------
 # Native PaddleOCR sidecar generation
 # ---------------------------------------------------------------------------
@@ -275,7 +301,9 @@ def generate_native_sidecar(pdf_path: Path) -> bool:
         }
         json_out = out_dir / f"{filename_stem}.json"
         with open(json_out, "w", encoding="utf-8") as wf:
-            json.dump(sidecar_json, wf, ensure_ascii=False, indent=2)
+            json.dump(
+                sidecar_json, wf, ensure_ascii=False, indent=2, default=_json_default
+            )
         log(f"  Native JSON written: {json_out}")
 
         # Build structured Markdown sidecar (page-by-page with headers)
@@ -397,8 +425,14 @@ def wait_for_docling(timeout: int = 120) -> None:
 def process_file(pdf_path: Path) -> bool:
     """Process a single PDF: Docling → OCR → Paperless.
 
-    Returns True on success. On failure, leaves the original PDF in PROCESSING/
-    so the caller can retry it and decide when to move it to ERROR/.
+    Returns True on success.
+
+    Raises on OCR failure (the caller — process_with_retries — handles retry
+    classification and decides when to move the file to ERROR/).
+    Returns False on non-retryable pipeline failures (sidecar abort in
+    'required' mode, Paperless push failure).
+
+    On any failure the PDF is left in PROCESSING/ so a retry can find it.
     """
     filename = pdf_path.name
     log(f"\n{'=' * 60}")
@@ -424,10 +458,24 @@ def process_file(pdf_path: Path) -> bool:
         run_ocrmypdf(processing_path, ocr_output)
         log("  OCR: OK")
     except Exception as exc:
-        log_error(f"OCR failed: {exc}")
+        # Re-raise (instead of returning False) so the retry loop in
+        # process_with_retries() can classify deterministic errors as
+        # non-retryable and skip wasted GPU passes.
+        if isinstance(exc, ZeroDivisionError):
+            # Upstream ocrmypdf bug: CoordinateTransform (rendering/finalize
+            # phase) divides by dpi, which is 0.0 when a PDF page has no
+            # renderable images. Deterministic — the same page always fails.
+            # Distinct from #761 (scanning phase, already fixed). Tracked
+            # upstream; bump ocrmypdf when fixed.
+            log_error(
+                f"OCR failed: zero-DPI page in {filename} (upstream ocrmypdf "
+                f"CoordinateTransform bug) — non-retryable, not retrying."
+            )
+        else:
+            log_error(f"OCR failed: {exc}")
         if ocr_output.exists():
             ocr_output.unlink()
-        return False
+        raise
 
     # Paperless
     if not push_to_paperless(ocr_output):
@@ -442,6 +490,85 @@ def process_file(pdf_path: Path) -> bool:
         ocr_output.unlink()
     log(f"  → DONE/ ({filename})")
     return True
+
+
+def process_with_retries(pdf: Path, max_retries: int, retry_delay: int) -> None:
+    """Process a single PDF, retrying transient failures up to max_retries.
+
+    Extracted from the main loop so the retry/non-retryable logic is
+    unit-testable (main() is an infinite polling loop and can't be tested
+    directly).
+
+    - Success → file lands in DONE/ (process_file's responsibility), stop.
+    - Non-retryable error (deterministic, e.g. ZeroDivisionError from the
+      upstream ocrmypdf zero-DPI bug) → stop immediately, no retry sleep.
+    - Transient failure with attempts remaining → optionally destroy the model
+      if model-related, sleep retry_delay, retry.
+    - Max retries exhausted → move to ERROR/ with a reason.
+
+    On failure the file is always left in PROCESSING/ by process_file, so the
+    retry's current_path resolution (PROCESSING/ first) finds it.
+    """
+    attempts = max(1, max_retries)
+    success = False
+    non_retryable_reason: str | None = None
+
+    for attempt in range(1, attempts + 1):
+        # If a previous attempt already moved the file to PROCESSING, retry
+        # with that path instead of the original INBOX path.
+        current_path = (
+            PROCESSING / pdf.name if (PROCESSING / pdf.name).exists() else pdf
+        )
+
+        try:
+            success = process_file(current_path)
+            last_exc: Exception | None = None
+        except Exception as exc:
+            success = False
+            last_exc = exc
+            log_error(
+                f"Processing attempt {attempt}/{attempts} for {pdf.name} raised: {exc}"
+            )
+
+        if success:
+            break  # Success — move to next file
+
+        # Non-retryable (deterministic) errors: a retry cannot fix them, so
+        # stop immediately instead of burning more GPU passes + sleep.
+        if last_exc is not None and _is_non_retryable_error(last_exc):
+            log_error(
+                f"Non-retryable error for {pdf.name} "
+                f"({type(last_exc).__name__}: {last_exc}) — skipping remaining "
+                f"retries."
+            )
+            non_retryable_reason = (
+                f"non-retryable: {type(last_exc).__name__}: {last_exc}"
+            )
+            break
+
+        if attempt < attempts:
+            # Only destroy model if the error is model-related
+            if last_exc is not None and _is_model_error(last_exc):
+                destroy_paddlex_model()
+                log_error(
+                    f"Processing attempt {attempt}/{attempts} failed for "
+                    f"{pdf.name} (model error); destroying model and retrying in {retry_delay}s"
+                )
+            else:
+                log_error(
+                    f"Processing attempt {attempt}/{attempts} failed for "
+                    f"{pdf.name}; retrying in {retry_delay}s"
+                )
+            time.sleep(retry_delay)
+            continue
+
+        log_error(f"Max retries reached for {pdf.name}")
+
+    # Land any failure in ERROR/ after the loop (max retries, or non-retryable
+    # early break). On success the file is already in DONE/.
+    if not success:
+        failed_path = PROCESSING / pdf.name if (PROCESSING / pdf.name).exists() else pdf
+        move_to_error(failed_path, non_retryable_reason or "max retries reached")
 
 
 def wait_for_stable_file(pdf_path: Path, stability_timeout: int | None = None) -> bool:
@@ -551,55 +678,9 @@ def main() -> None:
                     log(f"  Skipping (unstable): {pdf.name}")
                     continue
 
-                # Process with retries
-                attempts = max(1, max_retries)
-                for attempt in range(1, attempts + 1):
-                    # If a previous attempt already moved the file to PROCESSING,
-                    # retry with that path instead of the original INBOX path.
-                    current_path = (
-                        PROCESSING / pdf.name
-                        if (PROCESSING / pdf.name).exists()
-                        else pdf
-                    )
-
-                    try:
-                        success = process_file(current_path)
-                        last_exc: Exception | None = None
-                    except Exception as exc:
-                        success = False
-                        last_exc = exc
-                        log_error(
-                            f"Processing attempt {attempt}/{attempts} for {pdf.name} "
-                            f"raised: {exc}"
-                        )
-
-                    if success:
-                        break  # Success — move to next file
-
-                    if attempt < attempts:
-                        # Only destroy model if the error is model-related
-                        if last_exc is not None and _is_model_error(last_exc):
-                            destroy_paddlex_model()
-                            log_error(
-                                f"Processing attempt {attempt}/{attempts} failed for "
-                                f"{pdf.name} (model error); destroying model and retrying in {retry_delay}s"
-                            )
-                        else:
-                            log_error(
-                                f"Processing attempt {attempt}/{attempts} failed for "
-                                f"{pdf.name}; retrying in {retry_delay}s"
-                            )
-                        time.sleep(retry_delay)
-                        continue
-
-                    log_error(f"Max retries reached for {pdf.name}")
-                    # Make sure the file ends up in ERROR/ after the final attempt.
-                    failed_path = (
-                        PROCESSING / pdf.name
-                        if (PROCESSING / pdf.name).exists()
-                        else pdf
-                    )
-                    move_to_error(failed_path, "max retries reached")
+                # Process with retries (handles non-retryable fast-fail and
+                # ERROR/ landing).
+                process_with_retries(pdf, max_retries, retry_delay)
 
         except Exception as exc:
             log_error(f"Main loop error: {exc}")

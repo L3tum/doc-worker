@@ -12,11 +12,14 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from worker import (
     generate_native_sidecar,
     handle_docling,
     move_to_error,
     process_file,
+    process_with_retries,
     recover_leftover_files,
 )
 
@@ -118,6 +121,53 @@ class TestGenerateNativeSidecar:
                     os.environ["DOCLING_DIR"] = old
                 else:
                     del os.environ["DOCLING_DIR"]
+
+    def test_sidecar_with_numpy_blocks(self):
+        """Sidecar generation handles numpy-typed structured_blocks.
+
+        Exercises the _json_default safety net: even if a numpy type leaks past
+        the source-level fix, json.dump(default=...) must not crash.
+        """
+        import numpy as np
+
+        mock_pages = [
+            {
+                "page": 1,
+                "text": "test",
+                "blocks": [],
+                "structured_blocks": [
+                    {
+                        "type": "text",
+                        "text": "test",
+                        "bbox": np.array([0.0, 0.0, 100.0, 50.0], dtype=np.float32),
+                        "confidence": np.float32(0.85),
+                    }
+                ],
+            }
+        ]
+
+        with patch("worker.run_paddlex_structure_v3", return_value=mock_pages):
+            with patch("worker.blocks_to_markdown", return_value="# heading"):
+                pdf_path = Path(tempfile.gettempdir()) / "test_np.pdf"
+                pdf_path.write_text("fake")
+
+                import worker
+
+                old = worker.DOCLING_OUT
+                worker.DOCLING_OUT = Path(tempfile.gettempdir()) / "sidecar_test_np"
+                try:
+                    assert generate_native_sidecar(pdf_path) is True
+                    json_path = worker.DOCLING_OUT / "test_np" / "test_np.json"
+                    assert json_path.exists()
+                    with open(json_path) as f:
+                        data = json.load(f)
+                    sb = data["pages"][0]["structured_blocks"][0]
+                    assert sb["bbox"] == [0.0, 0.0, 100.0, 50.0]
+                    # .tolist() on the float32 scalar yields the float64 of the
+                    # nearest float32, so compare against that exact value.
+                    assert sb["confidence"] == float(np.float32(0.85))
+                finally:
+                    worker.DOCLING_OUT = old
 
     def test_handle_docling_native(self):
         """Test handle_docling with native mode."""
@@ -316,7 +366,13 @@ class TestRecoverLeftoverFiles:
 # ── process_file with model init failure ─────────────────────────────────
 class TestProcessFileModelInitFailure:
     def test_model_init_failure_returns_false(self):
-        """process_file() returns False when model init fails during native sidecar."""
+        """process_file() returns False when model init fails during native sidecar.
+
+        'native' mode makes a sidecar failure non-fatal (handle_docling
+        returns True), so the pipeline proceeds to OCR. OCR is mocked to
+        succeed here so the test isolates the sidecar-failure-then-continue
+        path without running a real OCR pass.
+        """
         import worker
 
         with patch.object(worker, "DOCLING_MODE", "native"):
@@ -325,6 +381,44 @@ class TestProcessFileModelInitFailure:
                 side_effect=RuntimeError(
                     "No available model hosting platforms detected."
                 ),
+            ):
+                with (
+                    patch("worker.run_ocrmypdf") as mock_ocr,
+                    patch("worker.push_to_paperless", return_value=True),
+                ):
+                    tmp_inbox = Path(tempfile.mkdtemp())
+                    tmp_processing = Path(tempfile.mkdtemp())
+                    worker.INBOX = tmp_inbox
+                    worker.PROCESSING = tmp_processing
+                    worker.DONE = Path(tempfile.mkdtemp())
+                    worker.ERROR = Path(tempfile.mkdtemp())
+                    worker.DOCLING_OUT = Path(tempfile.mkdtemp())
+                    worker.PAPERLESS_CONSUME = Path(tempfile.mkdtemp())
+
+                    test_pdf = tmp_inbox / "test.pdf"
+                    test_pdf.write_bytes(b"%PDF-1.4 fake")
+
+                    result = process_file(test_pdf)
+                    # Sidecar failed but native mode continues; mocked OCR +
+                    # push succeed, so the pipeline completes.
+                    assert result is True
+                    mock_ocr.assert_called_once()
+
+    def test_process_file_ocr_failure_raises(self):
+        """process_file() re-raises a ZeroDivisionError from OCR (non-retryable).
+
+        Previously OCR failures were swallowed (returned False) so the retry
+        loop couldn't classify them. Now they propagate for fast-fail.
+        """
+        import worker
+
+        with patch.object(worker, "DOCLING_MODE", "off"):
+            with (
+                patch(
+                    "worker.run_ocrmypdf",
+                    side_effect=ZeroDivisionError("float division by zero"),
+                ),
+                patch("worker.push_to_paperless", return_value=True),
             ):
                 tmp_inbox = Path(tempfile.mkdtemp())
                 tmp_processing = Path(tempfile.mkdtemp())
@@ -338,8 +432,8 @@ class TestProcessFileModelInitFailure:
                 test_pdf = tmp_inbox / "test.pdf"
                 test_pdf.write_bytes(b"%PDF-1.4 fake")
 
-                result = process_file(test_pdf)
-                assert result is False
+                with pytest.raises(ZeroDivisionError):
+                    process_file(test_pdf)
 
     def test_native_sidecar_failure_continues_pipeline(self):
         """Native sidecar failure doesn't abort pipeline in best_effort mode."""
@@ -354,3 +448,76 @@ class TestProcessFileModelInitFailure:
                 assert result is True  # continues despite sidecar failure
         finally:
             worker.DOCLING_MODE = old_mode
+
+
+# ── process_with_retries (non-retryable fast-fail) ─────────────────────────
+class TestProcessWithRetries:
+    def test_non_retryable_error_skips_retries(self):
+        """A non-retryable error (ZeroDivisionError) stops immediately.
+
+        process_file is called exactly once (no retry sleep), and the file is
+        moved to ERROR/ with a reason containing 'non-retryable'.
+        """
+        import worker
+
+        tmp_inbox = Path(tempfile.mkdtemp())
+        tmp_processing = Path(tempfile.mkdtemp())
+        tmp_error = Path(tempfile.mkdtemp())
+        old_inbox, old_proc, old_err = worker.INBOX, worker.PROCESSING, worker.ERROR
+        worker.INBOX = tmp_inbox
+        worker.PROCESSING = tmp_processing
+        worker.ERROR = tmp_error
+        try:
+            test_pdf = tmp_inbox / "test.pdf"
+            test_pdf.write_bytes(b"%PDF-1.4 fake")
+
+            with (
+                patch(
+                    "worker.process_file",
+                    side_effect=ZeroDivisionError("float division by zero"),
+                ) as mock_pf,
+                patch("worker.move_to_error") as mock_move,
+            ):
+                # retry_delay=0 so no real sleep even if a retry were attempted
+                process_with_retries(test_pdf, max_retries=3, retry_delay=0)
+
+            # Non-retryable → exactly one attempt, no retry loop.
+            assert mock_pf.call_count == 1
+            # Landed in ERROR/ with a non-retryable reason.
+            assert mock_move.call_count == 1
+            _, reason = mock_move.call_args[0]
+            assert "non-retryable" in reason
+        finally:
+            worker.INBOX, worker.PROCESSING, worker.ERROR = old_inbox, old_proc, old_err
+
+    def test_retryable_error_retries_then_gives_up(self):
+        """A retryable (non-exception) failure is retried up to max_retries.
+
+        process_file returns False (not raising) → all attempts run, then the
+        file is moved to ERROR/ with 'max retries reached'.
+        """
+        import worker
+
+        tmp_inbox = Path(tempfile.mkdtemp())
+        tmp_processing = Path(tempfile.mkdtemp())
+        tmp_error = Path(tempfile.mkdtemp())
+        old_inbox, old_proc, old_err = worker.INBOX, worker.PROCESSING, worker.ERROR
+        worker.INBOX = tmp_inbox
+        worker.PROCESSING = tmp_processing
+        worker.ERROR = tmp_error
+        try:
+            test_pdf = tmp_inbox / "test.pdf"
+            test_pdf.write_bytes(b"%PDF-1.4 fake")
+
+            with (
+                patch("worker.process_file", return_value=False) as mock_pf,
+                patch("worker.move_to_error") as mock_move,
+            ):
+                process_with_retries(test_pdf, max_retries=3, retry_delay=0)
+
+            assert mock_pf.call_count == 3
+            assert mock_move.call_count == 1
+            _, reason = mock_move.call_args[0]
+            assert reason == "max retries reached"
+        finally:
+            worker.INBOX, worker.PROCESSING, worker.ERROR = old_inbox, old_proc, old_err
