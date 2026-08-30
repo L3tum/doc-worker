@@ -2,6 +2,10 @@
 Doc-Worker — Tests for worker.py sidecar generation.
 
 Tests generate_native_sidecar with mocked PaddleX pipelines.
+
+Moved from tests/test_worker.py to tests/unit/test_worker.py: CI
+(docker.yaml) runs `pytest tests/unit`, so this file is now executed in
+CI in addition to local dev runs.
 """
 
 from __future__ import annotations

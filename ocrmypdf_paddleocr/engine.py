@@ -14,6 +14,7 @@ from ocrmypdf.models.ocr_element import BoundingBox, OcrClass, OcrElement
 from ocrmypdf.pluginspec import OcrEngine, OrientationConfidence
 from PIL import Image
 
+from ocrmypdf_paddleocr.compat import VECTOR_PAGE_DPI
 from ocrmypdf_paddleocr.lang_map import SUPPORTED_LANGUAGES, tesseract_to_paddle
 
 if TYPE_CHECKING:
@@ -155,6 +156,10 @@ class PaddleOcrEngine(OcrEngine):
             img_width, img_height = img.size
             dpi_info = img.info.get("dpi", (300, 300))
             dpi = float(dpi_info[0] if isinstance(dpi_info, tuple) else dpi_info)
+            # Defensive DPI hygiene: keep ocr_tree.dpi truthful for zero/negative/
+            # non-finite tags (inf too). NOT the fix for the zero-DPI graft crash —
+            # see ocrmypdf_paddleocr/compat.py (graft_page reads pdfinfo dpi, not this).
+            dpi = dpi if (dpi > 0 and math.isfinite(dpi)) else VECTOR_PAGE_DPI
 
         page = OcrElement(
             ocr_class=OcrClass.PAGE,

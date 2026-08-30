@@ -12,7 +12,15 @@ log = logging.getLogger(__name__)
 
 @hookimpl
 def initialize(plugin_manager):
-    """Check that PaddleOCR is importable at startup."""
+    """Check PaddleOCR is importable, then apply the zero-DPI graft shim.
+
+    The shim patches ``OcrGrafter.graft_page`` in-process. ocrmypdf fires
+    ``initialize`` once per interpreter (it caches the plugin manager) and
+    ``apply_zero_dpi_graft_workaround`` is idempotent, so one call covers every
+    later in-process OCR run. A shim failure must NOT break plugin load: it is
+    fail-soft, and if it doesn't apply, the worker's non-retryable
+    ZeroDivisionError backstop still routes zero-DPI files to ERROR/.
+    """
     try:
         import paddlex  # noqa: F401
     except ImportError:
@@ -21,6 +29,10 @@ def initialize(plugin_manager):
         raise MissingDependencyError(
             "PaddleX is required but not installed. Install with: pip install paddlex paddlepaddle"
         )
+
+    from ocrmypdf_paddleocr.compat import apply_zero_dpi_graft_workaround
+
+    apply_zero_dpi_graft_workaround()
 
 
 @hookimpl

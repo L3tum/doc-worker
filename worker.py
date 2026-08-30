@@ -253,12 +253,12 @@ def _json_default(obj: object) -> object:
 
 
 def _is_non_retryable_error(exc: Exception) -> bool:
-    """Return True for deterministic errors that a retry cannot fix.
+    """Return True for deterministic errors a retry cannot fix.
 
-    ZeroDivisionError: ocrmypdf CoordinateTransform divides by dpi, which is
-    0.0 when a PDF page has no renderable images (upstream ocrmypdf bug,
-    distinct from #761 which fixed the scanning phase). The same input page
-    always yields the same dpi, so retrying is pointless.
+    ZeroDivisionError: a zero-DPI PDF page (no renderable images) that the
+    graft-dpi shim in ocrmypdf_paddleocr/compat.py did not convert. Same input
+    always yields the same zero dpi, so retrying is pointless — fail fast to
+    ERROR/. See compat.py for the primary fix and why the backstop exists.
     """
     return isinstance(exc, ZeroDivisionError)
 
@@ -462,14 +462,13 @@ def process_file(pdf_path: Path) -> bool:
         # process_with_retries() can classify deterministic errors as
         # non-retryable and skip wasted GPU passes.
         if isinstance(exc, ZeroDivisionError):
-            # Upstream ocrmypdf bug: CoordinateTransform (rendering/finalize
-            # phase) divides by dpi, which is 0.0 when a PDF page has no
-            # renderable images. Deterministic — the same page always fails.
-            # Distinct from #761 (scanning phase, already fixed). Tracked
-            # upstream; bump ocrmypdf when fixed.
+            # Backstop: the graft-dpi shim (ocrmypdf_paddleocr/compat.py, applied in the
+            # plugin's initialize) did not convert this page — either it was not applied
+            # (internals changed under the <18 pin) or a zero-dpi path it doesn't cover.
+            # Deterministic, so fail fast to ERROR/ rather than burn GPU passes.
             log_error(
                 f"OCR failed: zero-DPI page in {filename} (upstream ocrmypdf "
-                f"CoordinateTransform bug) — non-retryable, not retrying."
+                f"zero-dpi bug; graft-dpi shim did not convert it) — non-retryable, not retrying."
             )
         else:
             log_error(f"OCR failed: {exc}")
