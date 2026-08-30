@@ -90,8 +90,14 @@ def test_generate_ocr_dpi_hygiene(
     tag is left unchanged. Exercises the exact blank-page shape that previously
     produced page.dpi == 0.0."""
     pytest.importorskip("ocrmypdf")
+    import sys
     from pathlib import Path
     from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    # Mock paddlex so the engine's `import paddlex` (inside version())
+    # succeeds without triggering paddlex's heavy __init__ side effects.
+    monkeypatch.setitem(sys.modules, "paddlex", MagicMock())
 
     engine = importlib.import_module("ocrmypdf_paddleocr.engine")
 
@@ -118,7 +124,13 @@ def test_initialize_fail_soft_when_shim_application_breaks(monkeypatch):
     except Exception (not the __init__.py wrapper, which was removed).
     """
     pytest.importorskip("ocrmypdf")
-    pytest.importorskip("paddlex")
+    import sys
+    from unittest.mock import MagicMock
+
+    # Mock paddlex so initialize()'s `import paddlex` succeeds without
+    # triggering paddlex's heavy __init__ side effects (repo_manager).
+    monkeypatch.setitem(sys.modules, "paddlex", MagicMock())
+
     from ocrmypdf import _graft
 
     from ocrmypdf_paddleocr import compat, initialize

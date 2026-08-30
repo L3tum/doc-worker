@@ -125,10 +125,15 @@ def test_fail_soft_when_pdfinfo_raises(shim_ctx, monkeypatch) -> None:
     assert _graft.OcrGrafter.graft_page(fake_self, pageno=1) == "ok"
 
 
-def test_initialize_applies_shim(shim_ctx) -> None:
+def test_initialize_applies_shim(shim_ctx, monkeypatch) -> None:
     """D1=A: plugin initialize() wraps graft_page (shim applied at plugin load)."""
     pytest.importorskip("ocrmypdf")
-    pytest.importorskip("paddlex")
+    import sys
+
+    # Mock paddlex so initialize()'s `import paddlex` succeeds without
+    # triggering paddlex's heavy __init__ side effects (repo_manager).
+    monkeypatch.setitem(sys.modules, "paddlex", MagicMock())
+
     from ocrmypdf import _graft
 
     from ocrmypdf_paddleocr import initialize
@@ -281,7 +286,9 @@ def test_real_pageinfo_dpi_is_indexable_resolution(tmp_path) -> None:
     """
     pytest.importorskip("ocrmypdf")
     pytest.importorskip("img2pdf")
+
     import img2pdf
+    from ocrmypdf._concurrent import SerialExecutor
     from ocrmypdf._pipeline import get_pdfinfo
     from PIL import Image as PILImage
 
@@ -290,7 +297,8 @@ def test_real_pageinfo_dpi_is_indexable_resolution(tmp_path) -> None:
     pdf = tmp_path / "img.pdf"
     pdf.write_bytes(img2pdf.convert(str(img)))
 
-    dpi = get_pdfinfo(str(pdf))[0].dpi
+    executor = SerialExecutor()
+    dpi = get_pdfinfo(str(pdf), executor=executor)[0].dpi
     assert dpi[0] == pytest.approx(300.0)  # indexable → Resolution-shaped
     assert dpi[1] == pytest.approx(300.0)
     assert dpi.to_scalar() == pytest.approx(300.0)
@@ -308,8 +316,13 @@ def test_e2e_vector_page_runs_without_zero_division(tmp_path, monkeypatch) -> No
     All other shim tests use hand-written fakes.
     """
     pytest.importorskip("ocrmypdf")
-    pytest.importorskip("paddlex")
     pytest.importorskip("pikepdf")
+    import sys
+
+    # Mock paddlex so initialize()'s `import paddlex` succeeds without
+    # triggering paddlex's heavy __init__ side effects (repo_manager).
+    monkeypatch.setitem(sys.modules, "paddlex", MagicMock())
+
     import ocrmypdf
     import pikepdf
     from ocrmypdf import _graft
