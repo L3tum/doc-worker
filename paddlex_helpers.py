@@ -764,15 +764,17 @@ def _pdf_to_images(pdf_path: str, tmp_dir: str) -> list[str]:
         pdf_path,
         str(tmp_path),
     ]
-    # Timeout: 60 seconds per PDF to prevent hanging on corrupted/complex files
+    # Timeout configurable via PAPDFTOPPM_TIMEOUT (default 120s)
+    pdftoppm_timeout = int(os.getenv("PAPDFTOPPM_TIMEOUT", "120"))
     try:
         result = subprocess.run(
-            cmd, check=True, capture_output=True, text=True, timeout=60
+            cmd, check=True, capture_output=True, text=True, timeout=pdftoppm_timeout
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
-            f"pdftoppm timed out after 60 seconds converting {pdf_path}. "
-            "The PDF may be too large or corrupted."
+            f"pdftoppm timed out after {pdftoppm_timeout} seconds converting {pdf_path}. "
+            f"The PDF may be too large or corrupted. "
+            f"Set PAPDFTOPPM_TIMEOUT to increase the limit."
         )
 
     # Warn on stderr output, but elevate to error if no pages were produced

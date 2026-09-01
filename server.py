@@ -410,16 +410,19 @@ def _check_token(authorization: str | None) -> None:
 
 
 def _is_text_content(raw_bytes: bytes) -> bool:
-    """Check if the raw bytes look like a valid text file (not a PDF or other binary).
+    """Check if raw bytes look like valid text (not a PDF or other binary).
 
     Strategy:
-    1. Reject known binary file signatures (PDF, PNG, JPEG, GIF, BMP, TIFF, WebP,
-       ZIP-based formats like ODF, etc.).
-    2. Check for excessive high-byte or control characters — if more than 5% of the
-       first 8 KB are non-printable (outside ASCII printable range), treat as binary.
-       This catches most binary files without requiring UTF-8 decoding.
+    1. Reject known binary file signatures anchored at offset 0.
+    2. Strict UTF-8 decode of the first 8 KB: UnicodeDecodeError means binary.
+    3. For files > 10 KB, also decode the last 8 KB to catch binary formats
+       with printable headers (e.g., uncompressed PDFs with binary stream data
+       later in the file).
     """
-    # Step 1: Known binary signatures (must reject these early)
+    if not raw_bytes:
+        return False
+
+    # Step 1: Known binary signatures — anchored at offset 0
     binary_signatures = [
         b"%PDF",  # PDF
         b"\x89PNG\r\n\x1a\n",  # PNG
@@ -436,19 +439,27 @@ def _is_text_content(raw_bytes: bytes) -> bool:
         if raw_bytes.startswith(sig):
             return False
 
-    # Step 2: Heuristic check — count bytes that are not in the ASCII printable range
-    # We only look at the first 8 KB to avoid full-file scanning.
+    # Step 2: Strict UTF-8 decode of first 8 KB — binary data almost always
+    # contains invalid UTF-8 byte sequences. This correctly handles multi-byte
+    # UTF-8 text (German umlauts, CJK, emoji) which the old 5% high-byte ratio
+    # heuristic misclassified as binary.
     sample = raw_bytes[:8192]
-    if not sample:
-        return False  # Empty file — treat as text (empty text is still text)
+    try:
+        sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
 
-    non_printable = sum(
-        1
-        for byte in sample
-        if byte > 127 or (byte < 32 and byte not in (9, 10, 13))  # 9=tab, 10=LF, 13=CR
-    )
-    # If more than 5% of the sample is non-printable, likely binary
-    return non_printable / max(len(sample), 1) <= 0.05
+    # Step 3: For large files, also check the tail (last 8 KB) to catch binary
+    # formats with printable headers (e.g., uncompressed PDFs whose first 8 KB
+    # is valid UTF-8 dictionary text but whose stream data is binary).
+    if len(raw_bytes) > 10240:
+        tail = raw_bytes[-8192:]
+        try:
+            tail.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+
+    return True
 
 
 # ── Open-WebUI endpoint ──────────────────────────────────────────────
@@ -502,6 +513,9 @@ async def layout_parsing(
         file_bytes = base64.b64decode(file_b64)
     except Exception as exc:
         raise HTTPException(400, f"Invalid base64: {exc}")
+
+    if not file_bytes:
+        raise HTTPException(400, "File content is empty")
 
     # ── Text file detection: if not a PDF, return as-is ──
     if not is_image and _is_text_content(file_bytes):
@@ -560,22 +574,8 @@ async def layout_parsing(
     except HTTPException:
         raise
     except Exception as exc:
-        # ── Error fallback: PDF processing failed (e.g., pdfium error)
-        # Return the file content as text if possible ──
-        logger.warning(f"PDF processing failed ({exc}), returning raw content as text")
-        try:
-            content = file_bytes.decode("utf-8", errors="replace")
-            return JSONResponse(
-                content={
-                    "result": {
-                        "layoutParsingResults": [
-                            {"markdown": {"text": content}, "structuredBlocks": []}
-                        ],
-                    }
-                }
-            )
-        except Exception:
-            raise HTTPException(500, f"Layout parsing failed: {exc}")
+        logger.exception("Layout parsing failed")
+        raise HTTPException(500, f"Layout parsing failed: {exc}")
     finally:
         if tmp_path:
             Path(tmp_path).unlink(missing_ok=True)
@@ -640,6 +640,9 @@ async def extract_text(
     tmp_path = None
     try:
         file_bytes = await file.read()
+
+        if not file_bytes:
+            raise HTTPException(400, "File content is empty")
 
         # ── Text file detection: if not an image and looks like text, return as-is ──
         if not is_image and _is_text_content(file_bytes):

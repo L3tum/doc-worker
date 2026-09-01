@@ -174,6 +174,138 @@ class TestLayoutParsing:
         assert data["detail"]["status"] == "unhealthy"
         assert data["detail"]["component"] == "paddlex"
 
+    def test_layout_parsing_returns_500_on_processing_error(self, test_client):
+        """Test /layout-parsing returns 500 when processing fails (not raw bytes)."""
+        import server
+
+        def failing_run(*args, **kwargs):
+            raise RuntimeError("pdfium: failed to load PDF")
+
+        with patch("server.run_paddlex_structure_v3", failing_run):
+            with patch("server.os") as mock_os:
+                mock_os.getenv = lambda key, default="true": (
+                    "true" if key == "USE_STRUCTURE_V3" else default
+                )
+                with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
+                    file_b64 = base64.b64encode(b"%PDF-1.4 fake pdf content").decode()
+                    response = test_client.post(
+                        "/layout-parsing",
+                        headers={"Authorization": "Bearer test-token"},
+                        json={"file": file_b64, "fileType": 0},
+                    )
+
+        assert response.status_code == 500
+        data = response.json()
+        assert "Layout parsing failed" in data["detail"]
+        assert "pdfium: failed to load PDF" in data["detail"]
+        # Crucially: no success-shaped body on error
+        assert "layoutParsingResults" not in data
+
+    def test_layout_parsing_no_garbled_output_on_error(self, test_client):
+        """Regression test: error response must NOT contain garbled binary text.
+
+        Sends a realistic FlateDecode PDF that, if its raw bytes were decoded
+        as UTF-8, would produce the garble pattern (â, Ŋ, U+FFFD, etc.).
+        """
+        import zlib
+
+        import server
+
+        stream_data = zlib.compress(b"Hello World " * 100)
+        pdf = (
+            b"%PDF-1.4\n"
+            b"1 0 obj <</Type /Catalog /Pages 2 0 R>> endobj\n"
+            b"2 0 obj <</Type /Pages /Kids [3 0 R] /Count 1>> endobj\n"
+            b"3 0 obj <</Type /Page /MediaBox [0 0 612 792] /Parent 2 0 R>> endobj\n"
+            b"4 0 obj <</Length "
+            + str(len(stream_data)).encode()
+            + b" /Filter /FlateDecode>>\n"
+            b"stream\n" + stream_data + b"\nendstream\nendobj\n"
+            b"trailer <</Size 5 /Root 1 0 R>>\n%%EOF"
+        )
+
+        def failing_run(*args, **kwargs):
+            raise RuntimeError("simulated processing failure")
+
+        with patch("server.run_paddlex_structure_v3", failing_run):
+            with patch("server.os") as mock_os:
+                mock_os.getenv = lambda key, default="true": (
+                    "true" if key == "USE_STRUCTURE_V3" else default
+                )
+                with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
+                    file_b64 = base64.b64encode(pdf).decode()
+                    response = test_client.post(
+                        "/layout-parsing",
+                        headers={"Authorization": "Bearer test-token"},
+                        json={"file": file_b64, "fileType": 0},
+                    )
+
+        assert response.status_code == 500
+        body_text = response.text
+        # Error shape, not success shape
+        data = response.json()
+        assert "detail" in data
+        assert "layoutParsingResults" not in data
+        # The garble fingerprint must be absent
+        assert "\ufffd" not in body_text  # U+FFFD replacement character
+        assert "\xe2\x82\xac" not in body_text  # â (common garble char)
+
+    def test_layout_parsing_empty_file_returns_400(self, test_client):
+        """Empty file content must return 400, not 500 or garbled 200."""
+        import server
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
+            # Empty string is caught by the 'Missing file field' guard
+            response = test_client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Bearer test-token"},
+                json={"file": "", "fileType": 0},
+            )
+        assert response.status_code == 400
+        assert "file" in response.json()["detail"].lower()
+
+    def test_layout_parsing_german_text_passthrough(self, test_client):
+        """German text files must be returned as-is (200), not 500.
+
+        This tests the coupling between the _is_text_content fix and the
+        error fallback fix. Without the UTF-8-aware _is_text_content, German
+        text would be misclassified as binary, sent to OCR, and if OCR
+        fails, would hit the error path.
+        """
+        import server
+
+        german_text = "Müllerstraße über große höfe für deutsche Größe\n"
+        file_b64 = base64.b64encode(german_text.encode("utf-8")).decode()
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
+            response = test_client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Bearer test-token"},
+                json={"file": file_b64, "fileType": 0},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        results = data["result"]["layoutParsingResults"]
+        assert len(results) == 1
+        assert german_text in results[0]["markdown"]["text"]
+
+
+# ── Extract: empty file test ────────────────────────────────────────────────
+class TestExtractEmptyFile:
+    def test_extract_empty_file_returns_400(self, test_client):
+        """Empty file upload must return 400."""
+        import server
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
+            response = test_client.post(
+                "/extract",
+                headers={"Authorization": "Bearer test-token"},
+                files={"file": ("test.pdf", b"", "application/pdf")},
+            )
+        assert response.status_code == 400
+        assert "empty" in response.json()["detail"].lower()
+
 
 # ── Extract endpoint tests ────────────────────────────────────────────────
 class TestExtract:
