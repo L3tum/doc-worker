@@ -525,3 +525,41 @@ class TestProcessWithRetries:
             assert reason == "max retries reached"
         finally:
             worker.INBOX, worker.PROCESSING, worker.ERROR = old_inbox, old_proc, old_err
+
+
+# ── run_ocrmypdf idle-timeout regression ─────────────────────────────────
+class TestRunOcrmyPdfMarksModelUsed:
+    """Regression: the OCRmyPDF plugin loads the shared PaddleX General-OCR
+    model lazily inside ocrmypdf.ocr(). run_ocrmypdf must mark the model as
+    used so the idle-unload clock tracks this load. In the default
+    'best_effort' DOCLING mode this OCR path is the only model load for a
+    file, so without the mark the model would never be unloaded (VRAM leak).
+    """
+
+    def test_marks_model_used_before_ocr(self, tmp_path):
+        import sys
+
+        import worker
+        from unittest.mock import MagicMock
+
+        input_pdf = tmp_path / "in.pdf"
+        input_pdf.write_bytes(b"%PDF-1.4 fake")
+        output_pdf = tmp_path / "out.pdf"
+        output_pdf.write_bytes(b"%PDF-1.4 fake output")
+
+        ocrmypdf_mock = MagicMock()
+        calls: list[str] = []
+        ocrmypdf_mock.ocr.side_effect = lambda *a, **k: calls.append("ocr")
+
+        def fake_mark() -> None:
+            calls.append("mark")
+            worker._model_last_used = 123.0
+
+        with patch.dict(sys.modules, {"ocrmypdf": ocrmypdf_mock}):
+            with patch.object(worker, "_mark_model_used", side_effect=fake_mark):
+                worker.run_ocrmypdf(input_pdf, output_pdf)
+
+        # The idle clock was advanced, and the mark happened before the load.
+        assert worker._model_last_used == 123.0
+        assert ocrmypdf_mock.ocr.called
+        assert calls.index("mark") < calls.index("ocr")

@@ -34,6 +34,7 @@ from paddlex_helpers import (
     blocks_to_markdown,
     destroy_paddlex_model,
     migrate_legacy_model_dirs,
+    paddlex_model_is_loaded,
     run_paddlex_structure_v3,
     validate_paddlex_models,
     warmup_paddlex_models,
@@ -348,6 +349,13 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
             "Run `pip install ocrmypdf` or check your environment."
         )
 
+    # The plugin loads the shared PaddleX General-OCR model lazily inside
+    # ocrmypdf.ocr(). Mark it as used here so the idle-timeout clock tracks this
+    # load too — otherwise in non-native DOCLING modes (e.g. the default
+    # "best_effort") this OCR path is the only model load for a file and the
+    # model would never be subject to idle unloading, leaking VRAM.
+    _mark_model_used()
+
     ocrmypdf.ocr(
         input_pdf,
         output_pdf,
@@ -637,6 +645,12 @@ def main() -> None:
     try:
         warmup_paddlex_models()
         log("PaddleX models warmed up successfully.")
+        # Start the idle-unload clock from warmup time. Without this, a
+        # warmed-up-but-unused model keeps _model_last_used at 0 and the idle
+        # thread's `_model_last_used > 0` guard would never destroy it — leaking
+        # VRAM when no files ever arrive.
+        if paddlex_model_is_loaded():
+            _mark_model_used()
     except Exception as exc:
         log_error(f"PaddleX model warm-up failed: {exc}")
         log("Continuing anyway — models will be initialized lazily on first use.")

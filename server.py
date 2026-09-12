@@ -56,6 +56,7 @@ from paddlex_helpers import (
     get_paddlex_init_exception,
     migrate_legacy_model_dirs,
     paddleocr_lang_code,
+    paddlex_model_is_loaded,
     run_paddleocr,
     run_paddlex_structure_v3,
     validate_paddlex_models,
@@ -309,6 +310,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         warmup_paddlex_models()
         print("  PaddleX models warmed up successfully.", flush=True)
+        # Start the idle-unload clock from warmup time. Without this, a
+        # warmed-up-but-unused model keeps _model_last_used at 0 and the idle
+        # thread's `_model_last_used > 0` guard would never destroy it — leaking
+        # VRAM when no requests ever arrive.
+        if paddlex_model_is_loaded():
+            _mark_model_used()
     except Exception as exc:
         print(
             f"  PaddleX model warm-up failed: {exc}",

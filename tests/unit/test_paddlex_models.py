@@ -762,6 +762,45 @@ def test_destroy_and_recreate_paddlex_model(tmp_path, monkeypatch):
     assert create_count == 2  # pipeline was recreated, not reused
 
 
+def test_paddlex_model_is_loaded_reflects_resident_pipelines(tmp_path, monkeypatch):
+    """paddlex_model_is_loaded() tracks whether a warmed-up model is resident.
+
+    Regression test for the VRAM-leak bug: the idle-unload thread only destroys
+    a model once the process has marked it as used, and startup warmup is the
+    path that loads the pipelines without any request. If a warmed-up model is
+    not reported as loaded, the process never starts the idle clock and the
+    GPU memory is never reclaimed.
+    """
+    import paddlex_helpers
+
+    monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+    monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+    _write_all_models(tmp_path)
+
+    def counting_create_pipeline(*args: Any, **kwargs: Any) -> dict:
+        return {}
+
+    _install_fake_paddlex(
+        monkeypatch,
+        {
+            "OCR": _ocr_config_fixture(),
+            "layout_parsing": _layout_parsing_config_fixture(),
+        },
+        create_pipeline=counting_create_pipeline,
+    )
+
+    # Nothing resident yet (singleton cleared by the autouse fixture)
+    assert paddlex_helpers.paddlex_model_is_loaded() is False
+
+    # Startup warmup loads the pipelines -> resident
+    paddlex_helpers.warmup_paddlex_models()
+    assert paddlex_helpers.paddlex_model_is_loaded() is True
+
+    # Destruction reclaims them -> not resident
+    paddlex_helpers.destroy_paddlex_model()
+    assert paddlex_helpers.paddlex_model_is_loaded() is False
+
+
 # ── Retry logic: transient error recovery ────────────────────────────────
 
 

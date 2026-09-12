@@ -565,6 +565,19 @@ def warmup_paddlex_models() -> None:
                 delattr(_get_paddlex_structure_v3_model, "_init_exception")  # type: ignore[attr-defined]
 
 
+def paddlex_model_is_loaded() -> bool:
+    """Return True if any PaddleX pipeline is currently cached in memory.
+
+    Used by idle-timeout logic to decide whether there is a resident model to
+    reclaim. A model that was warmed up at startup but never served a request
+    still counts as loaded — and must still be subject to idle unloading.
+    """
+    return (
+        hasattr(_get_paddlex_model, "_model")  # type: ignore[attr-defined]
+        or hasattr(_get_paddlex_structure_v3_model, "_model")  # type: ignore[attr-defined]
+    )
+
+
 def _is_model_error(exc: Exception) -> bool:
     """Return True if the exception is likely related to PaddleX model state.
 
