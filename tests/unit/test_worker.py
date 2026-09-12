@@ -538,9 +538,9 @@ class TestRunOcrmyPdfMarksModelUsed:
 
     def test_marks_model_used_before_ocr(self, tmp_path):
         import sys
+        from unittest.mock import MagicMock
 
         import worker
-        from unittest.mock import MagicMock
 
         input_pdf = tmp_path / "in.pdf"
         input_pdf.write_bytes(b"%PDF-1.4 fake")

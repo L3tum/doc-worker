@@ -35,6 +35,16 @@ INBOX → stability check → PROCESSING → [Docling sidecar] → [OCR] → [Pa
 
 `PADDLE_GPU`: `cpu` (default), `cuda`
 
+## Code Quality (Required After Each Changeset)
+
+After every set of code changes, run and fix all failures before considering the work done:
+
+```bash
+ruff format .
+ruff check .
+mypy *.py
+```
+
 ## Critical Gotchas
 
 1. **Open-WebUI sends `Bearer <token>`** — parse auth header accordingly in `server.py`

@@ -61,7 +61,9 @@ class TestIsTextContent:
             b"1 0 obj <</Type /Catalog /Pages 2 0 R>> endobj\n"
             b"2 0 obj <</Type /Pages /Kids [3 0 R] /Count 1>> endobj\n"
             b"3 0 obj <</Type /Page /MediaBox [0 0 612 792] /Parent 2 0 R>> endobj\n"
-            b"4 0 obj <</Length " + str(len(stream_data)).encode() + b" /Filter /FlateDecode>>\n"
+            b"4 0 obj <</Length "
+            + str(len(stream_data)).encode()
+            + b" /Filter /FlateDecode>>\n"
             b"stream\n" + stream_data + b"\nendstream\nendobj\n"
             b"trailer <</Size 5 /Root 1 0 R>>\n%%EOF"
         )
