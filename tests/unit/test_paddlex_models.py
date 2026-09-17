@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import sys
+import time
 import types
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,7 @@ from paddlex_helpers import (
     TEXT_DETECTION_MODEL,
     TEXT_RECOGNITION_MODEL,
     TEXTLINE_ORIENTATION_MODEL,
+    ModelIdleTracker,
     _model_dir,
     create_paddleocr_model,
     run_paddleocr,
@@ -38,6 +42,10 @@ def _reset_paddlex_singleton():
     monkeypatches take full effect.
     """
     import paddlex_helpers
+
+    # Reset the in-flight guard counter so a leaked context cannot
+    # suppress idle-unload decisions in later tests.
+    paddlex_helpers._model_in_flight = 0
 
     # Clear any cached model/exception state
     for obj in (
@@ -78,6 +86,8 @@ def _reset_paddlex_singleton():
         for attr in ("_model", "_init_exception"):
             if hasattr(obj, attr):
                 delattr(obj, attr)
+
+    paddlex_helpers._model_in_flight = 0
 
 
 REQUIRED_MODEL_NAMES = (
@@ -242,14 +252,16 @@ def _install_fake_paddlex(
     The fake ``load_pipeline_config`` returns the config fixture for the requested
     pipeline name (and records the call). ``create_pipeline`` defaults to a capture
     stub; pass a custom callable to control counting / flaky / permanent behaviour
-    (it will be invoked as ``create_pipeline(config=cfg)``). Returns a captured dict
-    with keys ``pipeline`` / ``config`` (last call) and ``load_calls`` (a list).
+    (it will be invoked as ``create_pipeline(config=cfg, device=...)``). Returns a
+    captured dict with keys ``pipeline`` / ``config`` / ``kwargs`` (last call; all
+    keyword args recorded, e.g. ``device``) and ``load_calls`` (a list).
     """
     captured: dict[str, Any] = {"load_calls": []}
 
     def _default_create_pipeline(pipeline=None, *, config=None, **kwargs: Any) -> dict:
         captured["pipeline"] = pipeline
         captured["config"] = config
+        captured["kwargs"] = dict(kwargs)
         return {}  # dummy pipeline
 
     def fake_load_pipeline_config(pipeline: str) -> dict:
@@ -276,6 +288,73 @@ def _install_fake_paddlex(
     monkeypatch.setitem(sys.modules, "paddlex.inference.pipelines", pipelines_mod)
 
     return captured
+
+
+def _install_fake_paddle(
+    monkeypatch,
+    *,
+    compiled_with_cuda: bool = True,
+    device_count: int = 1,
+    allocated_mb: tuple[float, ...] = (),
+    reserved_mb: tuple[float, ...] = (),
+) -> dict[str, int]:
+    """Install fake ``paddle`` / ``paddle.device`` / ``paddle.device.cuda`` modules.
+
+    ``allocated_mb`` / ``reserved_mb`` are the MB values returned by
+    ``memory_allocated()`` / ``memory_reserved()`` in call order (the last
+    value repeats once the sequence is exhausted; 0 when empty). This lets a
+    test script the before/after stats of one destroy call. Returns per-API
+    call counters.
+    """
+    calls = {"empty_cache": 0, "allocated": 0, "reserved": 0}
+
+    def _seq_mb(values: tuple[float, ...]) -> Callable[[], int]:
+        state = {"i": 0, "last": 0.0}
+
+        def fn() -> int:
+            if values:
+                state["last"] = values[min(state["i"], len(values) - 1)]
+                state["i"] += 1
+            return int(state["last"] * 1024 * 1024)
+
+        return fn
+
+    alloc_fn = _seq_mb(allocated_mb)
+    resv_fn = _seq_mb(reserved_mb)
+
+    paddle_mod = types.ModuleType("paddle")
+    device_mod = types.ModuleType("paddle.device")
+    cuda_mod = types.ModuleType("paddle.device.cuda")
+
+    def empty_cache() -> None:
+        calls["empty_cache"] += 1
+
+    def is_compiled_with_cuda() -> bool:
+        return compiled_with_cuda
+
+    def count_devices() -> int:
+        return device_count
+
+    def memory_allocated() -> int:
+        calls["allocated"] += 1
+        return alloc_fn()
+
+    def memory_reserved() -> int:
+        calls["reserved"] += 1
+        return resv_fn()
+
+    cuda_mod.empty_cache = empty_cache  # type: ignore[attr-defined]
+    cuda_mod.device_count = count_devices  # type: ignore[attr-defined]
+    cuda_mod.memory_allocated = memory_allocated  # type: ignore[attr-defined]
+    cuda_mod.memory_reserved = memory_reserved  # type: ignore[attr-defined]
+    device_mod.cuda = cuda_mod  # type: ignore[attr-defined]
+    device_mod.is_compiled_with_cuda = is_compiled_with_cuda  # type: ignore[attr-defined]
+    paddle_mod.device = device_mod  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "paddle", paddle_mod)
+    monkeypatch.setitem(sys.modules, "paddle.device", device_mod)
+    monkeypatch.setitem(sys.modules, "paddle.device.cuda", cuda_mod)
+    return calls
 
 
 def test_constants_use_logical_model_names_not_infer_directory_names(
@@ -1570,3 +1649,393 @@ class TestModelDirSecurity:
 
         result = paddlex_helpers._model_dir(TEXT_DETECTION_MODEL)
         assert result == tmp_path / "PP-OCRv6_medium_det_infer"
+
+
+# ── empty_cache gate: runtime CUDA availability, not OCR_USE_GPU ─────────
+
+
+class TestDestroyEmptyCacheGate:
+    """destroy_paddlex_model() must flush Paddle's CUDA allocator pool based on
+    RUNTIME CUDA availability — not the OCR_USE_GPU env var. The old gate
+    (OCR_USE_GPU) let a cuda deployment with OCR_USE_GPU=false leak its pool
+    forever, because device selection was left to PaddleX auto-detection."""
+
+    def test_flushes_when_cuda_available_even_if_ocr_use_gpu_false(
+        self, tmp_path, monkeypatch
+    ):
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
+        calls = _install_fake_paddle(monkeypatch)  # CUDA available
+        monkeypatch.setattr(paddlex_helpers, "OCR_USE_GPU", False)
+
+        paddlex_helpers._get_paddlex_model()
+        paddlex_helpers.destroy_paddlex_model()
+
+        assert calls["empty_cache"] == 1
+
+    def test_no_cuda_api_when_cuda_unavailable(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
+        calls = _install_fake_paddle(monkeypatch, compiled_with_cuda=False)
+
+        paddlex_helpers._get_paddlex_model()
+        paddlex_helpers.destroy_paddlex_model()
+
+        assert calls["empty_cache"] == 0
+        assert calls["allocated"] == 0
+        assert calls["reserved"] == 0
+
+
+# ── explicit device= kwarg on create_pipeline ────────────────────────────
+
+
+class TestCreatePipelineDeviceKwarg:
+    """create_pipeline() must receive an explicit device= for both pipelines.
+
+    No PaddleX auto-detection: it silently ignored OCR_USE_GPU, which is how
+    the 'OCR_USE_GPU=false but running on GPU' deployments happened.
+    """
+
+    def test_ocr_pipeline_device_cpu_default(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        monkeypatch.setattr(paddlex_helpers, "OCR_USE_GPU", False)
+        monkeypatch.setattr(paddlex_helpers, "_cuda_available", lambda: False)
+        captured = _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
+
+        paddlex_helpers._get_paddlex_model()
+        assert captured["kwargs"]["device"] == "cpu"
+
+    def test_ocr_pipeline_device_gpu_when_requested_and_available(
+        self, tmp_path, monkeypatch
+    ):
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        monkeypatch.setattr(paddlex_helpers, "OCR_USE_GPU", True)
+        monkeypatch.setattr(paddlex_helpers, "_cuda_available", lambda: True)
+        captured = _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
+
+        paddlex_helpers._get_paddlex_model()
+        assert captured["kwargs"]["device"] == "gpu:0"
+
+    def test_layout_parsing_pipeline_device_gpu(self, tmp_path, monkeypatch):
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        monkeypatch.setattr(paddlex_helpers, "OCR_USE_GPU", True)
+        monkeypatch.setattr(paddlex_helpers, "_cuda_available", lambda: True)
+        captured = _install_fake_paddlex(
+            monkeypatch, {"layout_parsing": _layout_parsing_config_fixture()}
+        )
+
+        paddlex_helpers._get_paddlex_structure_v3_model()
+        assert captured["kwargs"]["device"] == "gpu:0"
+
+    def test_gpu_requested_but_cuda_unavailable_falls_back_to_cpu(
+        self, tmp_path, monkeypatch
+    ):
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        monkeypatch.setattr(paddlex_helpers, "OCR_USE_GPU", True)
+        monkeypatch.setattr(paddlex_helpers, "_cuda_available", lambda: False)
+        captured = _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
+
+        paddlex_helpers._get_paddlex_model()
+        assert captured["kwargs"]["device"] == "cpu"
+
+
+# ── destroy_paddlex_model(verify_reclaim=True) reclamation logging ───────
+
+
+class TestDestroyReclaimVerification:
+    """verify_reclaim=True (idle path) must measure before/after GPU stats and
+    log a distinct warning when the VRAM was NOT actually returned."""
+
+    def test_logs_reclaimed_when_stats_drop(self, tmp_path, monkeypatch, caplog):
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
+        calls = _install_fake_paddle(
+            monkeypatch, allocated_mb=(500, 10), reserved_mb=(600, 20)
+        )
+
+        paddlex_helpers._get_paddlex_model()
+        with caplog.at_level(logging.INFO, logger="doc-worker.paddlex_helpers"):
+            paddlex_helpers.destroy_paddlex_model(verify_reclaim=True)
+
+        assert calls["allocated"] == 2  # before + after
+        assert calls["reserved"] == 2
+        assert calls["empty_cache"] == 1
+        assert "VRAM reclaimed" in caplog.text
+        assert "VRAM NOT reclaimed" not in caplog.text
+        # before/after values are logged (500 -> 10 MB allocated)
+        assert "500" in caplog.text and "10" in caplog.text
+
+    def test_warns_when_allocated_stays_high(self, tmp_path, monkeypatch, caplog):
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
+        _install_fake_paddle(
+            monkeypatch, allocated_mb=(500, 450), reserved_mb=(600, 580)
+        )
+
+        paddlex_helpers._get_paddlex_model()
+        with caplog.at_level(logging.WARNING, logger="doc-worker.paddlex_helpers"):
+            paddlex_helpers.destroy_paddlex_model(verify_reclaim=True)
+
+        assert "VRAM NOT reclaimed" in caplog.text
+        assert "still referenced" in caplog.text
+
+    def test_no_stats_query_with_default_verify_reclaim(self, tmp_path, monkeypatch):
+        """Non-idle paths (shutdown/retry/recovery) must never query stats."""
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
+        calls = _install_fake_paddle(
+            monkeypatch, allocated_mb=(500,), reserved_mb=(600,)
+        )
+
+        paddlex_helpers._get_paddlex_model()
+        paddlex_helpers.destroy_paddlex_model()
+
+        assert calls["allocated"] == 0
+        assert calls["reserved"] == 0
+
+    def test_cpu_build_logs_without_reclamation_claim(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import paddlex_helpers
+
+        monkeypatch.setenv("PADDLEOCR_MODELS", str(tmp_path))
+        _write_all_models(tmp_path)
+        _install_fake_paddlex(monkeypatch, {"OCR": _ocr_config_fixture()})
+        calls = _install_fake_paddle(monkeypatch, compiled_with_cuda=False)
+
+        paddlex_helpers._get_paddlex_model()
+        with caplog.at_level(logging.INFO, logger="doc-worker.paddlex_helpers"):
+            paddlex_helpers.destroy_paddlex_model(verify_reclaim=True)
+
+        assert calls["allocated"] == 0
+        assert calls["reserved"] == 0
+        assert calls["empty_cache"] == 0
+        assert "memory reclaimed" not in caplog.text
+        assert "PaddleX models destroyed" in caplog.text
+
+
+# ── shared idle-unload decision (ModelIdleTracker) ──────────────────────
+
+
+class TestModelIdleTracker:
+    """The single shared idle-unload decision used by server and worker."""
+
+    def _check(
+        self,
+        monkeypatch,
+        stamp: float,
+        loaded: bool = True,
+        in_flight: bool = False,
+        timeout: float = 30,
+    ) -> tuple[list[dict], ModelIdleTracker]:
+        import paddlex_helpers
+
+        tracker = paddlex_helpers.ModelIdleTracker()
+        tracker._last_used = stamp
+        if loaded:
+            paddlex_helpers._get_paddlex_model._model = object()
+        destroys: list[dict] = []
+        monkeypatch.setattr(
+            paddlex_helpers,
+            "destroy_paddlex_model",
+            lambda **kw: destroys.append(kw),
+        )
+
+        if in_flight:
+            with paddlex_helpers.model_in_flight():
+                tracker.check_once(timeout)
+        else:
+            tracker.check_once(timeout)
+        return destroys, tracker
+
+    def test_mark_used_sets_stamp(self):
+        import paddlex_helpers
+
+        tracker = paddlex_helpers.ModelIdleTracker()
+        assert tracker._last_used == 0.0
+        before = time.time()
+        tracker.mark_used()
+        after = time.time()
+        assert before <= tracker._last_used <= after
+
+    def test_noop_when_stamp_zero(self, monkeypatch):
+        destroys, tracker = self._check(monkeypatch, stamp=0.0)
+        assert destroys == []
+        assert tracker._last_used == 0.0
+
+    def test_noop_when_timeout_not_elapsed(self, monkeypatch):
+        orig = time.time() - 10
+        destroys, tracker = self._check(monkeypatch, stamp=orig)
+        assert destroys == []
+        assert tracker._last_used is orig  # stamp untouched
+
+    def test_destroys_when_idle_loaded_and_not_in_flight(self, monkeypatch):
+        destroys, tracker = self._check(monkeypatch, stamp=time.time() - 100)
+        assert destroys == [{"verify_reclaim": True}]
+        assert tracker._last_used == 0.0
+
+    def test_resets_stamp_without_destroy_when_not_loaded(self, monkeypatch):
+        destroys, tracker = self._check(
+            monkeypatch, stamp=time.time() - 100, loaded=False
+        )
+        assert destroys == []  # no spurious destroy
+        assert tracker._last_used == 0.0  # but the stamp was reset
+
+    def test_skips_destroy_while_job_in_flight(self, monkeypatch):
+        destroys, tracker = self._check(
+            monkeypatch, stamp=time.time() - 100, in_flight=True
+        )
+        assert destroys == []
+        assert tracker._last_used != 0.0  # stamp preserved — retry on next poll
+
+    def test_negative_timeout_is_clamped_not_inverted(self, monkeypatch):
+        """A misconfigured negative timeout must be clamped (>= 1 s), not let
+        invert the ``elapsed <= timeout`` comparison — otherwise a just-used
+        model (elapsed ≈ 0) would be destroyed on the first poll after every
+        use."""
+        destroys, tracker = self._check(monkeypatch, stamp=time.time(), timeout=-5)
+        assert destroys == []
+        assert tracker._last_used != 0.0  # preserved — not destroyed
+
+
+# ── in-flight model guard ────────────────────────────────────────────────
+
+
+class TestModelInFlightGuard:
+    """model_in_flight() counter: exception safety is the load-bearing part
+    (a wedged counter would permanently block idle unloading)."""
+
+    def test_counter_tracks_nesting(self):
+        import paddlex_helpers
+
+        assert paddlex_helpers.model_in_flight_count() == 0
+        with paddlex_helpers.model_in_flight():
+            assert paddlex_helpers.model_in_flight_count() == 1
+            with paddlex_helpers.model_in_flight():
+                assert paddlex_helpers.model_in_flight_count() == 2
+        assert paddlex_helpers.model_in_flight_count() == 0
+
+    def test_counter_returns_to_zero_after_exception(self):
+        import paddlex_helpers
+
+        assert paddlex_helpers.model_in_flight_count() == 0
+        with pytest.raises(RuntimeError, match="boom"):
+            with paddlex_helpers.model_in_flight():
+                raise RuntimeError("boom")
+        assert paddlex_helpers.model_in_flight_count() == 0
+
+    def test_run_paddleocr_holds_guard_during_predict(self, monkeypatch):
+        """The guard must be held across model fetch + predict so the idle
+        thread never sees a loaded model as idle mid-job."""
+        import paddlex_helpers
+
+        seen: dict[str, int] = {}
+
+        class _SpyModel:
+            def predict(self, _path: str):
+                seen["count"] = paddlex_helpers.model_in_flight_count()
+                yield {"rec_texts": [], "rec_scores": [], "rec_boxes": []}
+
+        monkeypatch.setattr(paddlex_helpers, "_get_paddlex_model", _SpyModel)
+
+        paddlex_helpers.run_paddleocr("document.pdf")
+        assert seen["count"] == 1
+        assert paddlex_helpers.model_in_flight_count() == 0
+
+    def test_guard_releases_after_predict_exception(self, monkeypatch):
+        import paddlex_helpers
+
+        class _BoomModel:
+            def predict(self, _path: str):
+                raise RuntimeError("predictor exploded")
+                yield  # pragma: no cover — makes this a generator
+
+        monkeypatch.setattr(paddlex_helpers, "_get_paddlex_model", _BoomModel)
+
+        with pytest.raises(RuntimeError, match="predictor exploded"):
+            paddlex_helpers.run_paddleocr("document.pdf")
+        assert paddlex_helpers.model_in_flight_count() == 0
+
+    def test_run_paddlex_structure_v3_holds_guard_across_convert_and_predict(
+        self, monkeypatch
+    ):
+        """run_paddlex_structure_v3 is the primary pipeline for the worker
+        sidecar and the server /layout-parsing + /extract-text endpoints: the
+        guard must be held across model fetch, the PDF→image conversion, and
+        every per-page predict. Dropping the wrap on this path would let the
+        idle thread destroy the pipeline mid-job with no failing test."""
+        import paddlex_helpers
+
+        seen: dict[str, int] = {}
+
+        class _SpyModel:
+            def predict(self, _path: str):
+                seen["predict"] = paddlex_helpers.model_in_flight_count()
+                yield {
+                    "overall_ocr_res": {
+                        "rec_texts": [],
+                        "rec_scores": [],
+                        "rec_boxes": [],
+                    }
+                }
+
+        def fake_pdf_to_images(_pdf_path: str, _tmp_dir: str) -> list[str]:
+            seen["convert"] = paddlex_helpers.model_in_flight_count()
+            return ["page-1.png"]
+
+        monkeypatch.setattr(
+            paddlex_helpers, "_get_paddlex_structure_v3_model", _SpyModel
+        )
+        monkeypatch.setattr(paddlex_helpers, "_pdf_to_images", fake_pdf_to_images)
+
+        paddlex_helpers.run_paddlex_structure_v3("document.pdf")
+
+        assert seen["convert"] == 1  # held across the pdftoppm conversion
+        assert seen["predict"] == 1  # held during per-page predict
+        assert paddlex_helpers.model_in_flight_count() == 0  # released after
+
+    def test_run_paddlex_structure_v3_releases_guard_on_exception(self, monkeypatch):
+        import paddlex_helpers
+
+        class _BoomModel:
+            def predict(self, _path: str):
+                raise RuntimeError("structure predictor exploded")
+                yield  # pragma: no cover — makes this a generator
+
+        monkeypatch.setattr(
+            paddlex_helpers, "_get_paddlex_structure_v3_model", _BoomModel
+        )
+        monkeypatch.setattr(
+            paddlex_helpers, "_pdf_to_images", lambda _p, _d: ["page-1.png"]
+        )
+
+        with pytest.raises(RuntimeError, match="structure predictor exploded"):
+            paddlex_helpers.run_paddlex_structure_v3("document.pdf")
+        assert paddlex_helpers.model_in_flight_count() == 0

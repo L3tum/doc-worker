@@ -51,6 +51,9 @@ from pydantic import BaseModel
 from starlette.responses import Response
 
 from paddlex_helpers import (
+    ModelIdleTracker,
+    _gpu_memory_stats_mb,
+    _paddlex_device,
     blocks_to_markdown,
     destroy_paddlex_model,
     get_paddlex_init_exception,
@@ -85,35 +88,52 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
 logger = logging.getLogger("doc-worker.api")
 
 # Track when the PaddleOCR model was last used (for idle-timeout destruction)
-_model_last_used = 0.0
-_model_last_used_lock = threading.Lock()
+_model_idle_tracker = ModelIdleTracker()
 
 
 def _mark_model_used() -> None:
     """Update the model last-use timestamp (thread-safe)."""
-    with _model_last_used_lock:
-        _model_last_used = time.time()
+    _model_idle_tracker.mark_used()
+
+
+def _check_idle_once() -> None:
+    """One idle-unload decision; the shared logic lives in paddlex_helpers."""
+    _model_idle_tracker.check_once(MODEL_IDLE_TIMEOUT)
 
 
 def _print_gpu_info() -> str:
-    """Detect PaddleOCR GPU support at runtime and return a human-readable string."""
+    """Report the PaddleX device that will actually be used at startup.
+
+    Mirrors paddlex_helpers._paddlex_device() — the same decision that is
+    passed to create_pipeline() — so the banner can never claim the model
+    runs on a different device than the one it actually does.
+    """
+    device = _paddlex_device()
     try:
         import paddle
 
-        has_cuda = paddle.device.is_compiled_with_cuda()
-        if has_cuda and OCR_USE_GPU:
-            # Try to get device count for extra info
-            try:
-                count = paddle.device.cuda.device_count()
-                return f"GPU (CUDA, {count} device(s), OCR_USE_GPU=true)"
-            except Exception:
-                return "GPU (CUDA, device count unknown)"
-        elif has_cuda:
-            return "GPU (CUDA available, OCR_USE_GPU=false — running on CPU)"
-        else:
-            return "CPU (paddlepaddle CPU-only)"
+        device_count = (
+            paddle.device.cuda.device_count()
+            if paddle.device.is_compiled_with_cuda()
+            else 0
+        )
     except Exception:
-        return "GPU detection unavailable"
+        device_count = None
+
+    if device == "gpu:0":
+        if device_count is not None:
+            return (
+                f"GPU (device=gpu:0, {device_count} CUDA device(s), OCR_USE_GPU=true)"
+            )
+        return "GPU (device=gpu:0, CUDA available, OCR_USE_GPU=true)"
+    if OCR_USE_GPU:
+        # Explicit operator-requested-GPU fallback: truth-telling line so the
+        # banner never hides that the flag had no effect.
+        return (
+            "CPU (device=cpu — OCR_USE_GPU=true but no CUDA device available; "
+            "falling back to CPU)"
+        )
+    return "CPU (device=cpu, OCR_USE_GPU=false)"
 
 
 _PADDLEOCR_MODELS_LIST = [
@@ -144,23 +164,17 @@ def _model_status(model_name: str, model_dir_name: str) -> str:
 def _idle_timeout_checker() -> None:
     """Background daemon thread: destroy the model after MODEL_IDLE_TIMEOUT seconds of inactivity.
 
-    Wakes every 5 seconds, checks if the model is loaded and the idle timeout
-    has elapsed, then calls `destroy_paddlex_model()`.
+    Wakes every 5 seconds and delegates the decision to
+    paddlex_helpers.ModelIdleTracker.check_once() (shared with the worker),
+    which also skips destroys while a job is in flight.
     """
-    global _model_last_used
     logger.info(
         f"Model idle timeout thread started (timeout={MODEL_IDLE_TIMEOUT}s, poll=5s)"
     )
     while True:
         try:
             time.sleep(5)
-            with _model_last_used_lock:
-                if (
-                    _model_last_used > 0
-                    and time.time() - _model_last_used > MODEL_IDLE_TIMEOUT
-                ):
-                    destroy_paddlex_model()
-                    _model_last_used = 0  # reset so we don't re-destroy on next wake
+            _check_idle_once()
         except Exception:
             logger.exception("Idle timeout thread encountered an error, continuing")
 
@@ -310,9 +324,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         warmup_paddlex_models()
         print("  PaddleX models warmed up successfully.", flush=True)
+        # Log the loaded-state VRAM so the loaded-vs-idle delta is visible in
+        # the container log (the idle-unload log reports the after state).
+        gpu_stats = _gpu_memory_stats_mb()
+        if gpu_stats is not None:
+            print(
+                f"  GPU memory after warmup: allocated={gpu_stats[0]:.0f} MB, "
+                f"reserved={gpu_stats[1]:.0f} MB",
+                flush=True,
+            )
         # Start the idle-unload clock from warmup time. Without this, a
-        # warmed-up-but-unused model keeps _model_last_used at 0 and the idle
-        # thread's `_model_last_used > 0` guard would never destroy it — leaking
+        # warmed-up-but-unused model keeps the idle tracker's stamp at 0 and
+        # the idle thread's `stamp > 0` guard would never destroy it — leaking
         # VRAM when no requests ever arrive.
         if paddlex_model_is_loaded():
             _mark_model_used()
@@ -571,6 +594,11 @@ async def layout_parsing(
                 for page in pages
             ]
 
+        # Stamp job completion so a job longer than MODEL_IDLE_TIMEOUT
+        # restarts the idle clock instead of being destroyed on the first
+        # poll right after it finishes.
+        _mark_model_used()
+
         return JSONResponse(
             content={
                 "result": {
@@ -706,6 +734,11 @@ async def extract_text(
                 }
                 for p in pages
             ]
+
+        # Stamp job completion (see /layout-parsing) so a long job restarts
+        # the idle clock instead of being destroyed on the first poll after
+        # it finishes.
+        _mark_model_used()
 
         full_text = "\n\n".join(p["text"] for p in pages if p["text"])
         return JSONResponse(

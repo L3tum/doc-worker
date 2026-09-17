@@ -15,7 +15,8 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,100 @@ def paddleocr_lang_code() -> str:
         "cht": "chinese_cht",
     }
     return mapping.get(OCR_LANG.lower(), "en")
+
+
+# ── GPU device & memory helpers ─────────────────────────────────────────
+# Post-destroy memory_allocated() must be below this (MB) for the idle-unload
+# to be reported as "reclaimed". A small residual is expected (CUDA context,
+# Paddle runtime); anything meaningfully above it means a predictor is still
+# referenced somewhere.
+_VRAM_RECLAIM_THRESHOLD_MB = 100.0
+
+
+def _cuda_available() -> bool:
+    """Return True when Paddle was compiled with CUDA and a GPU device exists.
+
+    Uncached: the call sites are the startup banner, the warmup log, and idle
+    destroys (at most one per 30 s of inactivity) — a cache would only add
+    module state for tests to reset. Fail-soft: any import/attribute failure
+    (e.g. a CPU build) returns False.
+    """
+    try:
+        import paddle.device
+
+        return bool(
+            paddle.device.is_compiled_with_cuda()
+            and paddle.device.cuda.device_count() > 0
+        )
+    except Exception:
+        return False
+
+
+def _gpu_memory_stats_mb() -> tuple[float, float] | None:
+    """Return (allocated MB, reserved MB) from Paddle's CUDA memory pool.
+
+    Returns None when stats are unavailable (paddle missing, CPU build, no
+    device). Callers must then skip any reclamation claim.
+    """
+    try:
+        import paddle.device
+
+        if not paddle.device.is_compiled_with_cuda():
+            return None
+        if paddle.device.cuda.device_count() <= 0:
+            return None
+        return (
+            paddle.device.cuda.memory_allocated() / (1024 * 1024),
+            paddle.device.cuda.memory_reserved() / (1024 * 1024),
+        )
+    except Exception:
+        return None
+
+
+def _paddlex_device() -> str:
+    """Return the PaddleX device string passed to create_pipeline().
+
+    OCR_USE_GPU is the authoritative device switch: "gpu:0" only when the
+    operator asked for GPU AND a CUDA device is actually present, else "cpu".
+    The value is passed as an explicit ``device=`` kwarg — verified present on
+    both the PaddleX 3.2 floor and the 3.3+ line — so PaddleX auto-detection
+    can never silently pick a different device.
+    """
+    if OCR_USE_GPU and _cuda_available():
+        return "gpu:0"
+    return "cpu"
+
+
+# ── In-flight model guard ─────────────────────────────────────────────────
+# Counts jobs that are currently using a resident PaddleX pipeline so the
+# idle-unload thread never destroys the model out from under a long-running
+# job. The inc/dec is guarded by _model_in_flight_lock: ``counter += 1`` is a
+# non-atomic LOAD/ADD/STORE, so a GIL preemption between the read and the
+# write can drop an update and wedge the count permanently above 0 —
+# suppressing every idle-unload for the rest of the process lifetime. The
+# try/finally in model_in_flight() guarantees the counter returns to 0 after
+# exceptions, so a job crash cannot wedge it either.
+_model_in_flight = 0
+_model_in_flight_lock = threading.Lock()
+
+
+@contextmanager
+def model_in_flight() -> Generator[None, None, None]:
+    """Mark the PaddleX model as in use for the duration of the context."""
+    global _model_in_flight
+    with _model_in_flight_lock:
+        _model_in_flight += 1
+    try:
+        yield
+    finally:
+        with _model_in_flight_lock:
+            _model_in_flight -= 1
+
+
+def model_in_flight_count() -> int:
+    """Return the number of jobs currently holding the PaddleX model in use."""
+    with _model_in_flight_lock:
+        return _model_in_flight
 
 
 # ── Singleton model managers ──────────────────────────────────────────────
@@ -683,7 +778,10 @@ def _create_paddlex_ocr_pipeline(use_textline_orientation: bool = True) -> Any:
     cfg["use_textline_orientation"] = use_textline_orientation
     # Legacy top-level key (no-op in PaddleX 3.x, kept for parity with prior behavior).
     cfg["lang"] = paddleocr_lang_code()
-    return create_pipeline(config=cfg)
+    # device= is passed explicitly (no PaddleX auto-detection): the kwarg is
+    # verified present on both the PaddleX 3.2 floor and the 3.3+ line, so a
+    # keyword call is valid on every supported version.
+    return create_pipeline(config=cfg, device=_paddlex_device())
 
 
 def create_paddleocr_model(*, use_textline_orientation: bool = True) -> Any:
@@ -716,9 +814,26 @@ def _get_paddlex_model() -> Any:
 
 
 # ── Model destruction ────────────────────────────────────────────────────
-def destroy_paddlex_model() -> None:
-    """Destroy cached PaddleX models and reclaim memory."""
+def destroy_paddlex_model(verify_reclaim: bool = False) -> None:
+    """Destroy cached PaddleX models and reclaim memory.
+
+    Args:
+        verify_reclaim: When True (idle-unload path), measure Paddle's CUDA
+            memory before and after destruction and log whether VRAM was
+            actually returned — with a distinct warning when it was not.
+            Use the default False for shutdown/retry/recovery paths: a stale
+            in-flight reference (e.g. the local ``engine`` of the in-flight
+            ``generate_ocr`` frame during mid-job recovery) can legitimately
+            keep a predictor alive there, which would make the warning a
+            false positive.
+    """
     import gc
+
+    # Capture pre-destroy stats BEFORE dropping the singletons — a later
+    # measurement would already miss the memory we are trying to free.
+    before_stats: tuple[float, float] | None = None
+    if verify_reclaim:
+        before_stats = _gpu_memory_stats_mb()
 
     try:
         with _PADDLEX_MODEL_LOCK:
@@ -743,7 +858,12 @@ def destroy_paddlex_model() -> None:
             pass
 
         gc.collect()
-        if OCR_USE_GPU:
+        # Gate the allocator flush on RUNTIME CUDA availability, not the
+        # OCR_USE_GPU env var: device selection is explicit now (see
+        # _paddlex_device()), but the flush must fire whenever Paddle's CUDA
+        # pool is actually in use — the old OCR_USE_GPU gate let a cuda
+        # deployment with OCR_USE_GPU=false leak its pool forever.
+        if _cuda_available():
             try:
                 import paddle.device
 
@@ -752,10 +872,86 @@ def destroy_paddlex_model() -> None:
             except Exception:
                 logger.exception("Failed to clear CUDA cache")
 
-        logger.info("PaddleX models destroyed — memory reclaimed")
+        if verify_reclaim:
+            after_stats = _gpu_memory_stats_mb()
+            if before_stats is None or after_stats is None:
+                # CPU build (or paddle unavailable): no stats, no reclamation
+                # claim — log the destroy fact only.
+                logger.info("PaddleX models destroyed (no GPU memory stats available)")
+            elif after_stats[0] > _VRAM_RECLAIM_THRESHOLD_MB:
+                logger.warning(
+                    "PaddleX models destroyed — VRAM NOT reclaimed "
+                    "(memory_allocated still %.0f MB, memory_reserved %.0f MB) "
+                    "— predictor(s) still referenced; next step: reference hunt "
+                    "(gc.get_objects() diff) or process recycle",
+                    after_stats[0],
+                    after_stats[1],
+                )
+            else:
+                logger.info(
+                    "PaddleX models destroyed — VRAM reclaimed "
+                    "(memory_allocated %.0f -> %.0f MB, "
+                    "memory_reserved %.0f -> %.0f MB)",
+                    before_stats[0],
+                    after_stats[0],
+                    before_stats[1],
+                    after_stats[1],
+                )
+        else:
+            logger.info("PaddleX models destroyed — memory reclaimed")
 
     except Exception:
         logger.exception("Error during PaddleX model destruction")
+
+
+class ModelIdleTracker:
+    """Per-process last-used stamp + lock for idle-unload decisions.
+
+    Server and worker each hold one instance (each process tracks its own
+    model usage). The stamp, its lock, and the unload decision live in one
+    place, so the "reset only while the lock is held" contract is enforced
+    structurally instead of in a docstring, and the decision logic has a
+    single test target.
+    """
+
+    def __init__(self) -> None:
+        self._last_used = 0.0
+        self._lock = threading.Lock()
+
+    def mark_used(self) -> None:
+        """Update the model last-use timestamp (thread-safe)."""
+        with self._lock:
+            self._last_used = time.time()
+
+    def check_once(self, timeout: float) -> None:
+        """One idle-unload decision (the logic shared by server and worker).
+
+        A non-positive *timeout* is clamped to 1 s: an unclamped negative
+        value would invert the comparison (``elapsed <= timeout``) and
+        destroy the model on the first poll after *every* use.
+
+        Decision (all under the internal lock, held across destroy):
+          - stamp <= 0 (never used) or idle timeout not yet elapsed -> skip
+          - nothing loaded (e.g. a cached init failure) -> reset the stamp
+            and return, so no spurious "reclaimed" line is logged for a
+            model that was never resident
+          - a job is in flight -> skip; the next poll retries
+          - otherwise -> destroy with reclamation verification and reset the
+            stamp
+        """
+        timeout = max(float(timeout), 1.0)
+        with self._lock:
+            if self._last_used <= 0 or time.time() - self._last_used <= timeout:
+                return
+            if not paddlex_model_is_loaded():
+                self._last_used = 0.0
+                return
+            if model_in_flight_count() > 0:
+                # The model is in use by a job — do not destroy mid-run; the
+                # next 5 s poll will retry.
+                return
+            destroy_paddlex_model(verify_reclaim=True)
+            self._last_used = 0.0
 
 
 # ── PDF → image conversion helper ─────────────────────────────────────────
@@ -825,7 +1021,8 @@ def _create_structure_v3_pipeline() -> Any:
     cfg["use_table_recognition"] = False
     cfg["use_seal_recognition"] = False
     cfg["use_formula_recognition"] = False
-    return create_pipeline(config=cfg)
+    # Explicit device= (see _create_paddlex_ocr_pipeline) — no auto-detection.
+    return create_pipeline(config=cfg, device=_paddlex_device())
 
 
 def _get_paddlex_structure_v3_model() -> Any:
@@ -861,10 +1058,14 @@ def run_paddleocr(file_path: str) -> list[dict]:
     with 'page' (int), 'text' (str), and 'blocks' (list[dict] with text, bbox,
     confidence).
     """
-    model = _get_paddlex_model()
-    # PaddleX >=3.0 predict() returns a generator (one result per sample/page);
-    # materialize it so the isinstance(list,tuple) guard and per-page .get() work.
-    result = list(model.predict(file_path))
+    # model_in_flight() spans model fetch + predict so the idle-unload thread
+    # can never destroy the pipeline out from under this job (including the
+    # lazy-init window if the model was just unloaded).
+    with model_in_flight():
+        model = _get_paddlex_model()
+        # PaddleX >=3.0 predict() returns a generator (one result per sample/page);
+        # materialize it so the isinstance(list,tuple) guard and per-page .get() work.
+        result = list(model.predict(file_path))
 
     # Safeguard: model.predict should return a list, but check anyway
     if not isinstance(result, (list, tuple)):
@@ -929,31 +1130,36 @@ def run_paddlex_structure_v3(file_path: str) -> list[dict]:
         structured_blocks (list[dict]): blocks with type, bbox, content, confidence
     """
 
-    model = _get_paddlex_structure_v3_model()
+    # model_in_flight() spans model fetch through the whole page processing
+    # (predict is per-page inside _process_structure_v3_pages) — this also
+    # covers the lazy-init window and the pdftoppm conversion in between, so
+    # the idle-unload thread can never destroy the pipeline mid-job.
+    with model_in_flight():
+        model = _get_paddlex_structure_v3_model()
 
-    # If file_path is a PDF, convert pages to temporary PNG images.
-    # The temp directory must stay alive while we process the images.
-    if file_path.lower().endswith(".pdf"):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            images = _pdf_to_images(file_path, tmp_dir)
-            if not images:
-                raise RuntimeError(
-                    f"Failed to convert PDF to images: {file_path}. "
-                    "Check that pdftoppm is installed and the file is a valid PDF."
-                )
+        # If file_path is a PDF, convert pages to temporary PNG images.
+        # The temp directory must stay alive while we process the images.
+        if file_path.lower().endswith(".pdf"):
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                images = _pdf_to_images(file_path, tmp_dir)
+                if not images:
+                    raise RuntimeError(
+                        f"Failed to convert PDF to images: {file_path}. "
+                        "Check that pdftoppm is installed and the file is a valid PDF."
+                    )
+                try:
+                    return _process_structure_v3_pages(model, images)
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"PP-StructureV3 prediction failed on {file_path}: {exc}"
+                    ) from exc
+        else:
             try:
-                return _process_structure_v3_pages(model, images)
+                return _process_structure_v3_pages(model, [file_path])
             except Exception as exc:
                 raise RuntimeError(
                     f"PP-StructureV3 prediction failed on {file_path}: {exc}"
                 ) from exc
-    else:
-        try:
-            return _process_structure_v3_pages(model, [file_path])
-        except Exception as exc:
-            raise RuntimeError(
-                f"PP-StructureV3 prediction failed on {file_path}: {exc}"
-            ) from exc
 
 
 def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:

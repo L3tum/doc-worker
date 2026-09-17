@@ -553,13 +553,81 @@ class TestRunOcrmyPdfMarksModelUsed:
 
         def fake_mark() -> None:
             calls.append("mark")
-            worker._model_last_used = 123.0
+            worker._model_idle_tracker._last_used = 123.0
 
         with patch.dict(sys.modules, {"ocrmypdf": ocrmypdf_mock}):
             with patch.object(worker, "_mark_model_used", side_effect=fake_mark):
                 worker.run_ocrmypdf(input_pdf, output_pdf)
 
         # The idle clock was advanced, and the mark happened before the load.
-        assert worker._model_last_used == 123.0
+        assert worker._model_idle_tracker._last_used == 123.0
         assert ocrmypdf_mock.ocr.called
         assert calls.index("mark") < calls.index("ocr")
+
+
+# ── run_ocrmypdf in-flight guard + kwargs regression ──────────────────────
+class TestRunOcrmyPdfInFlightGuard:
+    """run_ocrmypdf must hold the in-flight guard across the entire
+    ocrmypdf.ocr() call (the plugin forces jobs=1, so one interval
+    deterministically covers every plugin predict in get_deskew/generate_ocr)
+    and stamp the idle clock both before and after the call."""
+
+    def test_guard_held_across_ocr_with_double_stamp(self, tmp_path):
+        import sys
+        from unittest.mock import MagicMock
+
+        import paddlex_helpers
+        import worker
+
+        input_pdf = tmp_path / "in.pdf"
+        input_pdf.write_bytes(b"%PDF-1.4 fake")
+        output_pdf = tmp_path / "out.pdf"
+        output_pdf.write_bytes(b"%PDF-1.4 fake output")
+
+        ocrmypdf_mock = MagicMock()
+        events: list[tuple[str, int]] = []
+
+        def fake_ocr(*args, **kwargs) -> None:
+            events.append(("ocr", paddlex_helpers.model_in_flight_count()))
+
+        ocrmypdf_mock.ocr.side_effect = fake_ocr
+
+        def fake_mark() -> None:
+            events.append(("mark", paddlex_helpers.model_in_flight_count()))
+
+        with patch.dict(sys.modules, {"ocrmypdf": ocrmypdf_mock}):
+            with patch.object(worker, "_mark_model_used", side_effect=fake_mark):
+                worker.run_ocrmypdf(input_pdf, output_pdf)
+
+        # Pre-stamp before the guard is up, the whole ocr() call under the
+        # guard, completion stamp after release.
+        assert events == [("mark", 0), ("ocr", 1), ("mark", 0)]
+        assert paddlex_helpers.model_in_flight_count() == 0
+
+    def test_ocr_kwargs_pin_no_paddle_use_gpu(self, tmp_path):
+        """ocrmypdf.ocr() must not pass paddle_use_gpu= (the dead kwarg whose
+        removal this change made — re-adding it would re-introduce the
+        device-confusion bug) and must keep force_ocr=True."""
+        import sys
+        from unittest.mock import MagicMock
+
+        import worker
+
+        input_pdf = tmp_path / "in.pdf"
+        input_pdf.write_bytes(b"%PDF-1.4 fake")
+        output_pdf = tmp_path / "out.pdf"
+        output_pdf.write_bytes(b"%PDF-1.4 fake output")
+
+        ocrmypdf_mock = MagicMock()
+        with patch.dict(sys.modules, {"ocrmypdf": ocrmypdf_mock}):
+            worker.run_ocrmypdf(input_pdf, output_pdf)
+
+        ocrmypdf_mock.ocr.assert_called_once()
+        args, kwargs = ocrmypdf_mock.ocr.call_args
+        assert args == (input_pdf, output_pdf)
+        assert kwargs == {
+            "plugins": ["ocrmypdf_paddleocr"],
+            "language": worker.OCR_LANG,
+            "force_ocr": True,
+        }
+        assert "paddle_use_gpu" not in kwargs

@@ -30,10 +30,13 @@ import time
 from pathlib import Path
 
 from paddlex_helpers import (
+    ModelIdleTracker,
+    _gpu_memory_stats_mb,
     _is_model_error,
     blocks_to_markdown,
     destroy_paddlex_model,
     migrate_legacy_model_dirs,
+    model_in_flight,
     paddlex_model_is_loaded,
     run_paddlex_structure_v3,
     validate_paddlex_models,
@@ -66,36 +69,33 @@ def _ensure_directories() -> None:
 
 
 # Track when the PaddleOCR model was last used (for idle-timeout destruction)
-_model_last_used = 0.0
-_model_last_used_lock = threading.Lock()
+_model_idle_tracker = ModelIdleTracker()
 
 
 def _mark_model_used() -> None:
     """Update the model last-use timestamp (thread-safe)."""
-    with _model_last_used_lock:
-        _model_last_used = time.time()
+    _model_idle_tracker.mark_used()
+
+
+def _check_idle_once() -> None:
+    """One idle-unload decision; the shared logic lives in paddlex_helpers."""
+    _model_idle_tracker.check_once(MODEL_IDLE_TIMEOUT)
 
 
 def _worker_idle_timeout_checker() -> None:
     """Background daemon thread: destroy the model after MODEL_IDLE_TIMEOUT seconds of inactivity.
 
-    Wakes every 5 seconds, checks if the model is loaded and the idle timeout
-    has elapsed, then calls `destroy_paddlex_model()`.
+    Wakes every 5 seconds and delegates the decision to
+    paddlex_helpers.ModelIdleTracker.check_once() (shared with the server),
+    which also skips destroys while a job is in flight.
     """
-    global _model_last_used
     log(
         f"Worker model idle timeout thread started (timeout={MODEL_IDLE_TIMEOUT}s, poll=5s)"
     )
     while True:
         try:
             time.sleep(5)
-            with _model_last_used_lock:
-                if (
-                    _model_last_used > 0
-                    and time.time() - _model_last_used > MODEL_IDLE_TIMEOUT
-                ):
-                    destroy_paddlex_model()
-                    _model_last_used = 0  # reset so we don't re-destroy on next wake
+            _check_idle_once()
         except Exception:
             log_error("Worker idle timeout thread encountered an error, continuing")
             import traceback
@@ -279,6 +279,10 @@ def generate_native_sidecar(pdf_path: Path) -> bool:
     try:
         _mark_model_used()
         pages = run_paddlex_structure_v3(str(pdf_path))
+        # Stamp job completion so a job longer than MODEL_IDLE_TIMEOUT
+        # restarts the idle clock instead of being destroyed on the first
+        # poll right after it finishes.
+        _mark_model_used()
 
         filename_stem = pdf_path.stem
         out_dir = DOCLING_OUT / filename_stem
@@ -354,16 +358,25 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
     # load too — otherwise in non-native DOCLING modes (e.g. the default
     # "best_effort") this OCR path is the only model load for a file and the
     # model would never be subject to idle unloading, leaking VRAM.
+    # model_in_flight() covers the whole OCR run (the plugin forces jobs=1,
+    # so one interval deterministically covers every plugin predict in
+    # get_deskew/generate_ocr) and the lazy-init window, so the idle thread
+    # can never destroy the model mid-OCR.
     _mark_model_used()
 
-    ocrmypdf.ocr(
-        input_pdf,
-        output_pdf,
-        plugins=["ocrmypdf_paddleocr"],
-        language=OCR_LANG,
-        force_ocr=True,
-        paddle_use_gpu=OCR_USE_GPU,
-    )
+    with model_in_flight():
+        ocrmypdf.ocr(
+            input_pdf,
+            output_pdf,
+            plugins=["ocrmypdf_paddleocr"],
+            language=OCR_LANG,
+            force_ocr=True,
+        )
+
+    # Stamp job completion so a job longer than MODEL_IDLE_TIMEOUT restarts
+    # the idle clock instead of being destroyed on the first poll after it
+    # finishes.
+    _mark_model_used()
 
     elapsed = _time.time() - start_time
     output_size = output_pdf.stat().st_size
@@ -645,9 +658,17 @@ def main() -> None:
     try:
         warmup_paddlex_models()
         log("PaddleX models warmed up successfully.")
+        # Log the loaded-state VRAM so the loaded-vs-idle delta is visible in
+        # the container log (the idle-unload log reports the after state).
+        gpu_stats = _gpu_memory_stats_mb()
+        if gpu_stats is not None:
+            log(
+                f"GPU memory after warmup: allocated={gpu_stats[0]:.0f} MB, "
+                f"reserved={gpu_stats[1]:.0f} MB"
+            )
         # Start the idle-unload clock from warmup time. Without this, a
-        # warmed-up-but-unused model keeps _model_last_used at 0 and the idle
-        # thread's `_model_last_used > 0` guard would never destroy it — leaking
+        # warmed-up-but-unused model keeps the idle tracker's stamp at 0 and
+        # the idle thread's `stamp > 0` guard would never destroy it — leaking
         # VRAM when no files ever arrive.
         if paddlex_model_is_loaded():
             _mark_model_used()
