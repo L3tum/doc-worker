@@ -1,6 +1,6 @@
 ocrmypdf>=17.4.1,<18
 paddlex[base]>=3.2.0,<4.0.0
-paddlepaddle==3.3.0
+paddlepaddle==3.3.1
 # Pinned: fastapi 0.141.0 (2026-07-29) shipped a broken _compat refactor
 # (openapi/models.py imported PYDANTIC_V2 from the new _compat package,
 # which no longer defines it) and broke CI's unpinned `fastapi` install.
