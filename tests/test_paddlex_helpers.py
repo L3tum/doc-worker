@@ -264,6 +264,28 @@ class TestRunPaddlexOcr:
         assert pages[0]["text"] == "Hello World\nThis is a test"
         assert len(pages[0]["blocks"]) == 2  # two non-empty text blocks
 
+    def test_null_fields_produce_empty_page(self, tmp_path):
+        """F4: null OCR fields (not just missing keys) must not crash run_paddleocr."""
+        img = tmp_path / "page.png"
+        img.write_bytes(b"\x89PNG")
+        page_result = {
+            "rec_texts": None,
+            "rec_scores": None,
+            "rec_boxes": None,
+            "rec_polys": None,
+        }
+
+        class _FakeModel:
+            def predict(self, _path):
+                return iter([page_result])
+
+        with patch("paddlex_helpers._get_paddlex_model", return_value=_FakeModel()):
+            pages = run_paddleocr(str(img))
+
+        assert pages[0]["page"] == 1
+        assert pages[0]["text"] == ""
+        assert pages[0]["blocks"] == []
+
 
 # ── Structure V3 run function tests (with mocks) ──────────────────────────
 class TestRunPaddlexStructureV3:
@@ -306,6 +328,80 @@ class TestRunPaddlexStructureV3:
 
 
 # ── Numpy-typed structured_blocks serializability ─────────────────────────
+class TestJsonable:
+    """_jsonable must recursively scrub numpy types to plain Python values."""
+
+    def test_ndarray(self):
+        import numpy as np
+
+        from paddlex_helpers import _jsonable
+
+        out = _jsonable(np.array([1.5, 2.5], dtype=np.float32))
+        assert out == [1.5, 2.5]
+        assert all(type(v) is float for v in out)
+
+    def test_list_of_numpy_scalars(self):
+        """The production-incident shape: block_bbox as a list of np.float32."""
+        import numpy as np
+
+        from paddlex_helpers import _jsonable
+
+        out = _jsonable([np.float32(1.5), np.float32(2.5)])
+        assert out == [1.5, 2.5]
+        assert all(type(v) is float for v in out)
+
+    def test_nested_mixed(self):
+        import numpy as np
+
+        from paddlex_helpers import _jsonable
+
+        out = _jsonable([np.float32(1.0), [np.int32(2)], {"k": np.float64(3.0)}])
+        assert out == [1.0, [2], {"k": 3.0}]
+        assert type(out[1][0]) is int
+        assert type(out[2]["k"]) is float
+
+    def test_numpy_scalar(self):
+        import numpy as np
+
+        from paddlex_helpers import _jsonable
+
+        out = _jsonable(np.float32(0.5))
+        assert out == 0.5
+        assert type(out) is float
+
+    def test_plain_types_pass_through(self):
+        from paddlex_helpers import _jsonable
+
+        assert _jsonable("s") == "s"
+        assert _jsonable(1) == 1
+        assert _jsonable(1.5) == 1.5
+        assert _jsonable(True) is True
+        assert _jsonable(None) is None
+
+    def test_tuple_and_set(self):
+        import numpy as np
+
+        from paddlex_helpers import _jsonable
+
+        assert _jsonable((np.float32(1.0), "x")) == [1.0, "x"]
+        # Single-element set: deterministic order
+        assert _jsonable({np.int32(2)}) == [2]
+
+    def test_item_fallback(self):
+        from paddlex_helpers import _jsonable
+
+        class _ItemOnly:
+            """numpy-like scalar exposing .item() but not .tolist()."""
+
+            def __init__(self, value: float) -> None:
+                self._value = value
+
+            def item(self) -> float:
+                return self._value
+
+        assert _jsonable(_ItemOnly(3.5)) == 3.5
+
+
 class TestStructuredBlocksNumpySerializability:
     """Regression: PaddleX returns numpy float32 scores + np.array bboxes.
 
@@ -358,6 +454,182 @@ class TestStructuredBlocksNumpySerializability:
         # The full page dict must serialize with json.dumps and NO default=.
         # This is the exact failure mode from the production incident.
         json.dumps(pages)  # raises TypeError if any numpy type leaked
+
+    def test_structured_blocks_list_of_numpy_scalars_json_serializable(self):
+        """Production-incident shape: block_bbox as a list of np.float32.
+
+        The ndarray shape is covered above; PaddleX also hands back
+        block_bbox as a plain list of np.float32 scalars, which the old
+        top-level-only _jsonable passed through unconverted and which
+        crashed JSONResponse with "Object of type float32 is not JSON
+        serializable".
+        """
+        import json
+
+        import numpy as np
+
+        from paddlex_helpers import _process_structure_v3_pages
+
+        result_dict = {
+            "overall_ocr_res": {
+                "rec_texts": ["Hello", "World"],
+                "rec_scores": [np.float32(0.95), np.float32(0.90)],
+                "rec_boxes": [
+                    np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
+                    [
+                        np.float32(5.0),
+                        np.float32(6.0),
+                        np.float32(7.0),
+                        np.float32(8.0),
+                    ],
+                ],
+                "rec_polys": [],
+            },
+            "layout_det_res": {
+                "boxes": [
+                    {"label": "title", "score": np.float32(0.90)},
+                    {"label": "text", "score": np.float32(0.85)},
+                ],
+            },
+            "parsing_res_list": [
+                {
+                    "block_label": "title",
+                    "block_content": "Hello",
+                    "block_bbox": [
+                        np.float32(1.0),
+                        np.float32(2.0),
+                        np.float32(3.0),
+                        np.float32(4.0),
+                    ],
+                },
+                {
+                    "block_label": "text",
+                    "block_content": "World",
+                    "block_bbox": np.array([5.0, 6.0, 7.0, 8.0], dtype=np.float32),
+                },
+            ],
+        }
+
+        class _FakeModel:
+            def predict(self, _path):
+                yield result_dict
+
+        pages = _process_structure_v3_pages(_FakeModel(), ["/tmp/dummy.png"])
+        assert len(pages[0]["structured_blocks"]) == 2
+        assert len(pages[0]["blocks"]) == 2
+        # Raw OCR bboxes must also be plain Python lists (ndarray and
+        # list-of-numpy-scalar shapes alike)
+        for block in pages[0]["blocks"]:
+            assert isinstance(block["bbox"], list)
+            assert all(type(v) is float for v in block["bbox"])
+        # The full page dict must serialize with NO default= (incident mode)
+        json.dumps(pages)
+
+
+# ── Null-field tolerance (PaddleX emits null, not just missing keys) ─────
+class TestNullTolerance:
+    """PaddleX 3.x emits null for absent result sections.
+
+    The `or {}` / `or []` guards keep the pipeline alive for that; a
+    refactor back to `.get(..., default)` would silently regress these.
+    """
+
+    def test_null_page_fields_yield_empty_page(self):
+        """F1: parsing_res_list=null used to 500 with 'NoneType' not iterable."""
+        import json
+
+        from paddlex_helpers import _process_structure_v3_pages
+
+        result_dict = {
+            "overall_ocr_res": None,
+            "layout_det_res": None,
+            "parsing_res_list": None,
+        }
+
+        class _FakeModel:
+            def predict(self, _path):
+                yield result_dict
+
+        pages = _process_structure_v3_pages(_FakeModel(), ["/tmp/dummy.png"])
+        assert pages[0]["text"] == ""
+        assert pages[0]["blocks"] == []
+        assert pages[0]["structured_blocks"] == []
+        json.dumps(pages)
+
+    def test_null_layout_score_defaults_to_zero(self):
+        """F3: explicit-null layout score must not hit float(None)."""
+        import json
+
+        import numpy as np
+
+        from paddlex_helpers import _process_structure_v3_pages
+
+        result_dict = {
+            "overall_ocr_res": {
+                "rec_texts": ["Hello"],
+                "rec_scores": [np.float32(0.9)],
+                "rec_boxes": [np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)],
+                "rec_polys": [],
+            },
+            "layout_det_res": {
+                "boxes": [
+                    {"label": "title", "score": None},
+                    {"label": "text"},  # missing score
+                ],
+            },
+            "parsing_res_list": [
+                {
+                    "block_label": "title",
+                    "block_content": "Hello",
+                    "block_bbox": [1.0, 2.0, 3.0, 4.0],
+                }
+            ],
+        }
+
+        class _FakeModel:
+            def predict(self, _path):
+                yield result_dict
+
+        pages = _process_structure_v3_pages(_FakeModel(), ["/tmp/dummy.png"])
+        assert pages[0]["structured_blocks"][0]["confidence"] == 0.0
+        json.dumps(pages)
+
+    def test_non_finite_scores_degrade_to_finite(self):
+        """NaN/Inf model scores must not poison JSON (allow_nan=False)."""
+        import json
+
+        import numpy as np
+
+        from paddlex_helpers import _process_structure_v3_pages
+
+        result_dict = {
+            "overall_ocr_res": {
+                "rec_texts": ["Hello"],
+                "rec_scores": [np.float32("nan")],
+                "rec_boxes": [np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)],
+                "rec_polys": [],
+            },
+            "layout_det_res": {
+                "boxes": [{"label": "title", "score": np.float32("inf")}]
+            },
+            "parsing_res_list": [
+                {
+                    "block_label": "title",
+                    "block_content": "Hello",
+                    "block_bbox": [1.0, 2.0, 3.0, 4.0],
+                }
+            ],
+        }
+
+        class _FakeModel:
+            def predict(self, _path):
+                yield result_dict
+
+        pages = _process_structure_v3_pages(_FakeModel(), ["/tmp/dummy.png"])
+        assert pages[0]["blocks"][0]["confidence"] == 0.0
+        assert pages[0]["structured_blocks"][0]["confidence"] == 0.0
+        # Must survive strict JSON serialization (SafeJSONResponse settings)
+        json.dumps(pages, allow_nan=False)
 
 
 # ── Model validation tests ────────────────────────────────────────────────

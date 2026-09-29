@@ -44,6 +44,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
@@ -65,6 +66,7 @@ from paddlex_helpers import (
     validate_paddlex_models,
     warmup_paddlex_models,
 )
+from serialization import json_default
 
 # ── Config ────────────────────────────────────────────────────────────
 OCR_LANG = os.getenv("OCR_LANG", "deu")
@@ -429,6 +431,20 @@ async def limit_request_size(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+class SafeJSONResponse(JSONResponse):
+    """JSONResponse that survives numpy scalars/arrays leaking into payloads."""
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+            default=json_default,
+        ).encode("utf-8")
+
+
 def _check_token(authorization: str | None) -> None:
     """Validate the Authorization: Bearer <value> header."""
     if not PADDLEOCR_VL_TOKEN:
@@ -507,7 +523,7 @@ class LayoutParsingRequest(BaseModel):
 async def layout_parsing(
     body: LayoutParsingRequest,
     authorization: str | None = Header(None, alias="Authorization"),
-) -> JSONResponse:
+) -> SafeJSONResponse:
     """Open-WebUI PaddleOCR-VL compatible endpoint.
 
     Open-WebUI calls this when PaddleOCR-VL is selected as the
@@ -552,7 +568,7 @@ async def layout_parsing(
         # Determine file extension from filename hint or default to .txt
         # (Open-WebUI doesn't send a filename, so we just return the text)
         content = file_bytes.decode("utf-8", errors="replace")
-        return JSONResponse(
+        return SafeJSONResponse(
             content={
                 "result": {
                     "layoutParsingResults": [
@@ -599,7 +615,7 @@ async def layout_parsing(
         # poll right after it finishes.
         _mark_model_used()
 
-        return JSONResponse(
+        return SafeJSONResponse(
             content={
                 "result": {
                     "layoutParsingResults": layout_results,
@@ -646,7 +662,7 @@ async def health() -> dict:
 async def extract_text(
     file: UploadFile,
     authorization: str | None = Header(None, alias="Authorization"),
-) -> JSONResponse:
+) -> SafeJSONResponse:
     """Direct API: upload PDF/image, get structured text + blocks.
 
     Accepts: multipart/form-data with field 'file'
@@ -682,7 +698,7 @@ async def extract_text(
         # ── Text file detection: if not an image and looks like text, return as-is ──
         if not is_image and _is_text_content(file_bytes):
             content = file_bytes.decode("utf-8", errors="replace")
-            return JSONResponse(
+            return SafeJSONResponse(
                 content={
                     "filename": file.filename,
                     "pages": [
@@ -741,7 +757,7 @@ async def extract_text(
         _mark_model_used()
 
         full_text = "\n\n".join(p["text"] for p in pages if p["text"])
-        return JSONResponse(
+        return SafeJSONResponse(
             content={
                 "filename": file.filename,
                 "pages": result_pages,

@@ -42,6 +42,7 @@ from paddlex_helpers import (
     validate_paddlex_models,
     warmup_paddlex_models,
 )
+from serialization import json_default
 
 # ---------------------------------------------------------------------------
 # Configuration — all overridable via environment variables
@@ -238,21 +239,6 @@ def handle_docling(pdf_path: Path) -> bool:
     return True
 
 
-def _json_default(obj: object) -> object:
-    """json.dump default= fallback: convert numpy types to Python equivalents.
-
-    Handles numpy arrays/scalars (via .tolist()) and other objects that expose
-    an .item(). Safety net for the sidecar JSON — the primary fix converts
-    values at the source in paddlex_helpers._process_structure_v3_pages, but
-    this catches any future numpy-typed field before it crashes the dump.
-    """
-    if hasattr(obj, "tolist"):
-        return obj.tolist()
-    if hasattr(obj, "item"):
-        return obj.item()
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-
-
 def _is_non_retryable_error(exc: Exception) -> bool:
     """Return True for deterministic errors a retry cannot fix.
 
@@ -307,7 +293,7 @@ def generate_native_sidecar(pdf_path: Path) -> bool:
         json_out = out_dir / f"{filename_stem}.json"
         with open(json_out, "w", encoding="utf-8") as wf:
             json.dump(
-                sidecar_json, wf, ensure_ascii=False, indent=2, default=_json_default
+                sidecar_json, wf, ensure_ascii=False, indent=2, default=json_default
             )
         log(f"  Native JSON written: {json_out}")
 

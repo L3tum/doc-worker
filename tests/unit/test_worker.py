@@ -129,8 +129,9 @@ class TestGenerateNativeSidecar:
     def test_sidecar_with_numpy_blocks(self):
         """Sidecar generation handles numpy-typed structured_blocks.
 
-        Exercises the _json_default safety net: even if a numpy type leaks past
-        the source-level fix, json.dump(default=...) must not crash.
+        Exercises the json_default safety net (serialization.json_default):
+        even if a numpy type leaks past the source-level fix,
+        json.dump(default=...) must not crash.
         """
         import numpy as np
 

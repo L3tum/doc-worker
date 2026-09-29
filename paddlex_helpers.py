@@ -9,6 +9,7 @@ and semantic markdown building — all based on PaddleX 3.0 pipelines.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import subprocess
@@ -1040,14 +1041,56 @@ def _get_paddlex_structure_v3_model() -> Any:
 
 
 def _jsonable(value: Any) -> Any:
-    """Convert numpy arrays/scalars to JSON-serializable Python types.
+    """Recursively convert numpy arrays/scalars to JSON-serializable Python types.
 
-    Calls .tolist() when available (ndarray, numpy scalar); otherwise returns
-    the value unchanged. Safe for plain Python types (str, int, float, list).
+    Handles:
+      - ndarray / numpy scalar (has .tolist) → plain Python value(s)
+      - list/tuple/set of mixed values (e.g., PaddleX ``block_bbox`` arrives
+        as a *list* of np.float32 scalars) → plain list, converted recursively
+      - dict → plain dict with values converted (keys are PaddleX strings)
+      - plain Python types (str, int, float, bool, None) → unchanged
+
+    Anything else is returned unchanged; the server's SafeJSONResponse and the
+    worker's json.dump(default=...) are the last line of defense for types
+    this function does not recognize.
     """
     if hasattr(value, "tolist"):
         return value.tolist()
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "item"):
+        return value.item()
     return value
+
+
+def _finite_confidence(value: Any, fallback: float = 0.0) -> float:
+    """Coerce a model score to a finite float; None/NaN/Inf -> fallback.
+
+    PaddleX scores arrive as numpy float32; a degenerate (non-finite)
+    score would otherwise poison the JSON response — server responses
+    serialize with allow_nan=False, so a NaN confidence would 500 the
+    whole multi-page request instead of degrading one block's score.
+    None is accepted because PaddleX emits null for absent fields.
+    """
+    if value is None:
+        return fallback
+    v = float(value)
+    return v if math.isfinite(v) else fallback
+
+
+def _nullsafe(value: Any, default: Any) -> Any:
+    """Return ``value`` unless it is None, else ``default``.
+
+    PaddleX emits null for absent fields, which ``dict.get(k, default)``
+    does not catch. An explicit None check (not ``value or default``) is
+    required: multi-element ndarrays raise ValueError on truth-value
+    evaluation, and the model result fields fed through here can be arrays.
+    """
+    return default if value is None else value
 
 
 # ── OCR extraction (backward compatible) ─────────────────────────────────
@@ -1073,21 +1116,18 @@ def run_paddleocr(file_path: str) -> list[dict]:
             f"Expected list or tuple from model.predict, got {type(result).__name__}"
         )
 
-    def _jsonable(value: Any) -> Any:
-        if hasattr(value, "tolist"):
-            return value.tolist()
-        return value
-
     pages: list[dict] = []
     for page_idx, page_result in enumerate(result):
         if not page_result:
             pages.append({"page": page_idx + 1, "text": "", "blocks": []})
             continue
 
-        rec_texts = page_result.get("rec_texts", [])
-        rec_scores = page_result.get("rec_scores", [])
-        rec_boxes = page_result.get("rec_boxes", [])
-        rec_polys = page_result.get("rec_polys", page_result.get("dt_polys", []))
+        rec_texts = _nullsafe(page_result.get("rec_texts"), [])
+        rec_scores = _nullsafe(page_result.get("rec_scores"), [])
+        rec_boxes = _nullsafe(page_result.get("rec_boxes"), [])
+        rec_polys = page_result.get("rec_polys")
+        if rec_polys is None:
+            rec_polys = _nullsafe(page_result.get("dt_polys"), [])
 
         blocks: list[dict] = []
         text_parts: list[str] = []
@@ -1095,7 +1135,9 @@ def run_paddleocr(file_path: str) -> list[dict]:
             if not str(text).strip():
                 continue
 
-            confidence = float(rec_scores[idx]) if idx < len(rec_scores) else 0.0
+            confidence = (
+                _finite_confidence(rec_scores[idx]) if idx < len(rec_scores) else 0.0
+            )
             bbox = rec_boxes[idx] if idx < len(rec_boxes) else None
             if bbox is None and idx < len(rec_polys):
                 bbox = rec_polys[idx]
@@ -1174,11 +1216,11 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
         page_result: dict[str, Any] = next(iter(model.predict(img_path)), {})
 
         # Extract flat text/blocks from the overall OCR result
-        overall = page_result.get("overall_ocr_res", {})
-        rec_texts = overall.get("rec_texts", [])
-        rec_scores = overall.get("rec_scores", [])
-        rec_boxes = overall.get("rec_boxes", [])
-        rec_polys = overall.get("rec_polys", [])
+        overall = page_result.get("overall_ocr_res") or {}
+        rec_texts = _nullsafe(overall.get("rec_texts"), [])
+        rec_scores = _nullsafe(overall.get("rec_scores"), [])
+        rec_boxes = _nullsafe(overall.get("rec_boxes"), [])
+        rec_polys = _nullsafe(overall.get("rec_polys"), [])
 
         blocks: list[dict] = []
         text_parts: list[str] = []
@@ -1186,15 +1228,16 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
             if not str(text).strip():
                 continue
 
-            confidence = float(rec_scores[idx]) if idx < len(rec_scores) else 0.0
+            confidence = (
+                _finite_confidence(rec_scores[idx]) if idx < len(rec_scores) else 0.0
+            )
             bbox = rec_boxes[idx] if idx < len(rec_boxes) else None
             if bbox is None and idx < len(rec_polys):
                 bbox = rec_polys[idx]
 
-            # Safely convert bbox to list (avoiding mypy errors)
-            safe_bbox = (
-                bbox.tolist() if hasattr(bbox, "tolist") and bbox is not None else bbox
-            )
+            # Recursively convert bbox to plain Python values (ndarray or
+            # list of numpy scalars — see _jsonable)
+            safe_bbox = _jsonable(bbox)
 
             blocks.append(
                 {
@@ -1205,24 +1248,32 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
             )
             text_parts.append(str(text))
 
-        # Extract structured blocks from parsing_res_list
         # Build confidence lookup: index layout_det_res boxes by label (O(1) per block)
         layout_confidence: dict[str, float] = {}
-        for layout_box in page_result.get("layout_det_res", {}).get("boxes", []):
+        for layout_box in (page_result.get("layout_det_res") or {}).get("boxes", []):
             label = layout_box.get("label")
             if label and label not in layout_confidence:
                 # float(): PaddleX layout scores arrive as numpy float32; the
                 # sidecar JSON (worker.py) and server.py /layout-parsing must
-                # serialize plain Python floats.
-                layout_confidence[label] = float(layout_box.get("score", 0.0))
+                # serialize plain Python floats. _finite_confidence() also
+                # absorbs null scores (PaddleX emits null for absent fields).
+                layout_confidence[label] = _finite_confidence(layout_box.get("score"))
 
+        # Extract structured blocks from parsing_res_list — `or []`: PaddleX
+        # can emit null here (same null-emission class as the sibling fields
+        # above); .get(..., []) only protects a missing key, not a null value.
         structured_blocks: list[dict] = []
-        for block in page_result.get("parsing_res_list", []):
+        for block in page_result.get("parsing_res_list") or []:
+            if not isinstance(block, dict):
+                continue
             block_label = block.get("block_label", "unknown")
             block_content = block.get("block_content", "")
             # _jsonable(): block_bbox can be an ndarray (or list of numpy
             # floats); convert to a plain list for JSON serialization.
-            block_bbox = _jsonable(block.get("block_bbox", [0, 0, 0, 0]))
+            # Explicit None check (NOT `or []`): a multi-element ndarray
+            # raises ValueError on truth-value evaluation.
+            raw_bbox = block.get("block_bbox")
+            block_bbox = _jsonable(raw_bbox if raw_bbox is not None else [0, 0, 0, 0])
             confidence = layout_confidence.get(block_label, 0.0)
 
             structured_blocks.append(
@@ -1230,7 +1281,8 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
                     "type": block_label,
                     "bbox": block_bbox,
                     "text": str(block_content),
-                    # float(): round() on a numpy float32 returns float32
+                    # layout_confidence values are finite floats (see
+                    # _finite_confidence); round() keeps the JSON clean.
                     "confidence": round(float(confidence), 4),
                 }
             )
