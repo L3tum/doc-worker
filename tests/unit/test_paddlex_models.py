@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-# Import from paddlex_helpers directly (paddleocr_helpers is a shim)
+# Import from paddlex_helpers directly
 from paddlex_helpers import (
     DOC_ORIENTATION_MODEL,
     LAYOUT_DETECTION_MODEL,

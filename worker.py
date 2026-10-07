@@ -325,11 +325,9 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
     Uses the local ocrmypdf_paddleocr plugin which implements the OcrEngine
     interface with the bundled local PP-OCRv6 model directories.
     """
-    import time as _time
-
     file_size = input_pdf.stat().st_size
     log(f"  OCR start: {input_pdf.name} ({file_size:,} bytes)")
-    start_time = _time.time()
+    start_time = time.time()
 
     try:
         import ocrmypdf
@@ -364,7 +362,7 @@ def run_ocrmypdf(input_pdf: Path, output_pdf: Path) -> None:
     # finishes.
     _mark_model_used()
 
-    elapsed = _time.time() - start_time
+    elapsed = time.time() - start_time
     output_size = output_pdf.stat().st_size
     log(f"  OCR finished: {elapsed:.1f}s, output {output_size:,} bytes")
 

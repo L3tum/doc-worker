@@ -58,7 +58,6 @@ jobs:
               - 'ocrmypdf_paddleocr/**'
               - 'worker.py'
               - 'server.py'
-              - 'paddleocr_helpers.py'
               - 'Dockerfile'
               - 'requirements.txt'
               - 'tests/e2e/**'
