@@ -8,6 +8,7 @@ and semantic markdown building — all based on PaddleX 3.0 pipelines.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import os
@@ -379,6 +380,21 @@ def validate_paddlex_models() -> None:
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "1")
 
 _PADDLEX_PATCHED = False
+# Sticky word-segmentation patch state: "unpatched" / "applied" / "skipped".
+# "applied" and "skipped" short-circuit later calls (no re-running
+# inspect.getsource per pipeline creation); an ImportError leaves the state
+# "unpatched" so the next call retries (fail-soft, non-sticky).
+#
+# REMOVAL CONTRACT: when upstream PaddleX lands the Unicode word-
+# segmentation fix (PaddleX#5188), bump the pinned PaddleX range and delete
+# _patched_get_word_info + _patch_paddlex_word_segmentation and their call
+# sites (including this state constant).
+_PADDLEX_WORD_SEGMENTATION_STATE: str = "unpatched"
+
+# Precompiled Unicode word-character classifier for _patched_get_word_info.
+# A str pattern is Unicode by default in py3, so this is semantically
+# identical to re.search(r"\w", char) — precompiled purely for speed.
+_WORD_CHAR_RE = re.compile(r"\w")
 
 
 class _LocalModelResolver:
@@ -555,6 +571,199 @@ def _patch_paddlex_official_models() -> None:
     )
 
 
+def _patched_get_word_info(
+    self: Any, text: str, selection: Any
+) -> tuple[list[list[str]], list[list[int]], list[str]]:
+    """Patched copy of ``BaseRecLabelDecode.get_word_info`` (PaddleX 3.x).
+
+    Verbatim except two deliberate deltas: the Unicode ``\\w`` word-
+    character classifier (minus ``_``) and the precompiled module-level
+    ``_WORD_CHAR_RE`` it uses.  Installed by
+    ``_patch_paddlex_word_segmentation()`` — see that docstring for the
+    bug, the shape gate and the fail-soft state semantics (PaddleX#5188).
+    """
+    import numpy as np  # local import: keeps this module stdlib-only at import time
+
+    state: str | None = None
+    word_content: list[str] = []
+    word_col_content: list[int] = []
+    word_list: list[list[str]] = []
+    word_col_list: list[list[int]] = []
+    state_list: list[str] = []
+    valid_col = np.where(selection == True)[0]
+
+    for c_i, char in enumerate(text):
+        if "\u4e00" <= char <= "\u9fff":
+            c_state = "cn"
+        elif bool(_WORD_CHAR_RE.search(char)) and char != "_":
+            c_state = "en&num"
+        else:
+            c_state = "symbol"
+
+        if (
+            char == "."
+            and state == "en&num"
+            and c_i + 1 < len(text)
+            and bool(re.search("[0-9]", text[c_i + 1]))
+        ):
+            c_state = "en&num"
+        if char == "-" and state == "en&num":
+            c_state = "en&num"
+
+        if state is None:
+            state = c_state
+
+        if state != c_state:
+            if len(word_content) != 0:
+                word_list.append(word_content)
+                word_col_list.append(word_col_content)
+                state_list.append(state)
+                word_content = []
+                word_col_content = []
+            state = c_state
+
+        word_content.append(char)
+        word_col_content.append(int(valid_col[c_i]))
+
+    if len(word_content) != 0:
+        assert state is not None
+        word_list.append(word_content)
+        word_col_list.append(word_col_content)
+        state_list.append(state)
+
+    return word_list, word_col_list, state_list
+
+
+def _patch_paddlex_word_segmentation() -> None:
+    """Patch PaddleX word segmentation to treat umlauts as word characters.
+
+    PaddleX 3.x segments OCR lines into words with an ASCII-only
+    classification (``bool(re.search("[a-zA-Z0-9]", char))``) in
+    ``BaseRecLabelDecode.get_word_info`` (paddlex/inference/models/
+    text_recognition/processors.py).  Every umlaut / ``ß`` therefore becomes
+    its own one-character "symbol" word with its own box, and the OCRed PDF
+    text layer gains a spurious space around each of them ("Ä pfel",
+    "B ü rger").
+
+    Installs ``_patched_get_word_info`` — a verbatim copy of the PaddleX
+    3.x method (3.2.0–3.7.2) onto ``BaseRecLabelDecode``, except two
+    deliberate deltas: (a) the word-character classification line changed
+    from the ASCII-only ``[a-zA-Z0-9]`` regex to a Unicode ``\\w`` test
+    (excluding ``_``) — identical semantics, since str patterns are
+    Unicode by default in py3 — and (b) that check now uses the
+    precompiled module-level ``_WORD_CHAR_RE`` instead of a per-character
+    ``re.search`` (pure performance, no semantic change).  The copy also
+    carries an ``assert state is not None`` before the final append
+    (provably dead — state is set on the first loop iteration — but kept
+    to aid type narrowing).  Note: NFD-decomposed input (base character
+    + combining mark) can still be split, because the classifier treats
+    combining marks as symbols.
+
+    The PaddleOCR-main fix (ppocr/postprocess/rec_postprocess.py)
+    additionally preserves apostrophes (e.g. ``n'êtes`` stays one word);
+    this copy does NOT port that — behavior matches PaddleX upstream today,
+    and porting the apostrophe handling is a future option.
+
+    Version-tolerant and fail-soft (mirrors ``_patch_paddlex_official_models``):
+    - lazy import; ImportError tolerated (no PaddleX → no-op; state stays
+      "unpatched" so the next call retries — the only non-sticky outcome);
+      any OTHER exception during that import (e.g. OSError from a broken
+      native .so in the import chain) is latched "skipped" with a WARNING,
+      so a broken PaddleX install can never make `import paddlex_helpers`
+      or pipeline creation raise
+    - dual shape gate: the original source must contain BOTH the literal
+      ``"[a-zA-Z0-9]"`` AND the return-shape text
+      ``word_list, word_col_list, state_list`` (the shape the patched copy
+      returns). Missing either → state "skipped" with a WARNING naming the
+      PaddleX version — never shadow a method whose shape changed.
+    - "applied" / "skipped" are sticky: later calls short-circuit without
+      re-running ``inspect.getsource``. Any other failure (e.g. a
+      source-stripped install where getsource raises) also latches
+      "skipped" with a WARNING — worst case = today's behavior, never
+      breaks a job.
+
+    See: PaddleX#5188
+    """
+    global _PADDLEX_WORD_SEGMENTATION_STATE
+
+    if _PADDLEX_WORD_SEGMENTATION_STATE != "unpatched":
+        return  # already "applied" or "skipped" — idempotent, no re-inspection
+
+    try:
+        from paddlex.inference.models.text_recognition import (
+            processors as _procs_module,
+        )
+    except ImportError:
+        # PaddleX may not be installed (e.g. test env without paddlex).
+        # State stays "unpatched" on purpose so the next call retries.
+        return
+    except Exception as e:
+        # A broken PaddleX install (e.g. OSError from a broken native .so
+        # somewhere in the import chain) must never make
+        # `import paddlex_helpers` or pipeline creation raise — fail soft
+        # AND sticky, like the gate failures below.
+        _PADDLEX_WORD_SEGMENTATION_STATE = "skipped"
+        logger.warning(
+            "Failed to import PaddleX word segmentation module — "
+            'latching state "skipped": %s',
+            e,
+        )
+
+    try:
+        try:
+            import paddlex as _paddlex_module
+
+            version = getattr(_paddlex_module, "__version__", "unknown")
+        except ImportError:
+            # PaddleX not importable (e.g. fake-modules-only test env) —
+            # proceed without a version string for the log lines below.
+            version = "unknown"
+
+        cls = _procs_module.BaseRecLabelDecode
+        source = inspect.getsource(cls.get_word_info)
+        # Re-check gate + copied body when PaddleX is upgraded (PaddleX#5188).
+        if '"[a-zA-Z0-9]"' not in source:
+            logger.warning(
+                "paddlex %s BaseRecLabelDecode.get_word_info no longer uses "
+                "the ASCII-only word-character classifier — word segmentation "
+                "patch skipped (upstream already fixed or changed it). "
+                "Re-check the gate and the copied _patched_get_word_info body "
+                "when PaddleX is upgraded (PaddleX#5188).",
+                version,
+            )
+            _PADDLEX_WORD_SEGMENTATION_STATE = "skipped"
+            return
+        if "word_list, word_col_list, state_list" not in source:
+            logger.warning(
+                "paddlex %s BaseRecLabelDecode.get_word_info still contains "
+                "the ASCII classifier literal but no longer returns "
+                "'word_list, word_col_list, state_list' — word segmentation "
+                "patch skipped (return shape changed; not shadowing a "
+                "changed method).",
+                version,
+            )
+            _PADDLEX_WORD_SEGMENTATION_STATE = "skipped"
+            return
+
+        cls.get_word_info = _patched_get_word_info
+        _PADDLEX_WORD_SEGMENTATION_STATE = "applied"
+        logger.info(
+            "paddlex %s BaseRecLabelDecode.get_word_info patched for Unicode "
+            "word segmentation (PaddleX#5188)",
+            version,
+        )
+    except Exception as e:
+        # Fail-soft AND sticky: without the latch, a source-stripped
+        # PaddleX install (getsource failure) would re-warn on every
+        # pipeline creation. The outer ImportError path above
+        # intentionally stays non-sticky (retry next call).
+        _PADDLEX_WORD_SEGMENTATION_STATE = "skipped"
+        logger.warning(
+            'Failed to patch PaddleX word segmentation — latching state "skipped": %s',
+            e,
+        )
+
+
 def _ensure_paddlex_cache_home() -> None:
     """Set PADDLE_PDX_CACHE_HOME to a writable directory before PaddleX import."""
     configured_cache = Path(
@@ -573,15 +782,18 @@ def _ensure_paddlex_cache_home() -> None:
 def _ensure_paddlex_offline_compat() -> None:
     """Ensure PaddleX is ready for offline / air-gapped operation.
 
-    Calls ``_ensure_paddlex_cache_home()`` and then monkey-patches PaddleX's
+    After calling ``_ensure_paddlex_cache_home()``, monkey-patches PaddleX's
     ``official_models`` registry so that model lookups resolve to our
     pre-bundled local directories instead of trying to download from the
-    hosting platforms.
+    hosting platforms, and patches the word-segmentation classifier so that
+    umlauts / ``ß`` stay inside their word (see
+    ``_patch_paddlex_word_segmentation``).
 
     This must be called before any ``create_pipeline()`` invocation.
     """
     _ensure_paddlex_cache_home()
     _patch_paddlex_official_models()
+    _patch_paddlex_word_segmentation()
 
 
 def _is_permanent_model_init_error(exc: Exception) -> bool:
@@ -1543,6 +1755,7 @@ def blocks_to_markdown(structured_blocks: list[dict]) -> str:
 
 
 # ── Eager patching at import time ──────────────────────────────────────
-# Apply the monkey-patch immediately so it covers ALL PaddleX internal
+# Apply the monkey-patches immediately so they cover ALL PaddleX internal
 # code paths, including those triggered during import.
 _patch_paddlex_official_models()
+_patch_paddlex_word_segmentation()

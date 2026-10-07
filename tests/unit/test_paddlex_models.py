@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 import types
@@ -8,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 # Import from paddlex_helpers directly (paddleocr_helpers is a shim)
@@ -56,9 +58,29 @@ def _reset_paddlex_singleton():
             if hasattr(obj, attr):
                 delattr(obj, attr)
 
-    # Reset the patch flag so patch tests can apply cleanly
+    # Reset the patch flags so patch tests can apply cleanly
     original_patched = paddlex_helpers._PADDLEX_PATCHED
     paddlex_helpers._PADDLEX_PATCHED = False
+    original_word_seg_state = paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE
+    paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE = "unpatched"
+
+    # Snapshot whatever get_word_info is currently installed on the real
+    # class (patched or not — in CI the import-time eager patch ran first,
+    # so the saved value may already be the patched method) and restore it
+    # after the test, so no test can leave the class attribute in a state
+    # different from its pre-test value. (Dev env without PaddleX:
+    # ImportError, nothing to save.)
+    real_cls = None
+    real_get_word_info = None
+    try:
+        from paddlex.inference.models.text_recognition.processors import (
+            BaseRecLabelDecode as _real_cls,
+        )
+
+        real_cls = _real_cls
+        real_get_word_info = real_cls.get_word_info
+    except ImportError:
+        pass
 
     # Remove cached PaddleX submodules so test monkeypatches take effect.
     # Keep the top-level "paddlex" key — tests may or may not replace it.
@@ -75,8 +97,13 @@ def _reset_paddlex_singleton():
     # Restore saved submodules
     sys.modules.update(_saved_paddlex_modules)
 
-    # Restore the patch flag after test (in case of leaks)
+    # Restore the patch flags after test (in case of leaks)
     paddlex_helpers._PADDLEX_PATCHED = original_patched
+    paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE = original_word_seg_state
+
+    # Restore the real class's original method (CI only, see setup above).
+    if real_cls is not None:
+        real_cls.get_word_info = real_get_word_info
 
     # Also clear after test in case of leaks
     for obj in (
@@ -110,6 +137,157 @@ class _MockOfficialModels:
 
     def __contains__(self, name: object) -> bool:
         return False
+
+
+def _fake_get_word_info_pre_fix(self, text, selection):
+    """Pre-fix PaddleX 3.x word segmentation (ASCII-only classifier),
+    verbatim body from PaddleX 3.7.2.  Defined in this file so
+    ``inspect.getsource()`` sees the ``"[a-zA-Z0-9]"`` literal the shape
+    gate looks for.
+    """
+    state = None
+    word_content = []
+    word_col_content = []
+    word_list = []
+    word_col_list = []
+    state_list = []
+    valid_col = np.where(selection == True)[0]
+
+    for c_i, char in enumerate(text):
+        if "\u4e00" <= char <= "\u9fff":
+            c_state = "cn"
+        elif bool(re.search("[a-zA-Z0-9]", char)):
+            c_state = "en&num"
+        else:
+            c_state = "symbol"
+
+        if (
+            char == "."
+            and state == "en&num"
+            and c_i + 1 < len(text)
+            and bool(re.search("[0-9]", text[c_i + 1]))
+        ):
+            c_state = "en&num"
+        if char == "-" and state == "en&num":
+            c_state = "en&num"
+
+        if state is None:
+            state = c_state
+
+        if state != c_state:
+            if len(word_content) != 0:
+                word_list.append(word_content)
+                word_col_list.append(word_col_content)
+                state_list.append(state)
+                word_content = []
+                word_col_content = []
+            state = c_state
+
+        word_content.append(char)
+        word_col_content.append(int(valid_col[c_i]))
+
+    if len(word_content) != 0:
+        word_list.append(word_content)
+        word_col_list.append(word_col_content)
+        state_list.append(state)
+
+    return word_list, word_col_list, state_list
+
+
+def _fake_get_word_info_shape_changed(self, text, selection):
+    """PaddleX variant: ASCII classifier kept but return shape changed to a 2-tuple.
+
+    Source still contains the literal "[a-zA-Z0-9]" (so the first gate
+    passes) but returns (word_list, word_col_list) — no state_list.
+    """
+    word_list: list[list[str]] = []
+    word_col_list: list[list[int]] = []
+    word_content: list[str] = []
+    word_col_content: list[int] = []
+    for c_i, char in enumerate(text):
+        if bool(re.search("[a-zA-Z0-9]", char)):
+            word_content.append(char)
+            word_col_content.append(c_i)
+        elif word_content:
+            word_list.append(word_content)
+            word_col_list.append(word_col_content)
+            word_content = []
+            word_col_content = []
+    if word_content:
+        word_list.append(word_content)
+        word_col_list.append(word_col_content)
+    return word_list, word_col_list
+
+
+def _fake_get_word_info_upstream_fixed(self, text, selection):
+    """Upstream-fixed variant (no ASCII literal in this source) — simulates
+    a future PaddleX 3.x that ships the fix, for the shape-gate skip path.
+    """
+    del text, selection
+    return [], [], []
+
+
+def _make_fake_rec_label_decode_cls(get_word_info_fn):
+    """Create a fresh ``BaseRecLabelDecode``-like class per test.
+
+    The patch assigns onto the class attribute, so each test needs its own
+    class object — a shared module-level class would leak the patch between
+    tests.  Source discovery is per-function, so sharing the module-level
+    ``get_word_info`` implementations is fine for ``inspect.getsource()``.
+    """
+    return type("BaseRecLabelDecode", (), {"get_word_info": get_word_info_fn})
+
+
+def _install_fake_word_seg_modules(monkeypatch, cls):
+    """Install a fake ``paddlex.inference.models.text_recognition`` package and
+    its ``processors`` submodule into ``sys.modules`` carrying ``cls`` as
+    ``BaseRecLabelDecode`` — mirrors the TestPaddlexOfficialModelsPatch
+    fake-module pattern (both parent and submodule so the import works).
+    """
+    procs_module = types.ModuleType(
+        "paddlex.inference.models.text_recognition.processors"
+    )
+    procs_module.BaseRecLabelDecode = cls
+    pkg_module = types.ModuleType("paddlex.inference.models.text_recognition")
+    pkg_module.processors = procs_module
+
+    monkeypatch.setitem(
+        sys.modules, "paddlex.inference.models.text_recognition", pkg_module
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "paddlex.inference.models.text_recognition.processors",
+        procs_module,
+    )
+
+
+def _install_fake_offline_compat_modules(monkeypatch) -> None:
+    """Install fake paddlex + paddlex.inference.utils(.official_models)
+    modules so ``_ensure_paddlex_offline_compat()`` runs its model-patch
+    steps without touching real PaddleX in either environment (no-PaddleX
+    unit env or PaddleX-installed CI).
+
+    Same fake-module pattern as TestPaddlexOfficialModelsPatch: the
+    from-import resolves straight from the sys.modules hit on the dotted
+    target, so no real paddlex parent package is ever imported.  The
+    fake top-level ``paddlex`` package (``__path__ = []``) keeps the
+    ``from paddlex import inference`` fallback in
+    ``_patch_paddlex_official_models`` off real PaddleX in CI.
+    """
+    mock_obj = _MockOfficialModels()
+    mock_utils = types.ModuleType("paddlex.inference.utils")
+    mock_om_module = types.ModuleType("paddlex.inference.utils.official_models")
+    mock_om_module.official_models = mock_obj
+    mock_utils.official_models = mock_om_module
+
+    fake_paddlex = types.ModuleType("paddlex")
+    fake_paddlex.__path__ = []  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "paddlex", fake_paddlex)
+    monkeypatch.setitem(sys.modules, "paddlex.inference.utils", mock_utils)
+    monkeypatch.setitem(
+        sys.modules, "paddlex.inference.utils.official_models", mock_om_module
+    )
 
 
 def _write_model(
@@ -1094,6 +1272,386 @@ class TestPaddlexOfficialModelsPatch:
                 sys.modules["paddlex.inference.utils"] = saved_utils
             else:
                 sys.modules.pop("paddlex.inference.utils", None)
+
+
+# ── Monkey-patch: word segmentation for umlauts (PaddleX#5188) ───────────
+
+
+class TestPaddlexWordSegmentationPatch:
+    """Tests for _patch_paddlex_word_segmentation() — umlaut word segmentation."""
+
+    @pytest.fixture()
+    def patched_decoder(self, monkeypatch):
+        """Patched BaseRecLabelDecode instance (standard setup).
+
+        Fresh fake class + fake paddlex word-seg modules + applied patch.
+        """
+        import paddlex_helpers
+
+        cls = _make_fake_rec_label_decode_cls(_fake_get_word_info_pre_fix)
+        _install_fake_word_seg_modules(monkeypatch, cls)
+        paddlex_helpers._patch_paddlex_word_segmentation()
+        return cls()
+
+    def test_patch_applies_when_ascii_classifier_present(self, monkeypatch):
+        """ASCII literal in source → method replaced and state "applied"."""
+        import paddlex_helpers
+
+        cls = _make_fake_rec_label_decode_cls(_fake_get_word_info_pre_fix)
+        _install_fake_word_seg_modules(monkeypatch, cls)
+
+        paddlex_helpers._patch_paddlex_word_segmentation()
+
+        assert paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE == "applied"
+        assert cls.get_word_info is paddlex_helpers._patched_get_word_info
+
+    def test_patch_skipped_when_upstream_fixed(self, monkeypatch, caplog):
+        """No ASCII literal in source (future upstream fix) → skip, no raise."""
+        import paddlex_helpers
+
+        cls = _make_fake_rec_label_decode_cls(_fake_get_word_info_upstream_fixed)
+        _install_fake_word_seg_modules(monkeypatch, cls)
+
+        with caplog.at_level(logging.WARNING, logger="doc-worker.paddlex_helpers"):
+            paddlex_helpers._patch_paddlex_word_segmentation()
+
+        assert paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE == "skipped"
+        assert cls.get_word_info is not paddlex_helpers._patched_get_word_info
+        assert "word segmentation" in caplog.text
+
+    def test_patch_skipped_when_return_shape_changed(self, monkeypatch, caplog):
+        """ASCII literal present but 2-tuple return → skip (shape changed)."""
+        import paddlex_helpers
+
+        cls = _make_fake_rec_label_decode_cls(_fake_get_word_info_shape_changed)
+        _install_fake_word_seg_modules(monkeypatch, cls)
+
+        with caplog.at_level(logging.WARNING, logger="doc-worker.paddlex_helpers"):
+            paddlex_helpers._patch_paddlex_word_segmentation()
+
+        assert paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE == "skipped"
+        assert cls.get_word_info is not paddlex_helpers._patched_get_word_info
+        assert "return shape changed" in caplog.text
+
+    def test_patch_is_idempotent(self, monkeypatch):
+        """Repeated calls do not re-apply or break anything."""
+        import paddlex_helpers
+
+        cls = _make_fake_rec_label_decode_cls(_fake_get_word_info_pre_fix)
+        _install_fake_word_seg_modules(monkeypatch, cls)
+
+        paddlex_helpers._patch_paddlex_word_segmentation()
+        paddlex_helpers._patch_paddlex_word_segmentation()
+        paddlex_helpers._patch_paddlex_word_segmentation()
+
+        assert paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE == "applied"
+        assert cls.get_word_info is paddlex_helpers._patched_get_word_info
+
+    def test_patch_handles_import_error(self, monkeypatch):
+        """Patch is a no-op (no raise) when the processors module is missing.
+
+        The fake text_recognition parent package has no ``__path__`` and no
+        ``processors`` attribute, so the lazy from-import fails with
+        ModuleNotFoundError in BOTH environments (no PaddleX → 'paddlex'
+        itself missing; PaddleX installed → parent is not a package). It
+        deliberately does NOT re-import the real processors module.
+        """
+        import paddlex_helpers
+
+        monkeypatch.setattr(
+            paddlex_helpers, "_PADDLEX_WORD_SEGMENTATION_STATE", "unpatched"
+        )
+
+        fake_pkg = types.ModuleType("paddlex.inference.models.text_recognition")
+        monkeypatch.setitem(
+            sys.modules, "paddlex.inference.models.text_recognition", fake_pkg
+        )
+
+        # Must not raise in either environment
+        paddlex_helpers._patch_paddlex_word_segmentation()
+
+        assert paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE == "unpatched"
+
+    def test_patch_latches_skipped_when_getsource_fails(self, monkeypatch, caplog):
+        """Generic-except path (getsource failure) latches "skipped" (sticky).
+
+        Simulates a source-stripped PaddleX install by making
+        inspect.getsource raise; the patch call must not propagate,
+        must not replace the method, and must latch the state so the
+        warning does not repeat on every pipeline creation.
+        """
+        import paddlex_helpers
+
+        cls = _make_fake_rec_label_decode_cls(_fake_get_word_info_pre_fix)
+        _install_fake_word_seg_modules(monkeypatch, cls)
+
+        def _getsource_raises(*_args: Any, **_kwargs: Any) -> Any:
+            raise OSError("simulated source-stripped install")
+
+        monkeypatch.setattr(paddlex_helpers.inspect, "getsource", _getsource_raises)
+
+        with caplog.at_level(logging.WARNING, logger="doc-worker.paddlex_helpers"):
+            paddlex_helpers._patch_paddlex_word_segmentation()
+
+        assert paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE == "skipped"
+        assert cls.get_word_info is not paddlex_helpers._patched_get_word_info
+        assert "Failed to patch PaddleX word segmentation" in caplog.text
+
+    def test_patch_latches_skipped_when_import_fails_with_oserror(
+        self, monkeypatch, caplog
+    ):
+        """Non-ImportError import failure (broken PaddleX install) latches
+        "skipped" (sticky) instead of propagating.
+
+        Simulates an OSError raised while the import machinery resolves
+        the processors module (e.g. a broken native .so in the import
+        chain): a fake leaf module whose module-level ``__getattr__``
+        raises OSError for the "processors" attribute.  The lazy
+        from-import in the guard propagates the OSError out of the
+        import statement, which must be caught (logged + latched) so a
+        broken PaddleX install can never make `import paddlex_helpers`
+        or pipeline creation raise.
+        """
+        import paddlex_helpers
+
+        monkeypatch.setattr(
+            paddlex_helpers, "_PADDLEX_WORD_SEGMENTATION_STATE", "unpatched"
+        )
+
+        def _broken_getattr(name: str) -> Any:
+            if name == "processors":
+                raise OSError("simulated broken native .so in import chain")
+            raise AttributeError(name)
+
+        cls = _make_fake_rec_label_decode_cls(_fake_get_word_info_pre_fix)
+        leaf = types.ModuleType("paddlex.inference.models.text_recognition")
+        leaf.BaseRecLabelDecode = cls  # type: ignore[attr-defined]
+        leaf.__getattr__ = _broken_getattr  # type: ignore[attr-defined]
+        monkeypatch.setitem(
+            sys.modules, "paddlex.inference.models.text_recognition", leaf
+        )
+
+        with caplog.at_level(logging.WARNING, logger="doc-worker.paddlex_helpers"):
+            paddlex_helpers._patch_paddlex_word_segmentation()
+
+        assert paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE == "skipped"
+        assert cls.get_word_info is not paddlex_helpers._patched_get_word_info
+        assert "Failed to import PaddleX word segmentation module" in caplog.text
+
+    def test_patched_umlauts_segment_as_single_words(self, patched_decoder):
+        """Äpfel / Bürger / Straße each segment as one en&num word."""
+        decoder = patched_decoder
+        for text in ("Äpfel", "Bürger", "Straße"):
+            words, cols, states = decoder.get_word_info(
+                text, np.ones(len(text), dtype=bool)
+            )
+            assert words == [list(text)]
+            assert states == ["en&num"]
+            assert cols == [list(range(len(text)))]
+
+    def test_patched_underscore_stays_symbol(self, patched_decoder):
+        """'_' is excluded from word chars: "snake_case" → snake / _ / case."""
+        decoder = patched_decoder
+        words, _, states = decoder.get_word_info(
+            "snake_case", np.ones(len("snake_case"), dtype=bool)
+        )
+        assert words == [list("snake"), ["_"], list("case")]
+        assert states == ["en&num", "symbol", "en&num"]
+
+    def test_patched_cjk_segments_unchanged(self, patched_decoder):
+        """CJK lines still segment as cn words (branch untouched by the patch)."""
+        decoder = patched_decoder
+        words, _, states = decoder.get_word_info("你好啊", np.ones(3, dtype=bool))
+        assert words == [list("你好啊")]
+        assert states == ["cn"]
+
+        words, _, states = decoder.get_word_info("你好abc", np.ones(5, dtype=bool))
+        assert words == [list("你好"), list("abc")]
+        assert states == ["cn", "en&num"]
+
+    def test_patched_digit_punctuation_unchanged(self, patched_decoder):
+        """1.5-2.3-style digit punctuation keeps its original segmentation."""
+        decoder = patched_decoder
+        words, _, states = decoder.get_word_info("1.5-2.3", np.ones(7, dtype=bool))
+        assert words == [list("1.5-2.3")]
+        assert states == ["en&num"]
+
+    def test_patched_return_tuple_shape(self, patched_decoder):
+        """(word_list, word_col_list, state_list) stays three parallel lists."""
+        decoder = patched_decoder
+        text = "hello world 123"
+        words, cols, states = decoder.get_word_info(
+            text, np.ones(len(text), dtype=bool)
+        )
+        assert len(words) == len(cols) == len(states) == 5
+        # "hello", " ", "world", " ", "123" (separators are symbol words)
+        assert states == [
+            "en&num",
+            "symbol",
+            "en&num",
+            "symbol",
+            "en&num",
+        ]
+        assert cols == [
+            [0, 1, 2, 3, 4],
+            [5],
+            [6, 7, 8, 9, 10],
+            [11],
+            [12, 13, 14],
+        ]
+
+    def test_patched_nfd_decomposed_umlaut_still_splits(self, patched_decoder):
+        """Known, accepted boundary: NFD-decomposed input still splits.
+
+        "a\\u0308pfel" is the NFD decomposition of "äpfel" (base char 'a'
+        + U+0308 COMBINING DIAERESIS + "pfel").  U+0308 is a combining
+        mark, not a word character, so Unicode ``\\w`` does not match it
+        and the classifier emits it as its own symbol word.  OCR output
+        is NFC in practice (so NFC umlauts stay single words) — this
+        pins the NFD limitation documented in
+        _patch_paddlex_word_segmentation's docstring.
+        """
+        decoder = patched_decoder
+        text = "a\u0308pfel"
+        words, cols, states = decoder.get_word_info(
+            text, np.ones(len(text), dtype=bool)
+        )
+        assert words == [list("a"), ["\u0308"], list("pfel")]
+        assert cols == [[0], [1], [2, 3, 4, 5]]
+        assert states == ["en&num", "symbol", "en&num"]
+
+    def test_patched_empty_input_returns_empty_lists(self, patched_decoder):
+        """Empty text + empty mask → ([], [], []) — no words, no crash."""
+        decoder = patched_decoder
+        words, cols, states = decoder.get_word_info("", np.zeros(0, dtype=bool))
+        assert words == []
+        assert cols == []
+        assert states == []
+
+    def test_patched_partial_selection_maps_to_original_columns(self, patched_decoder):
+        """word → original-column mapping under a partial (filtered) mask.
+
+        Semantics: ``text`` is the already-filtered string (valid chars
+        only); ``selection`` is a bool mask over the ORIGINAL longer string
+        (``valid_col = np.where(selection)[0]`` = original column indices);
+        each filtered position ``c_i`` records ``int(valid_col[c_i])`` —
+        the column of that character in the original line.
+
+        Input: text "ab" with mask [T, F, F, T] over a 4-column original
+        (original cols 1-2 invalid).  Both characters classify "en&num",
+        and consecutive same-state characters merge into one word, so
+        the result is the single word "ab" whose characters map to
+        original columns 0 and 3.
+        """
+        decoder = patched_decoder
+        words, cols, states = decoder.get_word_info(
+            "ab", np.array([True, False, False, True])
+        )
+        assert words == [list("ab")]
+        assert cols == [[0, 3]]
+        assert states == ["en&num"]
+
+    def test_ascii_line_output_identical_original_vs_patched(self, patched_decoder):
+        """Plain ASCII lines yield a byte-identical output tuple pre/post patch."""
+        # Raw pre-patch function (the class attribute gets replaced by the
+        # patch, so compare against the module-level implementation).
+        original_fn = _fake_get_word_info_pre_fix
+
+        decoder = patched_decoder
+        for text in ("hello world 123 VGG-16", "a-b 1.5-2.3 (test)", "   "):
+            selection = np.ones(len(text), dtype=bool)
+            original = original_fn(decoder, text, selection)
+            patched = decoder.get_word_info(text, selection)
+            assert original == patched
+
+
+# ── _ensure_paddlex_offline_compat wiring ───────────────────────────────
+
+
+class TestEnsurePaddlexOfflineCompat:
+    """Wiring: _ensure_paddlex_offline_compat() actually runs the patches."""
+
+    def test_ensure_offline_compat_invokes_word_segmentation_patch(
+        self, tmp_path, monkeypatch
+    ):
+        """_ensure_paddlex_offline_compat() invokes
+        _patch_paddlex_word_segmentation() (production wiring).
+
+        The fake paddlex.inference.utils(.official_models) modules keep
+        the official-models patch step off real PaddleX in both the
+        no-PaddleX unit env and a PaddleX-installed CI env.
+        """
+        import paddlex_helpers
+
+        monkeypatch.setattr(
+            paddlex_helpers, "_PADDLEX_WORD_SEGMENTATION_STATE", "unpatched"
+        )
+        monkeypatch.setattr(paddlex_helpers, "_PADDLEX_PATCHED", False)
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _install_fake_offline_compat_modules(monkeypatch)
+
+        calls: list[Any] = []
+
+        def _spy(*args: Any, **kwargs: Any) -> None:
+            calls.append((args, kwargs))
+
+        monkeypatch.setattr(paddlex_helpers, "_patch_paddlex_word_segmentation", _spy)
+
+        paddlex_helpers._ensure_paddlex_offline_compat()
+
+        assert len(calls) == 1
+
+    def test_ensure_offline_compat_applies_word_segmentation_patch(
+        self, tmp_path, monkeypatch
+    ):
+        """Unspied wiring: the real patch runs and latches "applied".
+
+        With the fake word-segmentation modules installed (pre-fix ASCII
+        classifier source), a plain production call ends with the patch
+        applied to the class and state "applied".
+        """
+        import paddlex_helpers
+
+        monkeypatch.setattr(
+            paddlex_helpers, "_PADDLEX_WORD_SEGMENTATION_STATE", "unpatched"
+        )
+        monkeypatch.setattr(paddlex_helpers, "_PADDLEX_PATCHED", False)
+        monkeypatch.setenv("PADDLE_PDX_CACHE_HOME", str(tmp_path / "paddlex-cache"))
+        _install_fake_offline_compat_modules(monkeypatch)
+
+        cls = _make_fake_rec_label_decode_cls(_fake_get_word_info_pre_fix)
+        _install_fake_word_seg_modules(monkeypatch, cls)
+
+        paddlex_helpers._ensure_paddlex_offline_compat()
+
+        assert paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE == "applied"
+        assert cls.get_word_info is paddlex_helpers._patched_get_word_info
+
+
+class TestE2eFixtureIntegrity:
+    """The umlaut e2e fixture must be the exact file the e2e gate validated."""
+
+    def test_german_umlaut_fixture_hash_and_decodes(self):
+        """sha256 pinned to the current committed fixture + PNG decodes.
+
+        Regeneration via tests/fixtures/generate_german_umlaut.py is not
+        byte-reproducible across machines (~/.fonts fallback), so a hash
+        change means the fixture was regenerated — re-pinning requires
+        re-running tests/e2e in CI (the e2e-ocr job) first.
+        """
+        import hashlib
+
+        fixture = Path(__file__).resolve().parents[1] / "fixtures" / "german_umlaut.png"
+        digest = hashlib.sha256(fixture.read_bytes()).hexdigest()
+        assert (
+            digest == "9c6b50573db023f54911723636d2e2097f663e1bcb88a4930aab0981fd2e9282"
+        )
+
+        pytest.importorskip("PIL")
+        from PIL import Image
+
+        with Image.open(fixture) as img:
+            img.verify()
 
 
 # ── Retry logic: permanent error detection ───────────────────────────────
