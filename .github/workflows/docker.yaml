@@ -48,21 +48,55 @@ jobs:
       ocr_related: ${{ steps.paths.outputs.ocr_related }}
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3.0.4 (tag v3, PGP-verified by GitHub)
-        id: paths
         with:
-          filters: |
-            ocr_related:
-              - 'paddlex_helpers.py'
-              - 'ocrmypdf_paddleocr/**'
-              - 'worker.py'
-              - 'server.py'
-              - 'Dockerfile'
-              - 'requirements.txt'
-              - 'tests/e2e/**'
-              - 'tests/fixtures/**'
-              - '.github/workflows/docker.yaml'
+          fetch-depth: 0  # full history so the diff base (pre-push SHA / PR base) resolves
+
+      # dorny/paths-filter is not mirrored on data.forgejo.org, so the path
+      # filter is implemented inline (plain git diff) — no third-party action
+      # needed, and the job runs identically on GitHub Actions and the
+      # Forgejo/act runner.
+      - name: Check for OCR-related changes
+        id: paths
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          # Changed files, depending on the triggering event.
+          if [ "$EVENT" = "pull_request" ] && [ -n "$BASE_REF" ] \
+             && git rev-parse --verify --quiet "origin/$BASE_REF" >/dev/null; then
+            base=$(git merge-base "origin/$BASE_REF" HEAD)
+            changed=$(git diff --name-only "$base" HEAD)
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            # New branch / first push: diff against the empty tree.
+            empty_tree=$(git mktree < /dev/null)
+            changed=$(git diff --name-only "$empty_tree" HEAD)
+          elif [ -n "$BEFORE_SHA" ] && git cat-file -e "$BEFORE_SHA" 2>/dev/null; then
+            changed=$(git diff --name-only "$BEFORE_SHA" HEAD)
+          elif git rev-parse --verify --quiet "HEAD~1" >/dev/null; then
+            changed=$(git diff --name-only "HEAD~1" HEAD)
+          else
+            changed=""
+          fi
+
+          echo "Changed files:"
+          printf '%s\n' "$changed"
+
+          # OCR-related paths (same list as the old dorny/paths-filter config).
+          related=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              paddlex_helpers.py|worker.py|server.py|Dockerfile|requirements.txt|.github/workflows/docker.yaml|ocrmypdf_paddleocr/*|tests/e2e/*|tests/fixtures/*)
+                related=true
+                ;;
+            esac
+          done <<< "$changed"
+
+          echo "ocr_related=$related" >> "$GITHUB_OUTPUT"
 
   e2e-ocr:
     name: E2E OCR (umlaut regression)
