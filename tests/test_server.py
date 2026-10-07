@@ -7,6 +7,7 @@ Tests /layout-parsing, /extract, and /health with mocked PaddleX pipelines.
 from __future__ import annotations
 
 import base64
+import os
 from unittest.mock import patch
 
 import pytest
@@ -83,10 +84,7 @@ class TestLayoutParsing:
                 "server.blocks_to_markdown",
                 return_value="# Title of Document\n\nThis is paragraph text.",
             ):
-                with patch("server.os") as mock_os:
-                    mock_os.getenv = lambda key, default="true": (
-                        "true" if key == "USE_STRUCTURE_V3" else default
-                    )
+                with patch.dict(os.environ, {"USE_STRUCTURE_V3": "true"}):
                     with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
                         file_bytes = b"%PDF-1.4 Fake PDF content"
                         file_b64 = base64.b64encode(file_bytes).decode()
@@ -116,10 +114,7 @@ class TestLayoutParsing:
         mock_pages = [{"page": 1, "text": "Plain OCR text", "blocks": []}]
 
         with patch("server.run_paddleocr", return_value=mock_pages):
-            with patch("server.os") as mock_os:
-                mock_os.getenv = lambda key, default="true": (
-                    "false" if key == "USE_STRUCTURE_V3" else default
-                )
+            with patch.dict(os.environ, {"USE_STRUCTURE_V3": "false"}):
                 with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
                     file_b64 = base64.b64encode(b"%PDF-1.4 fake pdf").decode()
 
@@ -182,10 +177,7 @@ class TestLayoutParsing:
             raise RuntimeError("pdfium: failed to load PDF")
 
         with patch("server.run_paddlex_structure_v3", failing_run):
-            with patch("server.os") as mock_os:
-                mock_os.getenv = lambda key, default="true": (
-                    "true" if key == "USE_STRUCTURE_V3" else default
-                )
+            with patch.dict(os.environ, {"USE_STRUCTURE_V3": "true"}):
                 with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
                     file_b64 = base64.b64encode(b"%PDF-1.4 fake pdf content").decode()
                     response = test_client.post(
@@ -228,10 +220,7 @@ class TestLayoutParsing:
             raise RuntimeError("simulated processing failure")
 
         with patch("server.run_paddlex_structure_v3", failing_run):
-            with patch("server.os") as mock_os:
-                mock_os.getenv = lambda key, default="true": (
-                    "true" if key == "USE_STRUCTURE_V3" else default
-                )
+            with patch.dict(os.environ, {"USE_STRUCTURE_V3": "true"}):
                 with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
                     file_b64 = base64.b64encode(pdf).decode()
                     response = test_client.post(
@@ -337,10 +326,7 @@ class TestExtract:
             with patch(
                 "server.blocks_to_markdown", return_value="# Title\n\nParagraph"
             ):
-                with patch("server.os") as mock_os:
-                    mock_os.getenv = lambda key, default="true": (
-                        "true" if key == "USE_STRUCTURE_V3" else default
-                    )
+                with patch.dict(os.environ, {"USE_STRUCTURE_V3": "true"}):
                     with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
                         # Create a fake file upload with PDF signature to bypass text detection
                         response = test_client.post(
@@ -381,10 +367,7 @@ class TestExtract:
 
         with patch("server.run_paddlex_structure_v3", failing_run):
             with patch("server.run_paddleocr", return_value=mock_pages):
-                with patch("server.os") as mock_os:
-                    mock_os.getenv = lambda key, default="true": (
-                        "true" if key == "USE_STRUCTURE_V3" else default
-                    )
+                with patch.dict(os.environ, {"USE_STRUCTURE_V3": "true"}):
                     with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
                         response = test_client.post(
                             "/extract",
@@ -409,10 +392,7 @@ class TestExtract:
         mock_pages = [{"page": 1, "text": "Plain text", "blocks": []}]
 
         with patch("server.run_paddleocr", return_value=mock_pages):
-            with patch("server.os") as mock_os:
-                mock_os.getenv = lambda key, default="true": (
-                    "false" if key == "USE_STRUCTURE_V3" else default
-                )
+            with patch.dict(os.environ, {"USE_STRUCTURE_V3": "false"}):
                 with patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"):
                     response = test_client.post(
                         "/extract",

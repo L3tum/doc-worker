@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from collections.abc import Generator
@@ -12,6 +13,29 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+# ── Regression guard ──────────────────────────────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _no_new_directories_in_cwd() -> Generator[None, None, None]:
+    """Fail a test that creates a directory in the CWD (repo root at test time).
+
+    Guards against the MagicMock-into-path leak: on Python 3.13+, a MagicMock
+    that flows into Path()/os.path.join()/os.makedirs() silently "fspaths"
+    into a fake relative path (``MagicMock/<mock-name>/<id>``) and gets
+    mkdir'd into the CWD instead of raising. Tests must write into
+    tmp_path or tempfile, never the repo root.
+    """
+    before = set(os.listdir("."))
+    yield
+    new_dirs = [
+        d
+        for d in set(os.listdir(".")) - before
+        if os.path.isdir(d) and not os.path.islink(d)
+    ]
+    assert not new_dirs, f"test created directory(ies) in CWD: {sorted(new_dirs)}"
 
 
 # ── Mock PaddleX pipelines ────────────────────────────────────────────────
