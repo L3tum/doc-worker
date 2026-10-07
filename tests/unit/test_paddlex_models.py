@@ -73,12 +73,20 @@ def _reset_paddlex_singleton():
     real_cls = None
     real_get_word_info = None
     try:
-        from paddlex.inference.models.text_recognition.processors import (
-            BaseRecLabelDecode as _real_cls,
-        )
+        # Only import when the top-level package is already cached.  If
+        # "paddlex" is missing from sys.modules (a previously failed import
+        # was rolled back by CPython, leaving initialized repo_manager
+        # submodules behind), a from-import would re-execute
+        # paddlex/__init__.py, whose eager repo_manager.initialize() then
+        # raises "PDX has already been initialized".  Skip instead — the
+        # tests that need the real class inject fakes via sys.modules.
+        if "paddlex" in sys.modules:
+            from paddlex.inference.models.text_recognition.processors import (
+                BaseRecLabelDecode as _real_cls,
+            )
 
-        real_cls = _real_cls
-        real_get_word_info = real_cls.get_word_info
+            real_cls = _real_cls
+            real_get_word_info = real_cls.get_word_info
     except ImportError:
         pass
 

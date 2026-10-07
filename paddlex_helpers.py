@@ -546,8 +546,11 @@ def _patch_paddlex_official_models() -> None:
 
     try:
         from paddlex.inference.utils import official_models as _om_module
-    except ImportError:
-        # PaddleX may not be installed (e.g. test env without paddlex)
+    except ImportError as exc:
+        # PaddleX may not be installed (e.g. test env without paddlex).
+        # Log the cause so a broken PaddleX install (missing system lib,
+        # incompatible wheel) is visible instead of silently degrading.
+        logger.warning("PaddleX import failed — offline model patch disabled: %s", exc)
         return
 
     original = _om_module.official_models

@@ -24,6 +24,31 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # The pre-baked act runner image may lack the system libraries that
+      # `import paddlex` needs (cv2 -> libGL/libglib, paddle -> libgomp).
+      # Without them the PaddleX import fails partway through __init__, and
+      # CPython's import rollback leaves the repo_manager submodules behind
+      # in an initialized state — any later re-import then raises "PDX has
+      # already been initialized".  These are the same libraries the
+      # Dockerfile ships; on GHA's ubuntu-latest the install is a no-op.
+      - name: Install system libraries for PaddleX import
+        run: |
+          if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
+          $SUDO apt-get update -qq
+          PKGS="libgl1 libgomp1"
+          if $SUDO apt-cache show libglib2.0-0t64 >/dev/null 2>&1; then
+            PKGS="$PKGS libglib2.0-0t64"  # Ubuntu 24.04+
+          else
+            PKGS="$PKGS libglib2.0-0"     # Ubuntu 22.04
+          fi
+          # shellcheck disable=SC2086
+          $SUDO apt-get install -y -qq --no-install-recommends $PKGS
+
+      - name: Verify PaddleX import (diagnostic)
+        run: |
+          python -c "import paddlex; print('paddlex import OK:', paddlex.__version__)" \
+            || echo "::warning::PaddleX import failed — unit tests will run in degraded (mock-only) mode"
+
       - name: Run unit tests
         run: python -m pytest -q tests/
 
