@@ -156,13 +156,18 @@ jobs:
 
       - name: Run umlaut e2e
         run: |
+          # Run the e2e from the image's own copy of the repo
+          # (COPY . . -> /app/tests). No bind mounts: on the Forgejo/act
+          # runner the docker daemon may not share the job container's
+          # filesystem, so -v $PWD/... resolves to an empty directory
+          # ("can't open file '/e2e/umlaut_e2e.py'"). The image was just
+          # built from this commit, so the in-image copy is the exact
+          # code under test.
           docker run --rm \
             -w /app \
             -e PYTHONPATH=/app \
-            -v $PWD/tests/e2e:/e2e:ro \
-            -v $PWD/tests/fixtures:/fixtures:ro \
             doc-worker:e2e \
-            python /e2e/umlaut_e2e.py
+            python /app/tests/e2e/umlaut_e2e.py
 
   should-push:
     runs-on: ubuntu-latest
