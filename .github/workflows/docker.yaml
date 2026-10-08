@@ -67,7 +67,12 @@ jobs:
 
   filter:
     name: Filter (OCR-related changes)
-    if: github.event_name != 'release'
+    # No `if:` on this job. Forgejo's run creation for `release` events
+    # silently drops jobs whose `if:` it resolves to false (or that reference
+    # `needs.*` of a skipped job — see Forgejo issue #14684, "reusable
+    # workflow / if evaluation errors only logged server-side"): in release
+    # runs this job and e2e-ocr vanished entirely, and the publish gate then
+    # no-opped with zero output. The release case is handled in-step instead.
     runs-on: ubuntu-latest
     outputs:
       ocr_related: ${{ steps.paths.outputs.ocr_related }}
@@ -89,6 +94,13 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
+
+          # Release events carry no diff base and no before-SHA; the filter
+          # is meaningless there (e2e-ocr runs unconditionally on release).
+          if [ "$EVENT" = "release" ]; then
+            echo "ocr_related=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Changed files, depending on the triggering event.
           if [ "$EVENT" = "pull_request" ] && [ -n "$BASE_REF" ] \
@@ -126,16 +138,15 @@ jobs:
   e2e-ocr:
     name: E2E OCR (umlaut regression)
     # Runs in parallel with `test` (does not wait for it, so the cold
-    # image build overlaps the unit tests) and is gated on success() of
-    # the `filter` job: runs when OCR-affecting files changed, or on
-    # release events (filter is skipped on release, and success() over
-    # the single skipped need is satisfied). A skipped e2e-ocr does NOT
-    # block publishing (publish jobs gate on success(), which treats
-    # skipped needs as satisfied); a FAILED e2e-ocr does block publishing.
+    # image build overlaps the unit tests) and is gated on the `filter`
+    # job's output: runs when OCR-affecting files changed, or on release
+    # events (filter reports ocr_related=false on release, the gate below
+    # treats release unconditionally as "run"). The gate is in-step, not
+    # an `if:` — see the comment on `filter` for why (Forgejo release
+    # events drop jobs with `if:` referencing needs.* of skipped jobs).
+    # When not required, the job exits 0 (a no-op success) and does NOT
+    # block publishing; a FAILED e2e-ocr does block publishing.
     needs: [filter]
-    if: |
-      success() && (needs.filter.outputs.ocr_related == 'true' ||
-        github.event_name == 'release')
     timeout-minutes: 45
     runs-on: ubuntu-latest
     steps:
@@ -143,8 +154,14 @@ jobs:
 
       - name: Build CPU image
         env:
+          EVENT: ${{ github.event_name }}
+          OCR_RELATED: ${{ needs.filter.outputs.ocr_related }}
           DOCKER_BUILDKIT: 1
         run: |
+          if [ "$EVENT" != "release" ] && [ "$OCR_RELATED" != "true" ]; then
+            echo "e2e not required (event=$EVENT, ocr_related=$OCR_RELATED) — skipping"
+            exit 0
+          fi
           cache_args=""
           # GHA build cache is GitHub-only; Forgejo's buildx has no `gha`
           # cache type and would fail the build with it.
@@ -155,7 +172,15 @@ jobs:
           docker build $cache_args -t doc-worker:e2e .
 
       - name: Run umlaut e2e
+        env:
+          EVENT: ${{ github.event_name }}
+          OCR_RELATED: ${{ needs.filter.outputs.ocr_related }}
         run: |
+          if [ "$EVENT" != "release" ] && [ "$OCR_RELATED" != "true" ]; then
+            echo "e2e not required (event=$EVENT, ocr_related=$OCR_RELATED) — skipping"
+            exit 0
+          fi
+
           # Run the e2e from the image's own copy of the repo
           # (COPY . . -> /app/tests). No bind mounts: on the Forgejo/act
           # runner the docker daemon may not share the job container's
