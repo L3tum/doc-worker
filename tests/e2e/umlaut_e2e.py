@@ -112,6 +112,21 @@ def _print_runtime_diagnostics() -> str | None:
                 "segmentation), but if the word check below fails, check "
                 "this patch state first."
             )
+    try:
+        import os
+
+        import paddle
+    except ImportError as exc:
+        print(f"[e2e] diagnostics: paddle not importable: {exc}")
+    else:
+        # The oneDNN/PIR converter crash (onednn_instruction.cc) is gated by
+        # this env var (PaddleX run_mode selection), so surface it alongside
+        # the paddle version for future regression diagnosis.
+        print(
+            f"[e2e] diagnostics: paddle {paddle.__version__} "
+            f"PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT="
+            f"{os.environ.get('PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT', '(unset)')}"
+        )
     return state
 
 

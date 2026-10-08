@@ -72,22 +72,36 @@ RUN if [ "$PADDLE_GPU" = "cuda" ]; then \
     fi
 
 # ---------------------------------------------------------------------------
-# PaddlePaddle runtime flags
+# PaddleX runtime flags
 # ---------------------------------------------------------------------------
-# Disable oneDNN (MKL-DNN) on CPU: PaddlePaddle 3.x's PIR runtime crashes in
-# the oneDNN instruction converter during PP-OCRv6 inference:
+# Disable PaddleX's default MKLDNN (oneDNN) run mode on CPU.
+#
+# Without this, the e2e-ocr job (and production OCR) crashes during
+# PP-OCRv6 inference:
 #   NotImplementedError: (Unimplemented)
 #     ConvertPirAttribute2RuntimeAttribute not support
 #     [pir::ArrayAttribute<pir::DoubleAttribute>]
-#     (at .../new_executor/instruction/onednn/onednn_instruction.cc)
-# Reproduced with paddlepaddle==3.3.0 + paddlex==3.7.2 (e2e-ocr job). The
-# flag is read at `import paddle` time, so it must be set in the image
-# environment, not in Python code. No-op on the CUDA build (oneDNN is
-# CPU-only).
+#     (at .../new_executor/instruction/onednn/onednn_instruction.cc:116)
+#
+# Chain (verified against PaddleX v3.7.2 + Paddle v3.3.0 source):
+#   PaddleX's get_default_run_mode() picks run_mode="mkldnn" on CPU by
+#   default (PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT defaults to True) -> the
+#   paddle_static runner calls config.enable_mkldnn() -> Paddle 3.x's PIR
+#   oneDNN placement/fusion passes rewrite the model to the onednn_kernel
+#   dialect -> OneDNNPhiKernelInstruction::ConvertPirAttribute2RuntimeAttribute
+#   has no case for ArrayAttribute<DoubleAttribute> and throws Unimplemented.
+#
+# Note: FLAGS_use_mkldnn=0 was tried first and does NOT fix this — the PIR
+# oneDNN instruction path is not gated by that flag (the runner enables
+# mkldnn explicitly via the config API). This PaddleX env var is the
+# supported kill switch: it makes get_default_run_mode() return "paddle"
+# for every model, so no oneDNN pass runs at all. No effect on the CUDA
+# build (non-CPU run modes are "paddle" by default anyway).
+#
 # Upgrade contract: when bumping the paddlepaddle/paddlex pins, re-run the
-# e2e-ocr gate; if the new Paddle ships a fixed oneDNN PIR converter, remove
-# this flag.
-ENV FLAGS_use_mkldnn=0
+# e2e-ocr gate; if upstream fixes the converter (or PaddleX blocklists the
+# PP-OCRv6 models for mkldnn), remove this env var to regain oneDNN speed.
+ENV PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=0
 
 # ---------------------------------------------------------------------------
 # Pre-download PaddleOCR models (bypasses runtime download on first request)
