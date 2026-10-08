@@ -72,6 +72,24 @@ RUN if [ "$PADDLE_GPU" = "cuda" ]; then \
     fi
 
 # ---------------------------------------------------------------------------
+# PaddlePaddle runtime flags
+# ---------------------------------------------------------------------------
+# Disable oneDNN (MKL-DNN) on CPU: PaddlePaddle 3.x's PIR runtime crashes in
+# the oneDNN instruction converter during PP-OCRv6 inference:
+#   NotImplementedError: (Unimplemented)
+#     ConvertPirAttribute2RuntimeAttribute not support
+#     [pir::ArrayAttribute<pir::DoubleAttribute>]
+#     (at .../new_executor/instruction/onednn/onednn_instruction.cc)
+# Reproduced with paddlepaddle==3.3.0 + paddlex==3.7.2 (e2e-ocr job). The
+# flag is read at `import paddle` time, so it must be set in the image
+# environment, not in Python code. No-op on the CUDA build (oneDNN is
+# CPU-only).
+# Upgrade contract: when bumping the paddlepaddle/paddlex pins, re-run the
+# e2e-ocr gate; if the new Paddle ships a fixed oneDNN PIR converter, remove
+# this flag.
+ENV FLAGS_use_mkldnn=0
+
+# ---------------------------------------------------------------------------
 # Pre-download PaddleOCR models (bypasses runtime download on first request)
 # Uses wget + tar — no Python or PaddleX dependency needed
 # ---------------------------------------------------------------------------
