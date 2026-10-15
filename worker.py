@@ -27,6 +27,7 @@ import shutil
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from paddlex_helpers import (
@@ -61,6 +62,16 @@ DOCLING_MODE = os.getenv(
 OCR_LANG = os.getenv("OCR_LANG", "deu")
 OCR_USE_GPU = os.getenv("OCR_USE_GPU", "false").lower() in ("true", "1", "yes")
 MODEL_IDLE_TIMEOUT = int(os.getenv("MODEL_IDLE_TIMEOUT", "30"))
+
+# Sticky AcroForm pre-flatten state: "unpatched" (never attempted — the
+# pypdfium2-ImportError path touches no state, so while pypdfium2 is
+# absent the state stays here and every file retries fail-soft) / "active"
+# (pypdfium2 imported and a flatten succeeded at least once) / "skipped"
+# (pypdfium2 available but the document had no forms — benign; the next file
+# retries). Mirrors paddlex_helpers._PADDLEX_WORD_SEGMENTATION_STATE so the
+# in-image e2e (tests/e2e/variants_e2e.py) can hard-gate on the flatten path
+# actually having run. See AGENTS.md Version-Specific Hack #5.
+_ACROFORM_FLATTEN_STATE: str = "unpatched"
 
 
 def _ensure_directories() -> None:
@@ -141,14 +152,54 @@ def move_to_error(file_path: Path, reason: str) -> None:
 # ---------------------------------------------------------------------------
 # Crash recovery
 # ---------------------------------------------------------------------------
+# Distinctive marker of the worker-owned AcroForm pre-flatten intermediate
+# (see flatten_acroform_if_needed): a real user file cannot plausibly
+# contain it, so crash recovery can recognize worker-owned intermediates
+# unambiguously; the uuid makes concurrent workers safe.
+_FLATTENED_MARKER = "__acroform_flattened__"
+
+
 def recover_leftover_files() -> None:
     """Move any stale files from PROCESSING into ERROR on startup."""
-    leftovers = list(PROCESSING.iterdir()) if PROCESSING.exists() else []
+    # Deterministic order: marker-named intermediates first (while their
+    # original is still in PROCESSING/ the marker branch can recognize the
+    # pair and unlink the re-creatable copy — processing the original first
+    # would move it away and preserve the intermediate instead), then the
+    # rest by name. iterdir() order is filesystem-dependent.
+    leftovers = (
+        sorted(
+            PROCESSING.iterdir(),
+            key=lambda p: (0 if _FLATTENED_MARKER in p.name else 1, p.name),
+        )
+        if PROCESSING.exists()
+        else []
+    )
     if not leftovers:
         return
 
     log(f"Crash recovery: found {len(leftovers)} file(s) in PROCESSING/")
     for f in leftovers:
+        # A stray directory at a leftover path must not crash startup:
+        # Path.unlink() raises IsADirectoryError on a directory (the marker
+        # branch below), so skip non-files — same guard as the AcroForm
+        # flatten cleanup path.
+        if not f.is_file():
+            log(f"  Skipped non-file leftover: {f.name}/")
+            continue
+        # A name containing the marker makes the file unambiguously
+        # worker-owned (see flatten_acroform_if_needed), so a user file
+        # can no longer be silently unlinked. The intermediate is
+        # re-creatable only while the corresponding original (the name
+        # prefix before the marker) is also present in PROCESSING/ —
+        # unlink it in that case. Without the original it may be the only
+        # surviving copy of the user's document, so preserve it in ERROR/
+        # instead of silently deleting it.
+        if _FLATTENED_MARKER in f.name:
+            original = PROCESSING / (f.name.split(_FLATTENED_MARKER, 1)[0] + f.suffix)
+            if original.exists():
+                f.unlink(missing_ok=True)
+                log(f"  Removed stale AcroForm intermediate: {f.name}")
+                continue
         dest = ERROR / f.name
         # Avoid overwriting existing error files
         if dest.exists():
@@ -163,8 +214,14 @@ def recover_leftover_files() -> None:
 # ---------------------------------------------------------------------------
 # Docling API helpers
 # ---------------------------------------------------------------------------
-def call_docling_convert(pdf_path: Path) -> bool:
-    """Send a PDF to the Docling API and return True on success."""
+def call_docling_convert(pdf_path: Path, sidecar_name: str | None = None) -> bool:
+    """Send a PDF to the Docling API and return True on success.
+
+    *sidecar_name*, when given, is used both as the uploaded filename and
+    to key the DOCLING_OUT output (DOCLING_OUT/{stem of sidecar_name}/...)
+    instead of *pdf_path*.name — so a worker-owned intermediate copy
+    (AcroForm pre-flatten) does not leak into the sidecar naming.
+    """
     try:
         import requests
     except ImportError:
@@ -174,9 +231,10 @@ def call_docling_convert(pdf_path: Path) -> bool:
         )
 
     url = f"{DOCLING_BASE_URL}/v1alpha/convert"
+    upload_name = sidecar_name or pdf_path.name
     try:
         with open(pdf_path, "rb") as f:
-            files = {"files": (pdf_path.name, f, "application/pdf")}
+            files = {"files": (upload_name, f, "application/pdf")}
             data = {"output_formats": ["md", "json"]}
             resp = requests.post(url, files=files, data=data, timeout=900)
             resp.raise_for_status()
@@ -184,7 +242,7 @@ def call_docling_convert(pdf_path: Path) -> bool:
         # Docling returns a list of conversion results
         results = resp.json()
         if isinstance(results, list) and len(results) > 0:
-            filename_stem = pdf_path.stem
+            filename_stem = Path(upload_name).stem
             out_dir = DOCLING_OUT / filename_stem
             out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -206,9 +264,14 @@ def call_docling_convert(pdf_path: Path) -> bool:
         return False
 
 
-def handle_docling(pdf_path: Path) -> bool:
+def handle_docling(pdf_path: Path, sidecar_name: str | None = None) -> bool:
     """
     Run sidecar generation based on DOCLING_MODE.
+
+    *sidecar_name* is forwarded to both backends; when given, the sidecar
+    output is keyed by this name (DOCLING_OUT/{stem of sidecar_name}/...)
+    rather than by *pdf_path*'s name — used when processing a worker-owned
+    intermediate copy (AcroForm pre-flatten).
 
     Returns:
         True  — continue pipeline (sidecar succeeded or is disabled).
@@ -219,9 +282,9 @@ def handle_docling(pdf_path: Path) -> bool:
         return True
 
     if DOCLING_MODE == "native":
-        success = generate_native_sidecar(pdf_path)
+        success = generate_native_sidecar(pdf_path, sidecar_name=sidecar_name)
     else:
-        success = call_docling_convert(pdf_path)
+        success = call_docling_convert(pdf_path, sidecar_name=sidecar_name)
 
     if success:
         mode_label = "native" if DOCLING_MODE == "native" else "Docling"
@@ -253,15 +316,17 @@ def _is_non_retryable_error(exc: Exception) -> bool:
 # ---------------------------------------------------------------------------
 # Native PaddleOCR sidecar generation
 # ---------------------------------------------------------------------------
-def generate_native_sidecar(pdf_path: Path) -> bool:
+def generate_native_sidecar(pdf_path: Path, sidecar_name: str | None = None) -> bool:
     """Generate Markdown + JSON sidecar files using PaddleX PP-StructureV3.
 
     Outputs to DOCLING_OUT/{stem}/{stem}.md (structured markdown) and
-    DOCLING_OUT/{stem}/{stem}.json (structured blocks + text).
+    DOCLING_OUT/{stem}/{stem}.json (structured blocks + text), where {stem}
+    comes from *sidecar_name* when given, else *pdf_path*.
 
     Uses PP-StructureV3 for layout-aware extraction with block types
     (title, paragraph_title, text, table, image, etc.).
     """
+    name = sidecar_name or pdf_path.name
     try:
         _mark_model_used()
         pages = run_paddlex_structure_v3(str(pdf_path))
@@ -270,19 +335,25 @@ def generate_native_sidecar(pdf_path: Path) -> bool:
         # poll right after it finishes.
         _mark_model_used()
 
-        filename_stem = pdf_path.stem
+        filename_stem = Path(name).stem
         out_dir = DOCLING_OUT / filename_stem
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Compute each page's markdown once and reuse it in both sidecars
+        # (it was previously computed twice per page — JSON and MD).
+        page_markdown = {
+            p["page"]: blocks_to_markdown(p.get("structured_blocks", [])) for p in pages
+        }
 
         # Build JSON sidecar with structured blocks
         full_text = "\n\n".join(p["text"] for p in pages if p["text"])
         sidecar_json = {
-            "filename": pdf_path.name,
+            "filename": name,
             "pages": [
                 {
                     "page": p["page"],
                     "text": p["text"],
-                    "markdown": blocks_to_markdown(p.get("structured_blocks", [])),
+                    "markdown": page_markdown[p["page"]],
                     "blocks": p["blocks"],
                     "structured_blocks": p.get("structured_blocks", []),
                 }
@@ -301,7 +372,7 @@ def generate_native_sidecar(pdf_path: Path) -> bool:
         md_parts: list[str] = []
         for p in pages:
             md_parts.append(f"## Page {p['page']}\n")
-            md_text = blocks_to_markdown(p.get("structured_blocks", []))
+            md_text = page_markdown[p["page"]]
             if md_text.strip():
                 md_parts.append(md_text)
         md_out = out_dir / f"{filename_stem}.md"
@@ -314,6 +385,82 @@ def generate_native_sidecar(pdf_path: Path) -> bool:
     except Exception as exc:
         log_error(f"Native sidecar generation failed: {exc}")
         return False
+
+
+# ---------------------------------------------------------------------------
+# AcroForm pre-flatten — Version-Specific Hack #5 (AGENTS.md)
+# ---------------------------------------------------------------------------
+def flatten_acroform_if_needed(src: Path) -> Path | None:
+    """Bake filled AcroForm values into a copy of *src* before OCR.
+
+    Root cause: ocrmypdf 17's built-in pypdfium2 rasterizer opens the
+    document without ``init_forms()``, and PDFium's form layer (typed-in
+    values, checkbox states) only renders after ``init_forms()`` — so the
+    values are absent from the page image. Under ``force_ocr=True``
+    ocrmypdf merely *warns* about AcroForms, making the loss silent.
+    PDFium's form layer also synthesizes appearances, so this covers
+    /V-only widgets that a rasterizer only drawing existing /AP streams
+    (e.g. pdftoppm) would miss.
+
+    Fail-soft: a missing pypdfium2, an unopenable file, or a document
+    without forms all return ``None`` and the original is OCR'd as-is.
+
+    Returns the path of the flattened copy
+    (``<stem>__acroform_flattened__<8-hex><suffix>``, written next to
+    *src*), or None. The caller owns the copy's lifecycle (unlink on both
+    success and failure paths).
+    """
+    global _ACROFORM_FLATTEN_STATE
+
+    try:
+        import pypdfium2
+    except ImportError:
+        # No state is touched here — if an earlier file already flattened,
+        # the state is already "active"; just fall back to the original so
+        # the missing dependency stays fail-soft and non-sticky per file.
+        log_error(
+            "AcroForm pre-flatten unavailable (pypdfium2 not importable) — "
+            "OCR'ing the original; form field values may be missing."
+        )
+        return None
+
+    try:
+        doc = pypdfium2.PdfDocument(str(src))
+    except Exception as exc:
+        log_error(
+            f"AcroForm pre-flatten: cannot open {src.name}: {exc} — OCR'ing original"
+        )
+        return None
+
+    # Marker + uuid → no user-file collision and safe even if the worker
+    # is ever parallelized; recovery matches on the marker and derives the
+    # original as the name prefix before the marker + suffix.
+    out_path = src.with_name(
+        f"{src.stem}{_FLATTENED_MARKER}{uuid.uuid4().hex[:8]}{src.suffix}"
+    )
+    try:
+        if not doc.init_forms():
+            # No AcroForm in this document — nothing to flatten.
+            if _ACROFORM_FLATTEN_STATE != "active":
+                _ACROFORM_FLATTEN_STATE = "skipped"
+            return None
+        for page in doc:
+            page.flatten()
+        doc.save(str(out_path))
+    except Exception as exc:
+        log_error(
+            f"AcroForm pre-flatten failed for {src.name}: {exc} — OCR'ing original"
+        )
+        # A stray directory at the path must not make the cleanup raise.
+        if out_path.is_file():
+            out_path.unlink(missing_ok=True)
+        return None
+    finally:
+        doc.close()
+
+    _ACROFORM_FLATTEN_STATE = "active"
+    log(f"  AcroForm flattened: {out_path.name}")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -428,7 +575,7 @@ def wait_for_docling(timeout: int = 120) -> None:
 # Main worker loop
 # ---------------------------------------------------------------------------
 def process_file(pdf_path: Path) -> bool:
-    """Process a single PDF: Docling → OCR → Paperless.
+    """Process a single PDF: AcroForm flatten → Docling sidecar → OCR → Paperless.
 
     Returns True on success.
 
@@ -452,15 +599,41 @@ def process_file(pdf_path: Path) -> bool:
     else:
         log(f"  Retrying from processing: {processing_path}")
 
-    # Docling
-    if not handle_docling(processing_path):
+    # AcroForm pre-flatten: bake typed-in form values into a temporary
+    # copy BEFORE sidecar generation, so the sidecar (Docling API or
+    # native PaddleX) and the OCR text layer both see the baked-in form
+    # values (see flatten_acroform_if_needed and AGENTS.md
+    # Version-Specific Hack #5). The sidecar is still named after the
+    # original file (sidecar_name=filename), so DOCLING_OUT/ stays keyed
+    # by the user's filename. The original file is what lands in DONE/.
+    # Peak PROCESSING/ usage for form-bearing PDFs is ~3× input size
+    # (original + flattened copy + _ocr output) — relevant if the
+    # PROCESSING mount is small.
+    flattened_path = flatten_acroform_if_needed(processing_path)
+
+    # Docling — runs on the flattened copy when one exists
+    try:
+        sidecar_ok = handle_docling(
+            flattened_path or processing_path, sidecar_name=filename
+        )
+    except Exception:
+        # A raising backend (e.g. broken `requests` install) must not
+        # leak the worker-owned intermediate until the next startup.
+        if flattened_path is not None:
+            flattened_path.unlink(missing_ok=True)
+        raise
+    if not sidecar_ok:
+        # The flattened copy is an intermediate: unlink it even when the
+        # sidecar aborts, so it cannot leak into PROCESSING/.
+        if flattened_path is not None:
+            flattened_path.unlink(missing_ok=True)
         log_error("Sidecar generation failed and will be retried if attempts remain.")
         return False
 
     # OCR
     ocr_output = PROCESSING / f"{processing_path.stem}_ocr{processing_path.suffix}"
     try:
-        run_ocrmypdf(processing_path, ocr_output)
+        run_ocrmypdf(flattened_path or processing_path, ocr_output)
         log("  OCR: OK")
     except Exception as exc:
         # Re-raise (instead of returning False) so the retry loop in
@@ -480,6 +653,11 @@ def process_file(pdf_path: Path) -> bool:
         if ocr_output.exists():
             ocr_output.unlink()
         raise
+    finally:
+        # The flattened copy is an intermediate: unlink on both the success
+        # and failure paths.
+        if flattened_path is not None:
+            flattened_path.unlink(missing_ok=True)
 
     # Paperless
     if not push_to_paperless(ocr_output):

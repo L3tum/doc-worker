@@ -2605,3 +2605,100 @@ class TestModelInFlightGuard:
         with pytest.raises(RuntimeError, match="structure predictor exploded"):
             paddlex_helpers.run_paddlex_structure_v3("document.pdf")
         assert paddlex_helpers.model_in_flight_count() == 0
+
+
+# ── predict serialization ────────────────────────────────────────────────
+
+
+class TestPredictSerialization:
+    """_PADDLEX_PREDICT_LOCK: the asyncio.to_thread offload removed the event
+    loop's implicit one-job-at-a-time serialization, and Paddle's predictor
+    is not thread-safe (official guidance: one predictor per thread). Two
+    concurrent jobs must never be inside model.predict() at the same time."""
+
+    def test_run_paddleocr_predict_holds_lock(self, monkeypatch):
+        """run_paddleocr: model.fetch + predict must run under the lock."""
+        import paddlex_helpers
+
+        seen: dict[str, bool] = {}
+
+        class _SpyModel:
+            def predict(self, _path: str):
+                seen["locked"] = paddlex_helpers._PADDLEX_PREDICT_LOCK.locked()
+                yield {"rec_texts": [], "rec_scores": [], "rec_boxes": []}
+
+        monkeypatch.setattr(paddlex_helpers, "_get_paddlex_model", _SpyModel)
+
+        paddlex_helpers.run_paddleocr("document.pdf")
+        assert seen["locked"] is True
+
+    def test_run_paddlex_structure_v3_predict_holds_lock(self, monkeypatch):
+        """run_paddlex_structure_v3: the per-page predict must run under the
+        lock (the primary server pipeline for /layout-parsing + /extract)."""
+        import paddlex_helpers
+
+        seen: dict[str, bool] = {}
+
+        class _SpyModel:
+            def predict(self, _path: str):
+                seen["locked"] = paddlex_helpers._PADDLEX_PREDICT_LOCK.locked()
+                yield {
+                    "overall_ocr_res": {
+                        "rec_texts": [],
+                        "rec_scores": [],
+                        "rec_boxes": [],
+                    }
+                }
+
+        monkeypatch.setattr(
+            paddlex_helpers, "_get_paddlex_structure_v3_model", _SpyModel
+        )
+
+        paddlex_helpers.run_paddlex_structure_v3("page.png")
+        assert seen["locked"] is True
+
+    def test_concurrent_jobs_never_overlap_predict(self, monkeypatch):
+        """Two jobs in separate threads (the to_thread offload scenario) must
+        never be inside model.predict() on the shared pipeline at the same
+        time. Job 1 holds the predictor until the test confirms job 2 has
+        had the chance to (illegally) enter — overlap is observed, not
+        guessed."""
+        import threading
+        import time
+
+        import paddlex_helpers
+
+        state = {"job1_inside": False, "job2_saw_overlap": False}
+        state_lock = threading.Lock()
+        release_job1 = threading.Event()
+
+        class _SpyModel:
+            def predict(self, path: str):
+                if path == "a.pdf":  # job 1: hold the predictor until told
+                    with state_lock:
+                        state["job1_inside"] = True
+                    release_job1.wait(10)
+                    with state_lock:
+                        state["job1_inside"] = False
+                else:  # job 2: job 1 must already be out of predict
+                    with state_lock:
+                        if state["job1_inside"]:
+                            state["job2_saw_overlap"] = True
+                yield {"rec_texts": [], "rec_scores": [], "rec_boxes": []}
+
+        monkeypatch.setattr(paddlex_helpers, "_get_paddlex_model", _SpyModel)
+
+        t1 = threading.Thread(target=paddlex_helpers.run_paddleocr, args=("a.pdf",))
+        t2 = threading.Thread(target=paddlex_helpers.run_paddleocr, args=("b.pdf",))
+        t1.start()
+        t2.start()
+        # Wait until job 1 is inside predict: job 2 is now either blocked on
+        # the serialization lock (correct) or overlapping (bug).
+        deadline = time.time() + 10
+        while not state["job1_inside"] and time.time() < deadline:
+            time.sleep(0.01)
+        release_job1.set()
+        t1.join(30)
+        t2.join(30)
+        assert state["job1_inside"] is False
+        assert state["job2_saw_overlap"] is False

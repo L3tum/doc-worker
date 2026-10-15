@@ -336,6 +336,83 @@ class TestLayoutParsingE2E:
             )
         assert response.status_code == 413
 
+    # ── Content-based routing: the bytes decide the pipeline, the hint is a hint ──
+    def test_image_content_with_pdf_hint(self, client: TestClient) -> None:
+        """fileType=0 (PDF hint) but the bytes are an actual PNG → image pipeline.
+
+        The old code trusted the hint and sent the image down the PDF path
+        (pdftoppm on a PNG → 500).
+        """
+        file_b64 = base64.b64encode(_FAKE_PNG).decode()
+        with (
+            patch.object(
+                paddlex_helpers,
+                "_get_paddlex_structure_v3_model",
+                return_value=_FakeV3Model([_numpy_page_result(1)]),
+            ),
+            patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"),
+        ):
+            response = client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Bearer test-token"},
+                json={"file": file_b64, "fileType": 0},
+            )
+
+        assert response.status_code == 200
+        results = response.json()["result"]["layoutParsingResults"]
+        assert "Title 1" in results[0]["markdown"]["text"]
+
+    def test_pdf_content_with_image_hint(self, client: TestClient) -> None:
+        """fileType=1 (image hint) but the bytes are an actual PDF → PDF pipeline.
+
+        The old code trusted the hint and skipped the PDF pre-render
+        (PaddleX chokes on a raw PDF path).
+        """
+        file_b64 = base64.b64encode(_FAKE_PDF).decode()
+        with (
+            patch.object(
+                paddlex_helpers,
+                "_get_paddlex_structure_v3_model",
+                return_value=_FakeV3Model([_numpy_page_result(1)]),
+            ),
+            patch.object(
+                paddlex_helpers, "_pdf_to_images", return_value=["/tmp/page-1.png"]
+            ),
+            patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"),
+        ):
+            response = client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Bearer test-token"},
+                json={"file": file_b64, "fileType": 1},
+            )
+
+        assert response.status_code == 200
+        results = response.json()["result"]["layoutParsingResults"]
+        assert "Title 1" in results[0]["markdown"]["text"]
+
+    def test_text_content_with_image_hint_passthrough(self, client: TestClient) -> None:
+        """fileType=1 but the bytes are plain text → text passthrough (was 500)."""
+        file_b64 = base64.b64encode(b"Hello, just text.\n").decode()
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", ""):
+            response = client.post(
+                "/layout-parsing", json={"file": file_b64, "fileType": 1}
+            )
+
+        assert response.status_code == 200
+        results = response.json()["result"]["layoutParsingResults"]
+        assert results[0]["markdown"]["text"] == "Hello, just text.\n"
+        assert results[0]["structuredBlocks"] == []
+
+    def test_unknown_binary_415(self, client: TestClient) -> None:
+        """Unrecognized binary content → 415 (was a 500 from deep in the pipeline)."""
+        garbage = b"\x80\x81\x82" * 64  # invalid UTF-8, no known signature
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", ""):
+            response = client.post(
+                "/layout-parsing",
+                json={"file": base64.b64encode(garbage).decode(), "fileType": 0},
+            )
+        assert response.status_code == 415
+
 
 # ── POST /extract — direct upload API ────────────────────────────────────
 class TestExtractE2E:
@@ -416,6 +493,66 @@ class TestExtractE2E:
         data = response.json()
         assert "Plain OCR line 1" in data["full_text"]
         assert data["pages"][0]["structured_blocks"] is None
+
+    # ── Content-based routing: the bytes decide the pipeline, the name is a hint ──
+    def test_extract_pdf_content_image_name(self, client: TestClient) -> None:
+        """A file named *.png whose bytes are a PDF → PDF pipeline.
+
+        The old code routed on the extension (image path on raw PDF bytes
+        → 500 from deep in PaddleX).
+        """
+        with (
+            patch.object(
+                paddlex_helpers,
+                "_get_paddlex_structure_v3_model",
+                return_value=_FakeV3Model([_numpy_page_result(1)]),
+            ),
+            patch.object(
+                paddlex_helpers, "_pdf_to_images", return_value=["/tmp/page-1.png"]
+            ),
+            patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"),
+        ):
+            response = client.post(
+                "/extract",
+                headers={"Authorization": "Bearer test-token"},
+                files={"file": ("doc.png", _FAKE_PDF, "image/png")},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["filename"] == "doc.png"
+        assert "Title 1" in data["pages"][0]["markdown"]
+
+    def test_extract_image_content_pdf_name(self, client: TestClient) -> None:
+        """A file named *.pdf whose bytes are a PNG → image pipeline."""
+        with (
+            patch.object(
+                paddlex_helpers,
+                "_get_paddlex_structure_v3_model",
+                return_value=_FakeV3Model([_numpy_page_result(1)]),
+            ),
+            patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"),
+        ):
+            response = client.post(
+                "/extract",
+                headers={"Authorization": "Bearer test-token"},
+                files={"file": ("doc.pdf", _FAKE_PNG, "application/pdf")},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["filename"] == "doc.pdf"
+        assert "Title 1" in data["pages"][0]["markdown"]
+
+    def test_extract_unknown_binary_415(self, client: TestClient) -> None:
+        """Unrecognized binary content → 415 (was a 500 from deep in the pipeline)."""
+        garbage = b"\x80\x81\x82" * 64  # invalid UTF-8, no known signature
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", ""):
+            response = client.post(
+                "/extract",
+                files={"file": ("blob.bin", garbage, "application/octet-stream")},
+            )
+        assert response.status_code == 415
 
 
 # ── Helper layer (covers the worker.py sidecar path too) ─────────────────

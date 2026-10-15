@@ -4,14 +4,16 @@ Doc-Worker — Tests for worker.py sidecar generation.
 Tests generate_native_sidecar with mocked PaddleX pipelines.
 
 Moved from tests/test_worker.py to tests/unit/test_worker.py: CI
-(docker.yaml) runs `pytest tests/unit`, so this file is now executed in
-CI in addition to local dev runs.
+(docker.yaml) runs `python -m pytest -q tests/`, so this file is now
+executed in CI in addition to local dev runs.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -19,6 +21,7 @@ from unittest.mock import patch
 import pytest
 
 from worker import (
+    flatten_acroform_if_needed,
     generate_native_sidecar,
     handle_docling,
     move_to_error,
@@ -367,8 +370,389 @@ class TestRecoverLeftoverFiles:
         timestamped = [f for f in error_pdfs if "_20" in f.name]
         assert len(timestamped) == 1
 
+    def test_stale_flattened_intermediate_unlinked(self, monkeypatch):
+        """A stale marker-named intermediate is unlinked (not promoted) —
+        but only when its sibling original (foo.pdf) is also in
+        PROCESSING/.
 
-# ── process_file with model init failure ─────────────────────────────────
+        With the original present, the worker-owned AcroForm pre-flatten
+        copy is re-creatable from it, so it must not be promoted to ERROR/
+        as if it were a user file; the original is handled by the normal
+        recovery. (Without the original the intermediate is preserved —
+        see test_flattened_without_original_preserved.)
+        """
+        import worker
+
+        tmp_processing = Path(tempfile.mkdtemp())
+        tmp_error = Path(tempfile.mkdtemp())
+        monkeypatch.setattr(worker, "PROCESSING", tmp_processing)
+        monkeypatch.setattr(worker, "ERROR", tmp_error)
+
+        intermediate_name = "foo__acroform_flattened__deadbeef.pdf"
+        (tmp_processing / "foo.pdf").write_text("original")
+        (tmp_processing / intermediate_name).write_text("worker intermediate")
+
+        recover_leftover_files()
+
+        # The original is recovered as usual...
+        assert (tmp_error / "foo.pdf").exists()
+        # ...and the intermediate is deleted rather than promoted anywhere.
+        assert not (tmp_processing / intermediate_name).exists()
+        flattened_in_error = [
+            f for f in tmp_error.iterdir() if worker._FLATTENED_MARKER in f.name
+        ]
+        assert not flattened_in_error
+
+    def test_user_file_named_like_old_intermediate_preserved(self, monkeypatch):
+        """An old-style *_flattened.pdf user file is preserved, not unlinked.
+
+        The retired fixed-name scheme (<stem>_flattened.pdf) made recovery
+        unlink such a file whenever the sibling original was also present
+        — silent data loss. Under the marker scheme a plain user file is
+        just data: it must flow to ERROR/ with its content intact.
+        """
+        import worker
+
+        tmp_processing = Path(tempfile.mkdtemp())
+        tmp_error = Path(tempfile.mkdtemp())
+        monkeypatch.setattr(worker, "PROCESSING", tmp_processing)
+        monkeypatch.setattr(worker, "ERROR", tmp_error)
+
+        (tmp_processing / "foo.pdf").write_text("original")
+        (tmp_processing / "foo_flattened.pdf").write_text("user document")
+
+        recover_leftover_files()
+
+        # Both are user files: both must be preserved in ERROR/, intact.
+        assert (tmp_error / "foo.pdf").exists()
+        recovered = tmp_error / "foo_flattened.pdf"
+        assert recovered.exists()
+        assert recovered.read_text() == "user document"
+
+    def test_flattened_without_original_preserved(self, monkeypatch):
+        """A marker-named intermediate whose original is missing is preserved.
+
+        Without foo.pdf next to it, the worker intermediate may be the
+        only surviving copy of the user's document — it must flow through
+        to ERROR/ with its content intact, not be silently unlinked.
+        """
+        import worker
+
+        tmp_processing = Path(tempfile.mkdtemp())
+        tmp_error = Path(tempfile.mkdtemp())
+        monkeypatch.setattr(worker, "PROCESSING", tmp_processing)
+        monkeypatch.setattr(worker, "ERROR", tmp_error)
+
+        intermediate_name = "foo__acroform_flattened__deadbeef.pdf"
+        (tmp_processing / intermediate_name).write_text("worker intermediate")
+
+        recover_leftover_files()
+
+        # Gone from PROCESSING/, preserved in ERROR/ with content intact.
+        assert not (tmp_processing / intermediate_name).exists()
+        recovered = tmp_error / intermediate_name
+        assert recovered.exists()
+        assert recovered.read_text() == "worker intermediate"
+
+    def test_marker_named_directory_skipped(self, monkeypatch):
+        """A marker-named *directory* in PROCESSING/ must not crash startup.
+
+        Path.unlink() raises IsADirectoryError on a directory; recovery must
+        skip non-files (same guard as the AcroForm flatten cleanup) instead
+        of crash-looping the worker at boot.
+        """
+        import worker
+
+        tmp_processing = Path(tempfile.mkdtemp())
+        tmp_error = Path(tempfile.mkdtemp())
+        monkeypatch.setattr(worker, "PROCESSING", tmp_processing)
+        monkeypatch.setattr(worker, "ERROR", tmp_error)
+
+        intermediate_name = "foo__acroform_flattened__deadbeef.pdf"
+        (tmp_processing / intermediate_name).mkdir()  # stray directory, not a file
+        (tmp_processing / "foo.pdf").write_text("original")
+
+        recover_leftover_files()  # must not raise IsADirectoryError
+
+        # The stray directory is left in place (never silently deleted)...
+        assert (tmp_processing / intermediate_name).is_dir()
+        # ...and the real leftover is recovered as usual.
+        assert (tmp_error / "foo.pdf").exists()
+
+    def test_leftovers_recovered_in_name_order(self, monkeypatch):
+        """Recovery processes leftovers in name order, so the outcome is
+        deterministic when an original and its intermediate both survive a
+        crash (iterdir() order is filesystem-dependent)."""
+        import worker
+
+        tmp_processing = Path(tempfile.mkdtemp())
+        tmp_error = Path(tempfile.mkdtemp())
+        recorded: list[str] = []
+        monkeypatch.setattr(worker, "PROCESSING", tmp_processing)
+        monkeypatch.setattr(worker, "ERROR", tmp_error)
+        monkeypatch.setattr(worker, "log", lambda msg: recorded.append(str(msg)))
+
+        (tmp_processing / "b.pdf").write_text("b")
+        (tmp_processing / "a.pdf").write_text("a")
+
+        recover_leftover_files()
+
+        idx_a = next(i for i, m in enumerate(recorded) if "a.pdf" in m)
+        idx_b = next(i for i, m in enumerate(recorded) if "b.pdf" in m)
+        assert idx_a < idx_b
+        assert (tmp_error / "a.pdf").exists()
+        assert (tmp_error / "b.pdf").exists()
+
+
+# ── AcroForm pre-flatten (Version-Specific Hack #5, AGENTS.md) ──────────────
+class TestFlattenAcroform:
+    """flatten_acroform_if_needed: bake filled form values in before OCR.
+
+    The AcroForm fixture (tests/fixtures/acroform_filled.pdf) is generated
+    by tests/fixtures/generate_acroform_pdf.py: one page with baked-in
+    label text in the content stream plus two filled /Tx fields (Name /
+    City) carrying /V values, /AP appearance streams and
+    AcroForm.NeedAppearances=true — i.e. a realistic fill-in.
+    """
+
+    FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "acroform_filled.pdf"
+
+    @pytest.fixture()
+    def pdfium(self):
+        return pytest.importorskip("pypdfium2")
+
+    @staticmethod
+    def _render_hash(path: Path, pdfium) -> str:
+        doc = pdfium.PdfDocument(str(path))
+        try:
+            return hashlib.sha256(doc[0].render(scale=1).to_pil().tobytes()).hexdigest()
+        finally:
+            doc.close()
+
+    def test_acroform_flattened_copy(self, tmp_path, pdfium):
+        """Filled AcroForm → flattened copy without forms; original untouched.
+
+        The red guard: a plain (no init_forms) render of the original must
+        differ from a render of the flattened copy — the values are only
+        visible because flatten() baked them into the content stream.
+        """
+        import worker
+
+        src = tmp_path / "form.pdf"
+        shutil.copy(self.FIXTURE, src)
+        src_hash = self._render_hash(src, pdfium)
+
+        out = flatten_acroform_if_needed(src)
+        assert out is not None
+        assert out.exists()
+        # Marker + short-uuid naming: collision-free with user files.
+        assert out.name.startswith("form")
+        assert worker._FLATTENED_MARKER in out.name
+        assert out.name.endswith(".pdf")
+        assert out.name != "form_flattened.pdf"
+        assert worker._ACROFORM_FLATTEN_STATE == "active"
+
+        # The copy has no AcroForm left; the original still does.
+        flat_doc = pdfium.PdfDocument(str(out))
+        assert flat_doc.init_forms() is False
+        flat_doc.close()
+        src_doc = pdfium.PdfDocument(str(src))
+        assert src_doc.init_forms() is True
+        src_doc.close()
+
+        # Red guard: values now visible in the flattened render only.
+        assert self._render_hash(out, pdfium) != src_hash
+
+    def test_no_form_pdf_returns_none(self, tmp_path, pdfium, monkeypatch):
+        """A PDF without AcroForms → None (original OCR'd as-is).
+
+        Also pins the unpatched → skipped state transition: a formless
+        document sets _ACROFORM_FLATTEN_STATE to "skipped" (the sticky
+        state is reset to "unpatched" first so the assertion is
+        independent of test order).
+        """
+        import worker
+
+        plain = tmp_path / "plain.pdf"
+        doc = pdfium.PdfDocument.new()
+        doc.new_page(612, 792)
+        doc.save(str(plain))
+        doc.close()
+
+        monkeypatch.setattr(worker, "_ACROFORM_FLATTEN_STATE", "unpatched")
+        assert flatten_acroform_if_needed(plain) is None
+        assert not any(worker._FLATTENED_MARKER in p.name for p in tmp_path.iterdir())
+        assert worker._ACROFORM_FLATTEN_STATE == "skipped"
+
+    def test_corrupt_file_returns_none(self, tmp_path):
+        """An unopenable file → None (fail-soft), not an exception.
+
+        Passes via different branches per environment: pypdfium2 not
+        importable → the ImportError path; importable → PdfDocument
+        raises → the 'cannot open' path. Both must stay fail-soft None
+        (no exception, no partial intermediate file).
+        """
+        import worker
+
+        corrupt = tmp_path / "corrupt.pdf"
+        corrupt.write_bytes(b"not a pdf at all")
+        assert flatten_acroform_if_needed(corrupt) is None
+        assert not any(worker._FLATTENED_MARKER in p.name for p in tmp_path.iterdir())
+
+    def test_stray_directory_at_intermediate_path(self, tmp_path, monkeypatch):
+        """A stray directory at the intermediate path cannot make cleanup raise.
+
+        The fake pypdfium2 save() raises (what a directory at the target
+        path would produce); the except-branch guard must only unlink when
+        the path is a regular file, so the directory survives, no
+        IsADirectoryError escapes, and the original is OCR'd as-is.
+        """
+        import sys
+        import types
+        from unittest.mock import MagicMock
+
+        import worker
+
+        # Fix the uuid so the intermediate name is deterministic.
+        monkeypatch.setattr(
+            worker,
+            "uuid",
+            types.SimpleNamespace(
+                uuid4=lambda: types.SimpleNamespace(hex="deadbeefdeadbeef")
+            ),
+        )
+
+        src = tmp_path / "form.pdf"
+        src.write_bytes(b"%PDF-1.4 fake")
+        stray_dir = tmp_path / "form__acroform_flattened__deadbeef.pdf"
+        stray_dir.mkdir()
+
+        fake_doc = MagicMock()
+        fake_doc.init_forms.return_value = True
+        fake_doc.save.side_effect = OSError("simulated save failure")
+        fake_pypdfium2 = MagicMock(PdfDocument=MagicMock(return_value=fake_doc))
+
+        with patch.dict(sys.modules, {"pypdfium2": fake_pypdfium2}):
+            assert flatten_acroform_if_needed(src) is None
+        assert stray_dir.is_dir()
+
+    @staticmethod
+    def _point_worker_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Point all worker pipeline globals at fresh tmp dirs.
+
+        Uses monkeypatch so the module globals are restored automatically
+        (the old direct assignments leaked into other tests).
+        """
+        import worker
+
+        for attr, subdir in (
+            ("INBOX", "inbox"),
+            ("PROCESSING", "processing"),
+            ("DONE", "done"),
+            ("ERROR", "error"),
+            ("DOCLING_OUT", "docling"),
+            ("PAPERLESS_CONSUME", "paperless"),
+        ):
+            path = tmp_path / subdir
+            path.mkdir(parents=True)
+            monkeypatch.setattr(worker, attr, path)
+
+    def test_process_file_feeds_flattened_copy_to_ocr(
+        self, tmp_path, pdfium, monkeypatch
+    ):
+        """process_file OCRs the flattened copy; the original lands in DONE/.
+
+        The flattened intermediate is unlinked on the success path.
+        """
+        import worker
+
+        self._point_worker_at(tmp_path, monkeypatch)
+        with (
+            patch.object(worker, "DOCLING_MODE", "off"),
+            patch("worker.run_ocrmypdf") as mock_ocr,
+            patch("worker.push_to_paperless", return_value=True),
+        ):
+            src = worker.INBOX / "form.pdf"
+            shutil.copy(self.FIXTURE, src)
+
+            assert process_file(src) is True
+
+        # OCR received the flattened copy (not the original).
+        ocr_input: Path = mock_ocr.call_args.args[0]
+        assert ocr_input.parent == worker.PROCESSING
+        assert ocr_input.name.startswith("form")
+        assert worker._FLATTENED_MARKER in ocr_input.name
+        # The intermediate is cleaned up on the success path.
+        assert not ocr_input.exists()
+        # The original (unflattened) file is what lands in DONE/.
+        done_pdfs = sorted(p.name for p in worker.DONE.glob("form*.pdf"))
+        assert done_pdfs == ["form.pdf"]
+
+    def test_process_file_ocr_failure_unlinks_flattened(
+        self, tmp_path, pdfium, monkeypatch
+    ):
+        """OCR raising after flatten: intermediate unlinked, original kept.
+
+        The flattened copy is a worker-owned intermediate — even when
+        run_ocrmypdf raises it must not leak into PROCESSING/ (where
+        crash recovery would otherwise promote it to ERROR/). The original
+        stays in PROCESSING/ so the retry loop can find it; nothing lands
+        in DONE/.
+        """
+        import worker
+
+        self._point_worker_at(tmp_path, monkeypatch)
+        with (
+            patch.object(worker, "DOCLING_MODE", "off"),
+            patch("worker.run_ocrmypdf", side_effect=RuntimeError("boom")) as mock_ocr,
+            patch("worker.push_to_paperless", return_value=True),
+        ):
+            src = worker.INBOX / "form.pdf"
+            shutil.copy(self.FIXTURE, src)
+
+            with pytest.raises(RuntimeError, match="boom"):
+                process_file(src)
+
+        # OCR ran against the flattened copy (not the original).
+        ocr_input: Path = mock_ocr.call_args.args[0]
+        assert ocr_input.parent == worker.PROCESSING
+        assert ocr_input.name.startswith("form")
+        assert worker._FLATTENED_MARKER in ocr_input.name
+        # The intermediate is unlinked on the failure path, the original is
+        # left in PROCESSING/ for the retry loop, and DONE/ stays empty.
+        assert sorted(p.name for p in worker.PROCESSING.iterdir()) == ["form.pdf"]
+        assert not ocr_input.exists()
+        assert not any(worker.DONE.iterdir())
+
+    def test_process_file_flatten_none_uses_original(self, tmp_path, monkeypatch):
+        """flatten → None (formless PDF / no pypdfium2): OCR the original.
+
+        Success path: run_ocrmypdf receives the original processing path
+        and the original filename lands in DONE/.
+        """
+        import worker
+
+        self._point_worker_at(tmp_path, monkeypatch)
+        with (
+            patch.object(worker, "DOCLING_MODE", "off"),
+            patch("worker.flatten_acroform_if_needed", return_value=None),
+            patch("worker.run_ocrmypdf") as mock_ocr,
+            patch("worker.push_to_paperless", return_value=True),
+        ):
+            src = worker.INBOX / "plain.pdf"
+            src.write_bytes(b"%PDF-1.4 fake")
+
+            assert process_file(src) is True
+
+        # OCR ran against the original processing path (no flattened copy).
+        ocr_input: Path = mock_ocr.call_args.args[0]
+        assert ocr_input == worker.PROCESSING / "plain.pdf"
+        # Success: the original filename lands in DONE/, PROCESSING/ empty.
+        assert sorted(p.name for p in worker.DONE.iterdir()) == ["plain.pdf"]
+        assert not any(worker.PROCESSING.iterdir())
+
+
+# ── process_file: model-init failure (native sidecar) ──────────────────────
 class TestProcessFileModelInitFailure:
     def test_model_init_failure_returns_false(self):
         """process_file() returns False when model init fails during native sidecar.
@@ -453,6 +837,125 @@ class TestProcessFileModelInitFailure:
                 assert result is True  # continues despite sidecar failure
         finally:
             worker.DOCLING_MODE = old_mode
+
+
+# ── process_file: sidecar ordering vs. AcroForm pre-flatten (Hack #5) ───────
+class TestProcessFileSidecarFlattenOrdering:
+    """The sidecar must run on the flattened copy (flatten before sidecar)
+    so sidecar and OCR text layer agree for /V-only widgets, while the
+    DOCLING_OUT key stays the original filename."""
+
+    @staticmethod
+    def _point_worker_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import worker
+
+        for attr, subdir in (
+            ("INBOX", "inbox"),
+            ("PROCESSING", "processing"),
+            ("DONE", "done"),
+            ("ERROR", "error"),
+            ("DOCLING_OUT", "docling"),
+            ("PAPERLESS_CONSUME", "paperless"),
+        ):
+            path = tmp_path / subdir
+            path.mkdir(parents=True)
+            monkeypatch.setattr(worker, attr, path)
+
+    def test_native_sidecar_runs_on_flattened_copy_keyed_by_original(
+        self, tmp_path, monkeypatch
+    ):
+        """With flattening active and DOCLING_MODE=native, the native
+        sidecar receives the flattened path as pdf_path and
+        sidecar_name=<original filename> as kwarg — DOCLING_OUT stays
+        keyed by the original stem."""
+        import worker
+
+        self._point_worker_at(tmp_path, monkeypatch)
+        flattened = worker.PROCESSING / "form_flattened.pdf"
+        flattened.write_bytes(b"flattened copy")
+
+        with (
+            patch.object(worker, "DOCLING_MODE", "native"),
+            patch(
+                "worker.flatten_acroform_if_needed", return_value=flattened
+            ) as mock_flatten,
+            patch("worker.generate_native_sidecar", return_value=True) as mock_sidecar,
+            patch("worker.run_ocrmypdf"),
+            patch("worker.push_to_paperless", return_value=True),
+        ):
+            src = worker.INBOX / "form.pdf"
+            src.write_bytes(b"%PDF-1.4 fake")
+
+            assert process_file(src) is True
+
+        # Flatten ran on the original processing path...
+        mock_flatten.assert_called_once_with(worker.PROCESSING / "form.pdf")
+        # ...and the sidecar ran on the flattened copy, keyed by the
+        # original name (DOCLING_OUT/<original stem>/).
+        mock_sidecar.assert_called_once_with(flattened, sidecar_name="form.pdf")
+        # The intermediate is cleaned up on the success path.
+        assert not flattened.exists()
+
+    def test_required_sidecar_failure_unlinks_flattened(self, tmp_path, monkeypatch):
+        """Sidecar failure in 'required' mode while a flattened copy
+        exists: the intermediate is unlinked, so PROCESSING/ holds only
+        the original (a leaked copy would be promoted to ERROR/ by crash
+        recovery on the next startup)."""
+        import worker
+
+        self._point_worker_at(tmp_path, monkeypatch)
+        flattened = worker.PROCESSING / "form_flattened.pdf"
+        flattened.write_bytes(b"flattened copy")
+
+        with (
+            patch.object(worker, "DOCLING_MODE", "required"),
+            patch("worker.flatten_acroform_if_needed", return_value=flattened),
+            patch("worker.call_docling_convert", return_value=False),
+            patch("worker.run_ocrmypdf") as mock_ocr,
+        ):
+            src = worker.INBOX / "form.pdf"
+            src.write_bytes(b"%PDF-1.4 fake")
+
+            assert process_file(src) is False
+
+        # Aborted before OCR; only the original remains in PROCESSING/.
+        mock_ocr.assert_not_called()
+        assert sorted(p.name for p in worker.PROCESSING.iterdir()) == ["form.pdf"]
+        assert not flattened.exists()
+
+    def test_handle_docling_raise_unlinks_flattened(self, tmp_path, monkeypatch):
+        """A raising handle_docling backend must not leak the intermediate.
+
+        e.g. call_docling_convert raising RuntimeError on a broken
+        `requests` install: the exception propagates (upstream retry /
+        ERROR/ classification), but the worker-owned intermediate is
+        unlinked first, so it cannot sit in PROCESSING/ until the next
+        startup recovery.
+        """
+        import worker
+
+        self._point_worker_at(tmp_path, monkeypatch)
+        flattened = worker.PROCESSING / "form__acroform_flattened__deadbeef.pdf"
+        flattened.write_bytes(b"flattened copy")
+
+        with (
+            patch.object(worker, "DOCLING_MODE", "off"),
+            patch("worker.flatten_acroform_if_needed", return_value=flattened),
+            patch(
+                "worker.handle_docling",
+                side_effect=RuntimeError("broken requests install"),
+            ),
+        ):
+            src = worker.INBOX / "form.pdf"
+            src.write_bytes(b"%PDF-1.4 fake")
+
+            with pytest.raises(RuntimeError, match="broken requests install"):
+                process_file(src)
+
+        # The intermediate is unlinked; the original stays in PROCESSING/
+        # for the retry loop.
+        assert not flattened.exists()
+        assert sorted(p.name for p in worker.PROCESSING.iterdir()) == ["form.pdf"]
 
 
 # ── process_with_retries (non-retryable fast-fail) ─────────────────────────

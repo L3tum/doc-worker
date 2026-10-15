@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import os
+import struct
 from unittest.mock import patch
 
 import pytest
@@ -144,6 +145,56 @@ class TestLayoutParsing:
             response = test_client.post(
                 "/layout-parsing",
                 headers={"Authorization": "Bearer wrong"},
+                json={"file": base64.b64encode(b"fake").decode()},
+            )
+        assert response.status_code == 403
+
+    def test_layout_parsing_auth_wrong_scheme(self, test_client):
+        """A non-Bearer Authorization header must return 403, not 401."""
+        import server
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", "secret"):
+            response = test_client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Basic secret"},
+                json={"file": base64.b64encode(b"fake").decode()},
+            )
+        assert response.status_code == 403
+
+    def test_layout_parsing_auth_trailing_content_rejected(self, test_client):
+        """Only the token after 'Bearer ' is compared; extra trailing
+        content in the header must not authenticate (prefix-parse pin)."""
+        import server
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", "secret"):
+            response = test_client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Bearer secret extra"},
+                json={"file": base64.b64encode(b"fake").decode()},
+            )
+        assert response.status_code == 403
+
+    def test_layout_parsing_auth_empty_token_rejected(self, test_client):
+        """'Bearer ' with an empty token must return 403 (prefix-parse pin)."""
+        import server
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", "secret"):
+            response = test_client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Bearer "},
+                json={"file": base64.b64encode(b"fake").decode()},
+            )
+        assert response.status_code == 403
+
+    def test_layout_parsing_auth_double_space_rejected(self, test_client):
+        """'Bearer  secret' (double space) parses the token as ' secret',
+        which must not authenticate (prefix-parse pin)."""
+        import server
+
+        with patch.object(server, "PADDLEOCR_VL_TOKEN", "secret"):
+            response = test_client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Bearer  secret"},
                 json={"file": base64.b64encode(b"fake").decode()},
             )
         assert response.status_code == 403
@@ -530,3 +581,56 @@ class TestHealthCheckEndpoint:
         assert "/layout-parsing" in data["endpoints"]
         assert "/extract" in data["endpoints"]
         assert "/health" in data["endpoints"]
+
+
+# ── Magic-byte classifier pins ──────────────────────────────────────────
+class TestDetectFileTypeSignatures:
+    """Pure-function pins for server.detect_file_type (no TestClient)."""
+
+    @staticmethod
+    def _bmp(file_size: int, dib_size: int) -> bytes:
+        # "BM" + file-size DWORD (offset 2) + reserved DWORD (offset 6) +
+        # placeholder DWORD (offset 10) + DIB header-size DWORD (offset 14)
+        # + padding so the sample is >= 18 bytes.
+        return (
+            b"BM"
+            + struct.pack("<I", file_size)
+            + struct.pack("<I", 0)
+            + struct.pack("<I", 14)
+            + struct.pack("<I", dib_size)
+            + b"\x00" * 4
+        )
+
+    def test_webp_valid_is_image(self):
+        """RIFF-anchored WebP classifies as image."""
+        assert server.detect_file_type(b"RIFF\x00\x00\x00\x00WEBPVP8 ") == "image"
+
+    def test_webp_not_riff_anchored_is_text(self):
+        """Regression: a >=12-byte non-RIFF file with "WEBP" at offset 8
+        must not classify as image (it used to, and died with HTTP 500 in
+        the image pipeline; the bytes passed through as text before)."""
+        assert server.detect_file_type(b"12345678WEBP" + b"!" * 8) == "text"
+
+    def test_riff_non_webp_is_not_image(self):
+        """Other RIFF content (WAVE fourcc) is not an image; this sample's
+        NULs make it binary under the explicit NUL check, so it is unknown
+        (pre-change the NULs decoded as valid UTF-8 and it leaked through
+        as text — the 7-bit-clean-binary regression the NUL check closes)."""
+        assert server.detect_file_type(b"RIFF\x00\x00\x00\x00WAVEfmt ") == "unknown"
+
+    def test_bmp_bitmapinfoheader_is_image(self):
+        """Regression: DIB size 40 (BITMAPINFOHEADER) with a real file size
+        classifies as image."""
+        assert server.detect_file_type(self._bmp(100, 40)) == "image"
+
+    def test_bmp_v4_unspecified_filesize_is_image(self):
+        """DIB size 108 (BITMAPV4HEADER) with file-size DWORD 0 (unspecified)
+        classifies as image."""
+        assert server.detect_file_type(self._bmp(0, 108)) == "image"
+
+    def test_bmp_unknown_dib_size_is_text(self):
+        """'BM' text with a DIB slot value outside the known set is not an
+        image. The sample is NUL-free (the NUL check now classifies any
+        NUL-laden file as binary), so the text check decides: text."""
+        data = b"BM" + b"this is plain text" * 2
+        assert server.detect_file_type(data) == "text"

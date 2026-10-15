@@ -32,9 +32,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-# Inside the CI container the fixtures are mounted read-only at /fixtures.
-FIXTURE_IN_IMAGE = Path("/fixtures/german_umlaut.png")
-# Fallback for local (non-Docker) runs: repo-relative fixture.
+# Fixture lives in the repo: the CI job runs the script from the in-image
+# repo copy (COPY . . -> /app) with no bind mounts, and local (non-Docker)
+# runs resolve the same path repo-relative.
 FIXTURE_IN_REPO = Path(__file__).resolve().parents[1] / "fixtures" / "german_umlaut.png"
 
 EXPECTED_WORDS = ("Äpfel", "Bürger", "Straße")
@@ -45,13 +45,12 @@ class E2EError(Exception):
 
 
 def _find_fixture() -> Path:
-    """Return the first existing fixture path, else raise E2EError."""
-    for candidate in (FIXTURE_IN_IMAGE, FIXTURE_IN_REPO):
-        if candidate.is_file():
-            return candidate
+    """Return the repo-relative fixture path, else raise E2EError."""
+    if FIXTURE_IN_REPO.is_file():
+        return FIXTURE_IN_REPO
     raise E2EError(
-        f"fixture not found — looked for {FIXTURE_IN_IMAGE} "
-        f"(in-image mount) and {FIXTURE_IN_REPO} (repo fallback)."
+        f"fixture not found — looked in {FIXTURE_IN_REPO} "
+        "(the repo copy of tests/fixtures; there is no in-image mount)."
     )
 
 

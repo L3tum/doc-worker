@@ -8,6 +8,7 @@ and semantic markdown building — all based on PaddleX 3.0 pipelines.
 
 from __future__ import annotations
 
+import bisect
 import inspect
 import logging
 import math
@@ -187,6 +188,28 @@ def model_in_flight_count() -> int:
 
 # ── Singleton model managers ──────────────────────────────────────────────
 _PADDLEX_MODEL_LOCK = threading.Lock()
+
+# ── Single-pipeline serialization ─────────────────────────────────────────
+# Paddle's inference predictor is NOT thread-safe: the official multi-thread
+# guidance is one predictor per thread (PredictorPool for parallel serving).
+# Before the asyncio.to_thread offload, the event loop itself serialized OCR
+# jobs (each job ran the whole pipeline on the loop thread), so two
+# predict() calls could never overlap. That implicit serialization is gone
+# now, so it is restored explicitly: every model-fetch + predict phase in
+# this process runs under this lock.
+#
+# Neither of the existing guards serializes predict(): _PADDLEX_MODEL_LOCK
+# only guards pipeline creation/teardown, and model_in_flight() is just an
+# idle-unload refcount. Holding this lock around the full job body (including
+# the pdftoppm pre-render) also bounds the 300-dpi temp-disk staging to one
+# job at a time — the pre-change worst case — on the unauthenticated
+# endpoints.
+#
+# Lock ordering: this lock is always taken before (outside)
+# _PADDLEX_MODEL_LOCK, which is only entered via _get_*_model() while this
+# one is held; destroy_paddlex_model() takes only _PADDLEX_MODEL_LOCK.
+# No cycle, no deadlock.
+_PADDLEX_PREDICT_LOCK = threading.Lock()
 
 
 def get_paddlex_init_exception() -> BaseException | None:
@@ -1171,6 +1194,24 @@ class ModelIdleTracker:
 
 
 # ── PDF → image conversion helper ─────────────────────────────────────────
+# Render DPI for PDF→PNG page rasterization (pdftoppm -r). Pixel-based
+# defaults elsewhere in this module (pdftoppm timeout, reading-order column
+# threshold) are derived from this value.
+RENDER_DPI: int = 300
+
+# The 150-dpi-era base the pixel-scaled defaults derive from (pdftoppm
+# timeout, reading-order column threshold).
+LEGACY_DPI: int = 150
+
+# pdftoppm wall-clock budget, scaled off the 150-dpi-era 120 s by
+# (RENDER_DPI / LEGACY_DPI)² — the per-page *pixel* multiplier: 300 dpi is
+# 4× the per-page pixel cost of the old 150 dpi, i.e. ~4× peak temp-disk
+# staging (all pages held as PNG) and ~4× per-page decode memory, so the
+# old 120 s would starve large PDFs. At RENDER_DPI=300: 480 s. Override
+# with PAPDFTOPPM_TIMEOUT (seconds); env override semantics unchanged.
+DEFAULT_PDFTOPPM_TIMEOUT: int = round(120 * (RENDER_DPI / LEGACY_DPI) ** 2)
+
+
 def _pdf_to_images(pdf_path: str, tmp_dir: str) -> list[str]:
     """Convert a PDF file to a list of PNG images (one per page).
 
@@ -1185,12 +1226,19 @@ def _pdf_to_images(pdf_path: str, tmp_dir: str) -> list[str]:
         "pdftoppm",
         "-png",
         "-r",
-        "150",  # reasonable DPI for OCR
+        # RENDER_DPI (300) dpi: 1:1 for the common <=300-dpi scans (no
+        # re-rendering loss). 150 dpi used to downgrade >=300-dpi scans; the
+        # worker path is unaffected (ocrmypdf 17.x renders at the embedded
+        # scan's own DPI).
+        str(RENDER_DPI),
         pdf_path,
         str(tmp_path),
     ]
-    # Timeout configurable via PAPDFTOPPM_TIMEOUT (default 120s)
-    pdftoppm_timeout = int(os.getenv("PAPDFTOPPM_TIMEOUT", "120"))
+    # Timeout configurable via PAPDFTOPPM_TIMEOUT (seconds); the default
+    # scales with the render DPI — see DEFAULT_PDFTOPPM_TIMEOUT above.
+    pdftoppm_timeout = int(
+        os.getenv("PAPDFTOPPM_TIMEOUT", str(DEFAULT_PDFTOPPM_TIMEOUT))
+    )
     try:
         result = subprocess.run(
             cmd, check=True, capture_output=True, text=True, timeout=pdftoppm_timeout
@@ -1297,6 +1345,33 @@ def _finite_confidence(value: Any, fallback: float = 0.0) -> float:
     return v if math.isfinite(v) else fallback
 
 
+def _normalize_bbox(raw: object) -> list[float]:
+    """Coerce a model ``block_bbox`` to exactly four finite floats.
+
+    PaddleX normally emits a 4-element box, but a degenerate box
+    (empty/short sequence, None or non-numeric element, wrong
+    type) would crash the reading-order span heuristic, which
+    indexes ``bbox[0]``/``bbox[2]`` (IndexError/TypeError → 500
+    for the whole request). Fail-soft to the zero box: the block
+    keeps its text, positioned at the origin. Bare strings/bytes
+    and dicts are rejected outright (a 4-char numeric string or a
+    4-key dict is still not a box — a dict would otherwise yield
+    its *keys* as the box), and the numpy shapes ride on
+    _jsonable's .tolist path. Non-finite values (NaN/Inf — valid
+    floats, but json.dumps(allow_nan=False) would 500 the whole
+    response) also fail soft to the zero box.
+    """
+    if raw is None or isinstance(raw, (str, bytes, dict)):
+        return [0.0, 0.0, 0.0, 0.0]
+    try:
+        values = [float(v) for v in _jsonable(raw)]
+    except (TypeError, ValueError):
+        return [0.0, 0.0, 0.0, 0.0]
+    if len(values) != 4 or not all(math.isfinite(v) for v in values):
+        return [0.0, 0.0, 0.0, 0.0]
+    return values
+
+
 def _nullsafe(value: Any, default: Any) -> Any:
     """Return ``value`` unless it is None, else ``default``.
 
@@ -1318,12 +1393,16 @@ def run_paddleocr(file_path: str) -> list[dict]:
     """
     # model_in_flight() spans model fetch + predict so the idle-unload thread
     # can never destroy the pipeline out from under this job (including the
-    # lazy-init window if the model was just unloaded).
+    # lazy-init window if the model was just unloaded). _PADDLEX_PREDICT_LOCK
+    # serializes fetch+predict process-wide: the predictor is not thread-safe
+    # and the to_thread offload removed the event loop's implicit
+    # one-job-at-a-time serialization (see the lock's comment).
     with model_in_flight():
-        model = _get_paddlex_model()
-        # PaddleX >=3.0 predict() returns a generator (one result per sample/page);
-        # materialize it so the isinstance(list,tuple) guard and per-page .get() work.
-        result = list(model.predict(file_path))
+        with _PADDLEX_PREDICT_LOCK:
+            model = _get_paddlex_model()
+            # PaddleX >=3.0 predict() returns a generator (one result per sample/page);
+            # materialize it so the isinstance(list,tuple) guard and per-page .get() work.
+            result = list(model.predict(file_path))
 
     # Safeguard: model.predict should return a list, but check anyway
     if not isinstance(result, (list, tuple)):
@@ -1384,39 +1463,50 @@ def run_paddlex_structure_v3(file_path: str) -> list[dict]:
         page (int): 1-based page number
         text (str): raw text from OCR (same as General OCR output)
         blocks (list[dict]): per-block text, bbox, confidence
-        structured_blocks (list[dict]): blocks with type, bbox, content, confidence
+        structured_blocks (list[dict]): blocks with type, bbox, content,
+            confidence — pre-sorted in reading order (column-aware; the sort
+            happens in _process_structure_v3_pages with the page's true pixel
+            width, so blocks_to_markdown can serialize in input order)
+        page_width_px (int): the rendered page's pixel width, present when it
+            could be read from the page image
     """
 
     # model_in_flight() spans model fetch through the whole page processing
     # (predict is per-page inside _process_structure_v3_pages) — this also
     # covers the lazy-init window and the pdftoppm conversion in between, so
     # the idle-unload thread can never destroy the pipeline mid-job.
+    # _PADDLEX_PREDICT_LOCK serializes the whole job body (fetch, render,
+    # per-page predict) process-wide: the predictor is not thread-safe and
+    # the to_thread offload removed the event loop's implicit
+    # one-job-at-a-time serialization (see the lock's comment). Holding it
+    # across the render also keeps temp-disk staging bounded to one job.
     with model_in_flight():
-        model = _get_paddlex_structure_v3_model()
+        with _PADDLEX_PREDICT_LOCK:
+            model = _get_paddlex_structure_v3_model()
 
-        # If file_path is a PDF, convert pages to temporary PNG images.
-        # The temp directory must stay alive while we process the images.
-        if file_path.lower().endswith(".pdf"):
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                images = _pdf_to_images(file_path, tmp_dir)
-                if not images:
-                    raise RuntimeError(
-                        f"Failed to convert PDF to images: {file_path}. "
-                        "Check that pdftoppm is installed and the file is a valid PDF."
-                    )
+            # If file_path is a PDF, convert pages to temporary PNG images.
+            # The temp directory must stay alive while we process the images.
+            if file_path.lower().endswith(".pdf"):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    images = _pdf_to_images(file_path, tmp_dir)
+                    if not images:
+                        raise RuntimeError(
+                            f"Failed to convert PDF to images: {file_path}. "
+                            "Check that pdftoppm is installed and the file is a valid PDF."
+                        )
+                    try:
+                        return _process_structure_v3_pages(model, images)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"PP-StructureV3 prediction failed on {file_path}: {exc}"
+                        ) from exc
+            else:
                 try:
-                    return _process_structure_v3_pages(model, images)
+                    return _process_structure_v3_pages(model, [file_path])
                 except Exception as exc:
                     raise RuntimeError(
                         f"PP-StructureV3 prediction failed on {file_path}: {exc}"
                     ) from exc
-        else:
-            try:
-                return _process_structure_v3_pages(model, [file_path])
-            except Exception as exc:
-                raise RuntimeError(
-                    f"PP-StructureV3 prediction failed on {file_path}: {exc}"
-                ) from exc
 
 
 def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
@@ -1483,12 +1573,10 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
                 continue
             block_label = block.get("block_label", "unknown")
             block_content = block.get("block_content", "")
-            # _jsonable(): block_bbox can be an ndarray (or list of numpy
-            # floats); convert to a plain list for JSON serialization.
-            # Explicit None check (NOT `or []`): a multi-element ndarray
-            # raises ValueError on truth-value evaluation.
-            raw_bbox = block.get("block_bbox")
-            block_bbox = _jsonable(raw_bbox if raw_bbox is not None else [0, 0, 0, 0])
+            # _normalize_bbox() handles the ndarray / list-of-numpy-float
+            # shapes (see _jsonable) and fail-soft normalizes degenerate
+            # boxes to the zero box (see _normalize_bbox docstring).
+            block_bbox = _normalize_bbox(block.get("block_bbox"))
             confidence = layout_confidence.get(block_label, 0.0)
 
             structured_blocks.append(
@@ -1502,14 +1590,23 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
                 }
             )
 
-        pages.append(
-            {
-                "page": page_idx + 1,
-                "text": "\n".join(text_parts),
-                "blocks": blocks,
-                "structured_blocks": structured_blocks,
-            }
-        )
+        # Reading-order sort happens HERE (not in blocks_to_markdown, which
+        # is a pure serializer): the span heuristic needs the page's TRUE
+        # pixel width, which only the rendered page image knows. Fail-soft:
+        # an unreadable image (missing/corrupt file — e.g. mocked paths in
+        # tests) degrades to the content-extent fallback (page_width=None).
+        page_width_px = _image_width_px(img_path)
+        page: dict[str, Any] = {
+            "page": page_idx + 1,
+            "text": "\n".join(text_parts),
+            "blocks": blocks,
+            "structured_blocks": _sort_blocks_by_reading_order(
+                structured_blocks, page_width=page_width_px
+            ),
+        }
+        if page_width_px is not None:
+            page["page_width_px"] = int(page_width_px)
+        pages.append(page)
 
     return pages
 
@@ -1622,32 +1719,20 @@ def _convert_table_html_to_markdown(html_content: str) -> str:
     return "\n".join(md_lines)
 
 
-def _compute_reading_order_key(
-    block: dict, column_clusters: list[float] | None
-) -> tuple:
-    """Return a sort key for a single block given pre-computed column clusters.
-
-    If column_clusters is None or has only one column, uses simple (y, x) sort.
-    Otherwise assigns the block to its nearest column and returns (y, col_index).
-    """
-    bx = block["bbox"][0]
-    by = block["bbox"][1]
-    if column_clusters is None or len(column_clusters) <= 1:
-        return (by, bx)
-
-    col_idx = min(
-        range(len(column_clusters)), key=lambda i: abs(column_clusters[i] - bx)
-    )
-    return (by, col_idx)
-
-
 def _compute_column_clusters(
-    lefts: list[float], threshold: float = 50.0
+    lefts: list[float], threshold: float | None = None
 ) -> list[float] | None:
     """Cluster left x-coordinates into column centers.
 
+    *threshold* is the minimum x-distance between distinct columns. None
+    (default) scales with the render DPI: the 150-dpi-era 50 px literal,
+    i.e. ``50.0 * RENDER_DPI / LEGACY_DPI`` — 100 px at RENDER_DPI=300,
+    LEGACY_DPI=150.
+
     Returns None if there's only one column or no blocks.
     """
+    if threshold is None:
+        threshold = 50.0 * RENDER_DPI / LEGACY_DPI
     if not lefts:
         return None
     lefts_sorted = sorted(lefts)
@@ -1658,33 +1743,148 @@ def _compute_column_clusters(
     return columns if len(columns) > 1 else None
 
 
+def _image_width_px(image_path: str) -> float | None:
+    """Return the true pixel width of *image_path*, or None when unreadable.
+
+    Fail-soft on purpose: when the width cannot be determined (missing or
+    undecodable file — e.g. mocked image paths in tests), the reading-order
+    sort degrades to its content-extent fallback (page_width=None) instead
+    of failing the whole page. A zero/negative size (truncated header) is
+    treated as unreadable too — it would make every block a span.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(image_path) as img:
+            width = float(img.size[0])
+    except Exception:
+        return None
+    return width if width > 0 else None
+
+
 def _sort_blocks_by_reading_order(
-    structured_blocks: list[dict], column_threshold: float = 50.0
+    structured_blocks: list[dict],
+    column_threshold: float | None = None,
+    page_width: float | None = None,
 ) -> list[dict]:
     """Sort blocks by estimated reading order (handles multi-column layouts).
 
-    Efficiently clusters columns once, then assigns each block to a column in O(1).
-    Total complexity: O(n log n) instead of O(n²).
+    Reading order is column-first *within vertical bands*:
+
+    - A block is a **span** when its width exceeds 70% of the page width
+      (full-width titles, tables, headers/footers). Spans keep their
+      reading position and split the page into vertical bands — band *i*
+      spans from the bottom of span *i-1* to the top of span *i*.
+      This is what keeps a full-width footer below two columns in place
+      (a naive (column, y) key would drag it up into column 1). The page
+      width is the rendered page's TRUE pixel width when *page_width* is
+      given; otherwise it falls back to the content extent (rightmost
+      block edge) — the pre-true-width heuristic, which over-classifies a
+      wide-but-not-full block as a span whenever the content does not
+      reach the page edge.
+    - Non-span blocks join the band containing their top edge (anything
+      above the first span joins band 0; a degenerate top edge inside a
+      span's y-range joins the band below that span — deterministic,
+      only reachable by overlapping model output).
+    - Column clusters come from non-span left edges only (a span's left
+      edge is a page margin, not a column anchor) via
+      _compute_column_clusters. A band whose blocks touch two or more
+      clusters is emitted column-first: (column, y, x); single-cluster
+      bands fall back to plain (y, x).
+    - No spans and at most one column → plain top-to-bottom sort
+      (single-column documents are unchanged).
+
+    Total complexity: O(n log n) — one clustering pass, O(log s) band
+    lookup per block (bisect over the sorted span top edges; s = span
+    count, s << n) and O(1) column assignment per block.
 
     Args:
         structured_blocks: List of block dicts with 'bbox' keys.
-        column_threshold: Min x-distance to consider as separate columns (default 50px).
+        column_threshold: Min x-distance to consider as separate columns.
+            None (default) scales with the render DPI: the 150-dpi-era 50 px
+            literal, i.e. ``50.0 * RENDER_DPI / LEGACY_DPI`` — 100 px at
+            RENDER_DPI=300, LEGACY_DPI=150. The 50 px literal was ≈ 8.5 mm
+            on paper at 150 dpi; the DPI-scaled default preserves that
+            physical scale at 300 dpi instead of silently halving it to
+            ≈ 4.2 mm (which split hanging indents into phantom columns).
+        page_width: True page width in pixels (the rendered page image's
+            width). None (default) → fall back to the content extent
+            (rightmost block edge).
 
     Returns:
         New list of blocks sorted by reading order.
     """
+
+    def _yx(block: dict) -> tuple[float, float]:
+        """Plain top-to-bottom key: (top edge, left edge)."""
+        return (float(block["bbox"][1]), float(block["bbox"][0]))
+
     if len(structured_blocks) < 2:
-        return sorted(structured_blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+        return sorted(structured_blocks, key=_yx)
 
-    # Cluster left coordinates into column centers (single pass)
-    lefts = [b["bbox"][0] for b in structured_blocks]
-    column_clusters = _compute_column_clusters(lefts, threshold=column_threshold)
+    if column_threshold is None:
+        column_threshold = 50.0 * RENDER_DPI / LEGACY_DPI
 
-    # Sort using pre-computed clusters — O(n log n) with O(1) column assignment
-    return sorted(
-        structured_blocks,
-        key=lambda b: _compute_reading_order_key(b, column_clusters),
+    # True page width when the caller has the rendered image; content extent
+    # (rightmost block edge) otherwise — the pre-true-width fallback.
+    if page_width is None:
+        page_width = max(float(b["bbox"][2]) for b in structured_blocks)
+    span_limit = 0.7 * float(page_width)
+
+    def _is_span(block: dict) -> bool:
+        bbox = block["bbox"]
+        return (float(bbox[2]) - float(bbox[0])) > span_limit
+
+    spans = sorted((b for b in structured_blocks if _is_span(b)), key=_yx)
+    non_spans = [b for b in structured_blocks if not _is_span(b)]
+
+    # Column clusters from non-span left edges only (see docstring).
+    column_clusters = _compute_column_clusters(
+        [b["bbox"][0] for b in non_spans], threshold=column_threshold
     )
+
+    # Single-column page with no spans → plain top-to-bottom sort.
+    if not spans and (column_clusters is None or len(column_clusters) <= 1):
+        return sorted(structured_blocks, key=_yx)
+
+    def _column_index(block: dict, clusters: list[float]) -> int:
+        bx = float(block["bbox"][0])
+        return min(range(len(clusters)), key=lambda i: abs(clusters[i] - bx))
+
+    # Spans are sorted by (y, x), so their top edges are non-decreasing:
+    # band index = number of spans whose top edge is <= the block's top
+    # edge (bisect_right over span_tops → O(log s); a top edge exactly on
+    # a span's top, or inside a span's y-range, joins the band BELOW that
+    # span — same semantics as the old linear scan).
+    span_tops = [float(span["bbox"][1]) for span in spans]
+
+    def _sort_band(band: list[dict]) -> list[dict]:
+        if column_clusters is None or len(column_clusters) <= 1:
+            return sorted(band, key=_yx)
+        clusters = column_clusters
+        # Column index per block, computed once (used both for the
+        # distinct-cluster check and the sort key below).
+        indexed: list[tuple[int, dict]] = [
+            (_column_index(b, clusters), b) for b in band
+        ]
+        if len({col for col, _ in indexed}) < 2:
+            return sorted(band, key=_yx)
+        return [
+            block
+            for col, block in sorted(indexed, key=lambda pair: (pair[0], *_yx(pair[1])))
+        ]
+
+    bands: list[list[dict]] = [[] for _ in range(len(spans) + 1)]
+    for block in non_spans:
+        bands[bisect.bisect_right(span_tops, float(block["bbox"][1]))].append(block)
+
+    # Band 0, span 1, band 1, span 2, …
+    ordered: list[dict] = []
+    for idx in range(len(spans) + 1):
+        ordered.extend(_sort_band(bands[idx]))
+        if idx < len(spans):
+            ordered.append(spans[idx])
+    return ordered
 
 
 def blocks_to_markdown(structured_blocks: list[dict]) -> str:
@@ -1697,18 +1897,14 @@ def blocks_to_markdown(structured_blocks: list[dict]) -> str:
         - table → Markdown table (HTML converted)
         - image → [Image] or [Figure: caption] if a figure_title precedes it
 
-    Sorting: blocks are ordered by estimated reading order, accounting for
-    multi-column layouts by clustering on x-coordinate.
+    Pure serializer — input order is taken as-is (NO sorting): callers
+    (run_paddlex_structure_v3) deliver structured_blocks already ordered
+    in reading order (see _process_structure_v3_pages).
     """
     lines: list[str] = []
     last_figure_title = ""
 
-    # Sort blocks by estimated reading order (handles multi-column layouts)
-    sorted_blocks = _sort_blocks_by_reading_order(
-        structured_blocks, column_threshold=50.0
-    )
-
-    for block in sorted_blocks:
+    for block in structured_blocks:
         block_type = block["type"]
         content = block["text"]
 

@@ -136,7 +136,7 @@ jobs:
           echo "ocr_related=$related" >> "$GITHUB_OUTPUT"
 
   e2e-ocr:
-    name: E2E OCR (umlaut regression)
+    name: E2E OCR (umlaut + layout variants)
     # Runs in parallel with `test` (does not wait for it, so the cold
     # image build overlaps the unit tests) and is gated on the `filter`
     # job's output: runs when OCR-affecting files changed, or on release
@@ -171,7 +171,7 @@ jobs:
           # shellcheck disable=SC2086
           docker build $cache_args -t doc-worker:e2e .
 
-      - name: Run umlaut e2e
+      - name: Run e2e OCR (umlaut + layout variants)
         env:
           EVENT: ${{ github.event_name }}
           OCR_RELATED: ${{ needs.filter.outputs.ocr_related }}
@@ -188,11 +188,15 @@ jobs:
           # ("can't open file '/e2e/umlaut_e2e.py'"). The image was just
           # built from this commit, so the in-image copy is the exact
           # code under test.
+          # Both e2e suites run in ONE container: a second `docker run`
+          # would cold-start the PP-StructureV3 model again (double
+          # model-init time on every OCR-related push, inside the
+          # 45-minute publish-gate budget).
           docker run --rm \
             -w /app \
             -e PYTHONPATH=/app \
             doc-worker:e2e \
-            python /app/tests/e2e/umlaut_e2e.py
+            bash -c "python /app/tests/e2e/umlaut_e2e.py && python /app/tests/e2e/variants_e2e.py"
 
   should-push:
     runs-on: ubuntu-latest

@@ -11,6 +11,10 @@ from unittest.mock import patch
 import pytest
 
 from paddlex_helpers import (
+    DEFAULT_PDFTOPPM_TIMEOUT,
+    LEGACY_DPI,
+    RENDER_DPI,
+    _sort_blocks_by_reading_order,
     blocks_to_markdown,
     paddleocr_lang_code,
     run_paddleocr,
@@ -161,6 +165,33 @@ class TestBlocksToMarkdown:
         assert "Name" in result
         assert "Alice" in result
 
+    def test_out_of_order_input_preserved(self):
+        """No-sort contract: input order is taken as-is (NO sorting).
+
+        A text block lower on the page comes FIRST in the input; a title
+        block higher on the page comes second. A (re-)introduced sort
+        would emit the heading first; the pure serializer keeps the given
+        order (paragraph line before the heading line).
+        """
+        blocks = [
+            {
+                "type": "text",
+                "text": "Lower paragraph first.",
+                "bbox": [10, 500, 400, 540],
+                "confidence": 0.9,
+            },
+            {
+                "type": "title",
+                "text": "Upper title second",
+                "bbox": [10, 50, 300, 80],
+                "confidence": 0.95,
+            },
+        ]
+        result = blocks_to_markdown(blocks)
+        assert result.index("Lower paragraph first.") < result.index(
+            "# Upper title second"
+        )
+
     def test_reading_order_sort(self):
         blocks = [
             {
@@ -182,13 +213,16 @@ class TestBlocksToMarkdown:
                 "confidence": 0.95,
             },
         ]
-        result = blocks_to_markdown(blocks)
-        # Title (y=50, x=50) should come first, then Right block (y=50, x=300), then Left block (y=100, x=50)
-        assert result.index("Title") < result.index("Right block")
-        assert result.index("Right block") < result.index("Left block")
+        order = [b["text"] for b in _sort_blocks_by_reading_order(blocks)]
+        # No span (all widths ≤ 70% of page width 400) and two column
+        # clusters (left edges 50 / 300, gap > 50px) → the whole page is
+        # one band read column-first: Title and Left block (left column,
+        # top→bottom) before Right block (right column). The old (y, col)
+        # key produced Title, Right, Left (top-to-bottom interleaving).
+        assert order == ["Title", "Left block", "Right block"]
 
     def test_reading_order_multi_column(self):
-        """Test multi-column layout: left column items before right column at same height."""
+        """Test multi-column layout: the entire left column reads before the entire right column."""
         blocks = [
             {
                 "type": "text",
@@ -215,12 +249,425 @@ class TestBlocksToMarkdown:
                 "confidence": 0.9,
             },
         ]
-        result = blocks_to_markdown(blocks)
-        # Left col 1 should come before Right col 1, and Left col 2 before Right col 2
-        assert result.index("Left col 1") < result.index("Right col 1")
-        assert result.index("Left col 2") < result.index("Right col 2")
-        # Columns interleave: Left1, Right1, Left2, Right2 (same y ranges)
-        assert result.index("Right col 1") < result.index("Left col 2")
+        # Two column clusters (left edges 20 / 350) and no spans → one
+        # band read column-first: Left col 1, Left col 2, then Right col
+        # 1, Right col 2 (top→bottom within each column). The old (y, col)
+        # key interleaved L1, R1, L2, R2.
+        assert [b["text"] for b in _sort_blocks_by_reading_order(blocks)] == [
+            "Left col 1",
+            "Left col 2",
+            "Right col 1",
+            "Right col 2",
+        ]
+
+    def test_reading_order_spanning_title_first(self):
+        """A full-width (span) title above two columns stays first."""
+        blocks = [
+            {
+                "type": "title",
+                "text": "Report Title",
+                "bbox": [50, 20, 550, 60],  # width 500 > 70% of 550 → span
+                "confidence": 0.99,
+            },
+            {
+                "type": "text",
+                "text": "Left one",
+                "bbox": [20, 100, 200, 180],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "Right one",
+                "bbox": [350, 100, 530, 180],
+                "confidence": 0.9,
+            },
+        ]
+        # Span band-splitting: title first, then band 1 column-first.
+        assert [b["text"] for b in _sort_blocks_by_reading_order(blocks)] == [
+            "Report Title",
+            "Left one",
+            "Right one",
+        ]
+
+    def test_reading_order_span_between_bands(self):
+        """A full-width table span between two column bands stays in place."""
+        table_html = (
+            "<html><body><table><tr><td>MIDTABLE</td></tr></table></body></html>"
+        )
+        blocks = [
+            {
+                "type": "text",
+                "text": "Left one",
+                "bbox": [20, 20, 200, 100],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "Right one",
+                "bbox": [350, 20, 530, 100],
+                "confidence": 0.9,
+            },
+            {
+                "type": "table",
+                "text": table_html,
+                "bbox": [0, 150, 600, 180],  # width 600 > 70% of 600 → span
+                "confidence": 0.95,
+            },
+            {
+                "type": "text",
+                "text": "Left two",
+                "bbox": [20, 200, 200, 280],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "Right two",
+                "bbox": [350, 200, 530, 280],
+                "confidence": 0.9,
+            },
+        ]
+        # Band 0 (L1, R1) → span → band 1 (L2, R2): the table is emitted
+        # between the bands, not dragged into a column by its left edge.
+        assert [b["text"] for b in _sort_blocks_by_reading_order(blocks)] == [
+            "Left one",
+            "Right one",
+            table_html,
+            "Left two",
+            "Right two",
+        ]
+
+    def test_reading_order_full_width_footer_stays(self):
+        """A full-width footer below two columns is emitted after both columns."""
+        blocks = [
+            {
+                "type": "text",
+                "text": "Left one",
+                "bbox": [20, 20, 200, 100],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "Right one",
+                "bbox": [350, 20, 530, 100],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "Footer text",
+                "bbox": [0, 300, 600, 320],  # width 600 > 70% of 600 → span
+                "confidence": 0.9,
+            },
+        ]
+        assert [b["text"] for b in _sort_blocks_by_reading_order(blocks)] == [
+            "Left one",
+            "Right one",
+            "Footer text",
+        ]
+
+    def test_reading_order_narrow_cells_column_blocks(self):
+        """Word-style LEFT|RIGHT split: full-width header + two ~0.45-width cells.
+
+        The cells are non-spans (width < 70% of page) and read as column
+        blocks: header first, then the full left cell, then the full right
+        cell (not interleaved row-by-row).
+        """
+        blocks = [
+            {
+                "type": "text",
+                "text": "WORDHEADER",
+                "bbox": [0, 10, 600, 40],  # width 600 > 70% of 600 → span
+                "confidence": 0.99,
+            },
+            {
+                "type": "text",
+                "text": "WORDLEFT",
+                "bbox": [20, 60, 300, 140],  # width 280 ≈ 0.47 of 600 → non-span
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "WORDRIGHT",
+                "bbox": [320, 60, 600, 140],  # width 280 → non-span
+                "confidence": 0.9,
+            },
+        ]
+        assert [b["text"] for b in _sort_blocks_by_reading_order(blocks)] == [
+            "WORDHEADER",
+            "WORDLEFT",
+            "WORDRIGHT",
+        ]
+
+    def test_reading_order_single_column_unchanged(self):
+        """A single-column document stays in plain top-to-bottom order."""
+        blocks = [
+            {
+                "type": "text",
+                "text": "Para two",
+                "bbox": [55, 200, 165, 260],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "Para one",
+                "bbox": [50, 20, 160, 80],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "Para three",
+                "bbox": [52, 300, 162, 360],
+                "confidence": 0.9,
+            },
+        ]
+        # Left edges 50/55/52 within the default (DPI-scaled) threshold →
+        # one column cluster → plain (y, x) sort, even though input is
+        # shuffled.
+        assert [b["text"] for b in _sort_blocks_by_reading_order(blocks)] == [
+            "Para one",
+            "Para two",
+            "Para three",
+        ]
+
+    # ── H2: DPI-aware default column threshold ─────────────────────────
+    def test_reading_order_hanging_indent_default_threshold(self):
+        """Hanging-indent regression (H2): an 80 px indent must not look like a column.
+
+        Single-column page at its TRUE width (page_width=2480, A4 @ 300
+        dpi), three narrow blocks (~400 px wide, well under the 70% span
+        limit): A is a paragraph line, C is A's hanging-indent
+        continuation (80 px ≈ 6.8 mm at 300 dpi), B is the next paragraph
+        line.
+
+        Default threshold = 50 px * RENDER_DPI / 150 = 100 px at 300 dpi
+        (≈ 8.5 mm — the physical scale of the old 50 px @ 150 dpi literal):
+        the 80 px indent stays inside one column cluster → plain (y, x) →
+        [A, C, B].
+
+        Guard: with the old 50 px literal the 80 px indent splits a phantom
+        second column and the column-first sort displaces the continuation
+        line after the next paragraph: [A, B, C].
+        """
+        blocks = [
+            {
+                "type": "text",
+                "text": "A",
+                "bbox": [100, 100, 500, 140],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "C",
+                "bbox": [180, 150, 580, 190],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "B",
+                "bbox": [100, 200, 500, 240],
+                "confidence": 0.9,
+            },
+        ]
+        assert [
+            b["text"] for b in _sort_blocks_by_reading_order(blocks, page_width=2480)
+        ] == ["A", "C", "B"]
+        # Old 50 px literal (≈ 4.2 mm at 300 dpi) mis-splits the indent.
+        assert [
+            b["text"]
+            for b in _sort_blocks_by_reading_order(
+                blocks, column_threshold=50.0, page_width=2480
+            )
+        ] == ["A", "B", "C"]
+
+    # ── H4: span heuristic must use the true page width ─────────────────
+    def test_reading_order_span_boundary_true_width(self):
+        """Span limit must use the TRUE page width, not the content extent.
+
+        page_width=1000 → span limit 700 px: A (710 px = 71%) is a span,
+        W (690 px = 69%) is NOT. Expected: A first, then band 1 read
+        column-first (left column L1, W, L2 top→bottom, then right column
+        R1).
+
+        Pins the fix: the old content-extent heuristic measures 950 px here
+        (R1's right edge) → limit 665 px → W also classifies as a span and
+        splits the bands, yielding [A, L1, R1, W, L2] (W drags L2 after
+        itself).
+        """
+        blocks = [
+            {"type": "text", "text": "A", "bbox": [0, 0, 710, 40], "confidence": 0.9},
+            {
+                "type": "text",
+                "text": "W",
+                "bbox": [0, 200, 690, 240],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "L1",
+                "bbox": [0, 100, 400, 140],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "L2",
+                "bbox": [0, 300, 400, 340],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "R1",
+                "bbox": [900, 100, 950, 140],
+                "confidence": 0.9,
+            },
+        ]
+        assert [
+            b["text"] for b in _sort_blocks_by_reading_order(blocks, page_width=1000)
+        ] == ["A", "L1", "W", "L2", "R1"]
+
+    def test_reading_order_span_boundary_pair_69_vs_71(self):
+        """At page_width=1000, a width-710 block classifies as a span, width-690 does not.
+
+        Minimal layout where BOTH classifications are observable:
+        - if T71 (width 710 = 71%) were NOT a span, the whole page would
+          be one column-first band and T71 (left column, topmost) would be
+          emitted BEFORE the top-right narrow block;
+        - if N69 (width 690 = 69%) WERE a span, it would split a band and
+          the right-column block below it (RMid) would be emitted BEFORE
+          it.
+        Expected: RTop first (band 0, above the span), T71 (span), then
+        band 1 column-first (N69 in the left column before RMid on the
+        right).
+        """
+        blocks = [
+            {
+                "type": "text",
+                "text": "RTop",
+                "bbox": [900, 20, 950, 60],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "T71",
+                "bbox": [0, 100, 710, 140],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "N69",
+                "bbox": [0, 250, 690, 290],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "RMid",
+                "bbox": [900, 180, 950, 220],
+                "confidence": 0.9,
+            },
+        ]
+        assert [
+            b["text"] for b in _sort_blocks_by_reading_order(blocks, page_width=1000)
+        ] == ["RTop", "T71", "N69", "RMid"]
+
+    def test_reading_order_fallback_content_extent(self):
+        """page_width=None reproduces the pre-true-width content-extent heuristic.
+
+        Same layout as test_reading_order_span_boundary_true_width but with
+        no true width: the extent is R1's right edge (950) → limit 665 px →
+        W (690 px) ALSO classifies as a span and splits the bands:
+        [A, L1, R1, W, L2] — vs [A, L1, W, L2, R1] with page_width=1000.
+        """
+        blocks = [
+            {"type": "text", "text": "A", "bbox": [0, 0, 710, 40], "confidence": 0.9},
+            {
+                "type": "text",
+                "text": "W",
+                "bbox": [0, 200, 690, 240],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "L1",
+                "bbox": [0, 100, 400, 140],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "L2",
+                "bbox": [0, 300, 400, 340],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "R1",
+                "bbox": [900, 100, 950, 140],
+                "confidence": 0.9,
+            },
+        ]
+        assert [b["text"] for b in _sort_blocks_by_reading_order(blocks)] == [
+            "A",
+            "L1",
+            "R1",
+            "W",
+            "L2",
+        ]
+
+    # ── Review T2: branch coverage ──────────────────────────────────────
+    def test_reading_order_single_cluster_band_fallback(self):
+        """Two column clusters overall, but one band whose blocks all lie within
+        the column threshold → that band sorts plain (y, x).
+
+        The page has two column clusters overall (left edges 0 / 600 in
+        band 0). Below the span, R1 (x=100) and R2 (x=170) are 70 px apart
+        (≤ the default 100 px threshold at 300 dpi): they share one
+        cluster, so their band is emitted plain (y, x). R2 is listed first
+        in the input to prove the band is sorted, not passed through.
+        """
+        blocks = [
+            {"type": "text", "text": "Q1", "bbox": [0, 20, 150, 60], "confidence": 0.9},
+            {
+                "type": "text",
+                "text": "Q2",
+                "bbox": [600, 30, 750, 70],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "T",
+                "bbox": [0, 100, 710, 140],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "R2",
+                "bbox": [170, 210, 320, 250],
+                "confidence": 0.9,
+            },
+            {
+                "type": "text",
+                "text": "R1",
+                "bbox": [100, 200, 250, 240],
+                "confidence": 0.9,
+            },
+        ]
+        assert [
+            b["text"] for b in _sort_blocks_by_reading_order(blocks, page_width=1000)
+        ] == ["Q1", "Q2", "T", "R1", "R2"]
+
+    def test_reading_order_degenerate_overlap_joins_band_below(self):
+        """A block whose top edge falls INSIDE a span's y-range (overlapping model
+        output) joins the band BELOW that span → emitted after it.
+
+        Span S occupies y=0..50; B's top edge y=25 is inside that range.
+        Deterministic degenerate case: B joins band 1 (below S), so the
+        order is [S, B, C], not [B, S, C].
+        """
+        blocks = [
+            {"type": "text", "text": "S", "bbox": [0, 0, 710, 50], "confidence": 0.9},
+            {"type": "text", "text": "B", "bbox": [0, 25, 300, 70], "confidence": 0.9},
+            {"type": "text", "text": "C", "bbox": [0, 60, 300, 100], "confidence": 0.9},
+        ]
+        assert [
+            b["text"] for b in _sort_blocks_by_reading_order(blocks, page_width=1000)
+        ] == ["S", "B", "C"]
 
     def test_empty_blocks(self):
         result = blocks_to_markdown([])
@@ -251,6 +698,17 @@ class TestBlocksToMarkdown:
         assert "# Title" in result
         assert "Paragraph" in result
         assert "## Subtitle" in result
+
+
+# ── DPI-scaled defaults ─────────────────────────────────────────────────────
+class TestRenderDpiDefaults:
+    """The pixel-scaled defaults derive from one LEGACY_DPI base."""
+
+    def test_pdftoppm_timeout_scales_from_legacy_dpi(self):
+        """DEFAULT_PDFTOPPM_TIMEOUT scales off LEGACY_DPI, not a hardcoded 150."""
+        assert DEFAULT_PDFTOPPM_TIMEOUT == round(120 * (RENDER_DPI / LEGACY_DPI) ** 2)
+        # True at RENDER_DPI=300, LEGACY_DPI=150.
+        assert DEFAULT_PDFTOPPM_TIMEOUT == 480
 
 
 # ── OCR run function tests (with mocks) ───────────────────────────────────
@@ -326,6 +784,163 @@ class TestRunPaddlexStructureV3:
         assert "Title of Document" in pages[0]["text"]
         assert len(pages[0]["structured_blocks"]) == 3
 
+    def test_page_width_glue_true_image_end_to_end(
+        self, mock_paddlex_structure_v3_pipeline, tmp_path
+    ):
+        """Real page image → _image_width_px → span sort + page_width_px.
+
+        The sibling mocked tests use a nonexistent PNG path, so
+        _image_width_px fails soft to None and a regression that always
+        returns None would pass them all. Here the "rendered" page is a
+        REAL 2480 px-wide PNG (A4 @ 300 dpi) and the mocked model emits a
+        two-column layout where the TRUE width (2480 → span limit 1736 px)
+        changes the reading order vs the content-extent fallback:
+
+        - H (width 1900 px) is a span at true width; W (1600 px) is not.
+          Content-extent fallback: extent = 2100 (R1's right edge) → span
+          limit 1470 px → W is a span too, dragging R1 up before W:
+          [H, L1, R1, W, L2].
+        - True width: H first (wide span/header), then the remaining band
+          read column-first — left column top→bottom (L1, W, L2), then the
+          right column (R1): [H, L1, W, L2, R1].
+        """
+        pytest.importorskip("PIL")
+        from PIL import Image
+
+        png_path = tmp_path / "page-1.png"
+        Image.new("RGB", (2480, 3508), "white").save(str(png_path))
+
+        result_dict = {
+            "overall_ocr_res": {
+                "rec_texts": [
+                    "Right col line",
+                    "Wide header",
+                    "Left col line 2",
+                    "Wide body line",
+                    "Left col line 1",
+                ],
+                "rec_scores": [0.9] * 5,
+                "rec_boxes": [[0, 0, 100, 20]] * 5,
+                "rec_polys": [],
+            },
+            # Deliberately out of reading order (raw model output order):
+            # the sort inside _process_structure_v3_pages must reorder it.
+            "parsing_res_list": [
+                {
+                    "block_label": "text",
+                    "block_content": "Right col line",
+                    "block_bbox": [2000, 100, 2100, 140],
+                },
+                {
+                    "block_label": "text",
+                    "block_content": "Wide header",
+                    "block_bbox": [0, 0, 1900, 40],
+                },
+                {
+                    "block_label": "text",
+                    "block_content": "Left col line 2",
+                    "block_bbox": [0, 300, 400, 340],
+                },
+                {
+                    "block_label": "text",
+                    "block_content": "Wide body line",
+                    "block_bbox": [0, 200, 1600, 240],
+                },
+                {
+                    "block_label": "text",
+                    "block_content": "Left col line 1",
+                    "block_bbox": [0, 100, 400, 140],
+                },
+            ],
+            "layout_det_res": {"boxes": []},
+        }
+
+        # Same PaddleX-mocking pattern as the sibling tests, but with this
+        # test's own model output and a REAL rendered page image.
+        mock_paddlex_structure_v3_pipeline.predict.side_effect = lambda _path: iter(
+            [result_dict]
+        )
+        with patch("paddlex_helpers._pdf_to_images", return_value=[str(png_path)]):
+            pages = run_paddlex_structure_v3("/tmp/test.pdf")
+
+        assert len(pages) == 1
+        # The field's consumer — previously dead on every mocked test
+        # (nonexistent PNG path → _image_width_px fails soft to None).
+        assert pages[0]["page_width_px"] == 2480
+        # True width (2480) drives the span heuristic: H is the only span,
+        # the remaining band is read column-first.
+        assert [b["text"] for b in pages[0]["structured_blocks"]] == [
+            "Wide header",
+            "Left col line 1",
+            "Wide body line",
+            "Left col line 2",
+            "Right col line",
+        ]
+
+    @pytest.mark.usefixtures(
+        "mock_paddlex_structure_v3_pipeline",
+        "mock_pdf_to_images",
+    )
+    @pytest.mark.parametrize(
+        "degenerate_bbox",
+        [[], [1.0], [1, None, 3, 4], "garbage", None],
+        ids=["empty", "short", "none-element", "string", "none"],
+    )
+    def test_degenerate_block_bbox_fails_soft_to_zero_box(
+        self, mock_paddlex_structure_v3_pipeline, degenerate_bbox
+    ):
+        """A degenerate model block_bbox must not 500 the whole request.
+
+        The reading-order span heuristic indexes bbox[0]/bbox[2] (and takes
+        the max right edge); an empty/short box, a None or non-numeric
+        element, or a bare non-sequence used to raise IndexError/TypeError
+        in _sort_blocks_by_reading_order. Extraction now normalizes such
+        boxes to the zero box at the source, keeping the block's text.
+        """
+        import json
+
+        result_dict = {
+            "overall_ocr_res": {
+                "rec_texts": ["Good", "Bad"],
+                "rec_scores": [0.9, 0.9],
+                "rec_boxes": [[0, 0, 100, 20], [0, 40, 100, 60]],
+                "rec_polys": [],
+            },
+            # One well-formed box (passthrough assertion) plus the
+            # parameterized degenerate one.
+            "parsing_res_list": [
+                {
+                    "block_label": "text",
+                    "block_content": "Good",
+                    "block_bbox": [10.0, 20.0, 300.0, 60.0],
+                },
+                {
+                    "block_label": "text",
+                    "block_content": "Bad",
+                    "block_bbox": degenerate_bbox,
+                },
+            ],
+            "layout_det_res": {"boxes": []},
+        }
+
+        # Same PaddleX-mocking pattern as the sibling end-to-end tests,
+        # with this test's own model output.
+        mock_paddlex_structure_v3_pipeline.predict.side_effect = lambda _path: iter(
+            [result_dict]
+        )
+        pages = run_paddlex_structure_v3("/tmp/test.pdf")
+
+        assert len(pages) == 1
+        by_text = {b["text"]: b for b in pages[0]["structured_blocks"]}
+        # Both blocks survive extraction + the reading-order sort.
+        assert set(by_text) == {"Good", "Bad"}
+        # The well-formed box passes through unchanged (byte-identical).
+        assert by_text["Good"]["bbox"] == [10.0, 20.0, 300.0, 60.0]
+        # The degenerate box is replaced by the zero box at extraction.
+        assert by_text["Bad"]["bbox"] == [0, 0, 0, 0]
+        # The full page dict must serialize with NO default= (500 mode).
+        json.dumps(pages)
+
 
 # ── Numpy-typed structured_blocks serializability ─────────────────────────
 class TestJsonable:
@@ -400,6 +1015,82 @@ class TestJsonable:
                 return self._value
 
         assert _jsonable(_ItemOnly(3.5)) == 3.5
+
+
+# ── bbox normalization ──────────────────────────────────────────────────────
+class TestNormalizeBbox:
+    """_normalize_bbox coerces any degenerate model box to the zero box."""
+
+    def test_wellformed_list_passthrough(self):
+        from paddlex_helpers import _normalize_bbox
+
+        out = _normalize_bbox([1.0, 2.0, 3.0, 4.0])
+        assert out == [1.0, 2.0, 3.0, 4.0]
+        assert all(type(v) is float for v in out)
+
+    def test_ndarray_passthrough(self):
+        """The 4-element ndarray shape PaddleX emits for normal blocks."""
+        import numpy as np
+
+        from paddlex_helpers import _normalize_bbox
+
+        out = _normalize_bbox(np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
+        assert out == [1.0, 2.0, 3.0, 4.0]
+        assert all(type(v) is float for v in out)
+
+    def test_list_of_numpy_scalars_passthrough(self):
+        """The production-incident shape: block_bbox as a list of np.float32."""
+        import numpy as np
+
+        from paddlex_helpers import _normalize_bbox
+
+        out = _normalize_bbox(
+            [np.float32(1.0), np.float32(2.0), np.float32(3.0), np.float32(4.0)]
+        )
+        assert out == [1.0, 2.0, 3.0, 4.0]
+        assert all(type(v) is float for v in out)
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, [0.0, 0.0, 0.0, 0.0]),
+            ([], [0.0, 0.0, 0.0, 0.0]),
+            ([1.0], [0.0, 0.0, 0.0, 0.0]),
+            ([1, None, 3, 4], [0.0, 0.0, 0.0, 0.0]),
+            (["a", 2.0, 3.0, 4.0], [0.0, 0.0, 0.0, 0.0]),
+            ("garbage", [0.0, 0.0, 0.0, 0.0]),
+            ("1234", [0.0, 0.0, 0.0, 0.0]),
+            (5, [0.0, 0.0, 0.0, 0.0]),
+            ([float("nan"), 1.0, 2.0, 3.0], [0.0, 0.0, 0.0, 0.0]),
+            ([1.0, float("inf"), 2.0, 3.0], [0.0, 0.0, 0.0, 0.0]),
+            ({"0": 0.0, "1": 1.0, "2": 2.0, "3": 3.0}, [0.0, 0.0, 0.0, 0.0]),
+        ],
+        ids=[
+            "none",
+            "empty",
+            "short",
+            "none-element",
+            "non-numeric-element",
+            "string",
+            "numeric-string",
+            "bare-scalar",
+            "nan-element",
+            "inf-element",
+            "dict",
+        ],
+    )
+    def test_degenerate_inputs_fail_soft_to_zero_box(self, raw, expected):
+        """Anything but exactly four finite numerics degrades to the zero box.
+
+        NaN/Inf are valid floats but would 500 the response later (the
+        server serializes with json.dumps(allow_nan=False)); a 4-key dict
+        would otherwise yield its *keys* as the box.
+        """
+        from paddlex_helpers import _normalize_bbox
+
+        out = _normalize_bbox(raw)
+        assert out == expected
+        assert all(type(v) is float for v in out)
 
 
 class TestStructuredBlocksNumpySerializability:

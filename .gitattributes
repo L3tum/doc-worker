@@ -1,0 +1,5 @@
+# PDF fixtures are binary content: never line-ending-translate on checkout.
+# two_column.pdf is git-tracked as "text" (uncompressed pikepdf output), so a
+# core.autocrlf=true checkout would CRLF-corrupt its content stream and the
+# fixture would no longer render as the e2e tests expect.
+tests/fixtures/*.pdf -text

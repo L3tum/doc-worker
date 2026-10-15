@@ -33,18 +33,21 @@ Additional endpoints (not used by Open-WebUI, for direct API access):
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import hmac
 import http.server
 import json
 import logging
 import os
+import struct
 import tempfile
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
@@ -86,6 +89,12 @@ HEALTH_CHECK_PORT = int(os.getenv("HEALTH_CHECK_PORT", "8001"))
 
 # Image extensions that Open-WebUI sends as fileType=1
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
+
+# Shared 415 detail for /layout-parsing and /extract (single source of truth).
+UNSUPPORTED_FILE_TYPE_DETAIL = (
+    "Unsupported file type: content is not a recognizable PDF, "
+    "image (PNG/JPEG/GIF/BMP/WebP/TIFF) or text file."
+)
 
 logger = logging.getLogger("doc-worker.api")
 
@@ -446,43 +455,166 @@ class SafeJSONResponse(JSONResponse):
 
 
 def _check_token(authorization: str | None) -> None:
-    """Validate the Authorization: Bearer <value> header."""
+    """Validate the Authorization: Bearer <value> header.
+
+    The presented token is compared with hmac.compare_digest (constant-time)
+    against PADDLEOCR_VL_TOKEN.
+    """
     if not PADDLEOCR_VL_TOKEN:
         return  # No token configured, skip auth
     if not authorization:
         raise HTTPException(401, "Missing Authorization header")
-    if authorization != f"Bearer {PADDLEOCR_VL_TOKEN}":
+    if not authorization.startswith("Bearer "):
         raise HTTPException(403, "Invalid token")
+    token = authorization[len("Bearer ") :]
+    if not hmac.compare_digest(
+        token.encode("utf-8"), PADDLEOCR_VL_TOKEN.encode("utf-8")
+    ):
+        raise HTTPException(403, "Invalid token")
+
+
+# ── Magic-byte signatures (canonical table) ───────────────────────────
+# ONE canonical table of (name, predicate) entries drives BOTH
+# _is_text_content's step-1 binary rejection and detect_file_type's
+# pdf/image classification. Signatures are anchored at the start of the
+# content after skipping leading whitespace/control bytes (see
+# _skip_leading_noise).
+#
+# The reject-only entries (zip, gzip, bzip2, lzip) are binary containers we
+# do not accept: _is_text_content rejects them, and detect_file_type reports
+# them as "unknown" (never "image").
+#
+# WebP is the only RIFF content accepted: WAV/AVI share the RIFF container,
+# so a bare "RIFF" prefix must not classify as image. BMP requires a
+# plausible file-size DWORD (offset 2) plus a known DIB header-size DWORD
+# (offset 14), which is what excludes plain text starting with "BMW…".
+
+_BMP_DIB_SIZES = frozenset({12, 40, 64, 108, 124})
+
+
+def _sig_pdf(content: bytes) -> bool:
+    return content.startswith(b"%PDF")
+
+
+def _sig_png(content: bytes) -> bool:
+    return content.startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def _sig_jpeg(content: bytes) -> bool:
+    return content.startswith(b"\xff\xd8\xff")
+
+
+def _sig_gif(content: bytes) -> bool:
+    return content.startswith(b"GIF8")  # GIF87a or GIF89a
+
+
+def _sig_bmp(content: bytes) -> bool:
+    # "BM" + file-size DWORD (offset 2; 0 = unspecified, else >= 14) +
+    # DIB header-size DWORD (offset 14) in _BMP_DIB_SIZES. 18 bytes
+    # needed to read both DWORDs.
+    if len(content) < 18 or content[0:2] != b"BM":
+        return False
+    file_size = struct.unpack_from("<I", content, 2)[0]
+    dib_size = struct.unpack_from("<I", content, 14)[0]
+    return (file_size == 0 or file_size >= 14) and dib_size in _BMP_DIB_SIZES
+
+
+def _sig_webp(content: bytes) -> bool:
+    # RIFF-anchored: "RIFF" magic at offset 0 plus the "WEBP" fourcc at
+    # offset 8. The anchor is required so a non-RIFF "WEBP" at offset 8
+    # (e.g. plain ASCII text) does not classify as image; WAV/AVI share
+    # the RIFF container and stay excluded by the fourcc. The length
+    # guard is implicit — slicing shorter bytes yields a shorter result.
+    return content[:4] == b"RIFF" and content[8:12] == b"WEBP"
+
+
+def _sig_tiff_le(content: bytes) -> bool:
+    return content.startswith(b"II\x2a\x00")
+
+
+def _sig_tiff_be(content: bytes) -> bool:
+    return content.startswith(b"MM\x00\x2a")
+
+
+def _sig_zip(content: bytes) -> bool:
+    return content.startswith(b"PK\x03\x04")  # ZIP-based: ODF, DOCX, XLSX, etc.
+
+
+def _sig_gzip(content: bytes) -> bool:
+    return content.startswith(b"\x1f\x8b")
+
+
+def _sig_bzip2(content: bytes) -> bool:
+    return content.startswith(b"BZ")
+
+
+def _sig_lzip(content: bytes) -> bool:
+    return content.startswith(b"x\xda\x03")
+
+
+_FILE_SIGNATURES: tuple[tuple[str, Callable[[bytes], bool]], ...] = (
+    ("pdf", _sig_pdf),
+    ("png", _sig_png),
+    ("jpeg", _sig_jpeg),
+    ("gif", _sig_gif),
+    ("bmp", _sig_bmp),
+    ("webp", _sig_webp),
+    ("tiff_le", _sig_tiff_le),
+    ("tiff_be", _sig_tiff_be),
+    # Reject-only: binary containers, unsupported input.
+    ("zip", _sig_zip),
+    ("gzip", _sig_gzip),
+    ("bzip2", _sig_bzip2),
+    ("lzip", _sig_lzip),
+)
+
+# _FILE_SIGNATURES names that detect_file_type classifies as "image".
+_IMAGE_SIGNATURE_NAMES = frozenset(
+    {"png", "jpeg", "gif", "bmp", "webp", "tiff_le", "tiff_be"}
+)
+
+# Leading bytes skipped before the magic-byte anchors: controls 0x00–0x1F
+# plus space. Some producers pad the file header, and an offset-0-strict
+# "%PDF" anchor would misroute such files: leading binary header bytes made
+# them 415 (they OCR'd fine before), and leading whitespace made them pass
+# through as raw text. bytes.lstrip is a C-speed scan, so this stays cheap
+# on large uploads.
+_LEADING_ANCHOR_NOISE = bytes(range(0x21))
+
+
+def _skip_leading_noise(content: bytes) -> bytes:
+    """Return *content* with leading whitespace/control bytes removed.
+
+    The anchor view for the magic-byte signatures (see
+    _LEADING_ANCHOR_NOISE): predicates run against this, so a %PDF header
+    padded with leading LF/CR/NUL still classifies as PDF.
+    """
+    return content.lstrip(_LEADING_ANCHOR_NOISE)
 
 
 def _is_text_content(raw_bytes: bytes) -> bool:
     """Check if raw bytes look like valid text (not a PDF or other binary).
 
     Strategy:
-    1. Reject known binary file signatures anchored at offset 0.
-    2. Strict UTF-8 decode of the first 8 KB: UnicodeDecodeError means binary.
+    1. Reject known binary file signatures (the canonical
+       _FILE_SIGNATURES table, anchored after leading whitespace/control
+       bytes — see _skip_leading_noise).
+    2. Strict UTF-8 decode of the first 8 KB: UnicodeDecodeError means
+       binary. NUL bytes in the sample are rejected explicitly — NUL is
+       *valid* UTF-8, so the decode alone cannot catch 7-bit-clean
+       binaries (e.g. a near-silent small WAV).
     3. For files > 10 KB, also decode the last 8 KB to catch binary formats
-       with printable headers (e.g., uncompressed PDFs with binary stream data
-       later in the file).
+       with printable headers (e.g., uncompressed PDFs with binary stream
+       data later in the file); NULs in the tail are rejected the same way.
     """
     if not raw_bytes:
         return False
 
-    # Step 1: Known binary signatures — anchored at offset 0
-    binary_signatures = [
-        b"%PDF",  # PDF
-        b"\x89PNG\r\n\x1a\n",  # PNG
-        b"\xff\xd8\xff",  # JPEG (any valid JPEG)
-        b"GIF8",  # GIF (87a or 89a)
-        b"BM",  # BMP
-        b"RIFF",  # WebP, AVI, etc. (RIFF container)
-        b"PK\x03\x04",  # ZIP-based: ODF, DOCX, XLSX, etc.
-        b"\x1f\x8b",  # GZIP
-        b"BZ",  # bzip2
-        b"x\xda\x03",  # LZIP
-    ]
-    for sig in binary_signatures:
-        if raw_bytes.startswith(sig):
+    # Step 1: Known binary signatures (anchored after leading
+    # whitespace/control bytes — see _skip_leading_noise)
+    probe = _skip_leading_noise(raw_bytes)
+    for _name, predicate in _FILE_SIGNATURES:
+        if predicate(probe):
             return False
 
     # Step 2: Strict UTF-8 decode of first 8 KB — binary data almost always
@@ -495,6 +627,13 @@ def _is_text_content(raw_bytes: bytes) -> bool:
     except UnicodeDecodeError:
         return False
 
+    # Step 2b: NUL is valid UTF-8, so the decode above cannot catch
+    # 7-bit-clean binaries (every byte < 0x80) — without this check a
+    # near-silent small WAV would pass as "text" and be returned verbatim
+    # instead of a 415. Real text files do not contain NUL bytes.
+    if b"\x00" in sample:
+        return False
+
     # Step 3: For large files, also check the tail (last 8 KB) to catch binary
     # formats with printable headers (e.g., uncompressed PDFs whose first 8 KB
     # is valid UTF-8 dictionary text but whose stream data is binary).
@@ -504,8 +643,35 @@ def _is_text_content(raw_bytes: bytes) -> bool:
             tail.decode("utf-8")
         except UnicodeDecodeError:
             return False
+        if b"\x00" in tail:
+            return False
 
     return True
+
+
+def detect_file_type(content: bytes) -> Literal["pdf", "image", "text", "unknown"]:
+    """Classify decoded file content by magic bytes, not caller hints.
+
+    Order: %PDF → known image signatures → UTF-8 text check → unknown.
+    Reject-only binaries (ZIP/GZIP/BZ2/LZIP) never classify as "image" —
+    they fail the text check and therefore yield "unknown".
+    The result drives pipeline routing (PDF → OCR / image → OCR / text
+    passthrough) and the temp-file suffix: a wrong or missing fileType
+    hint or filename extension must not be able to send bytes down the
+    wrong pipeline.
+    """
+    if not content:
+        return "unknown"
+    for name, predicate in _FILE_SIGNATURES:
+        if predicate(_skip_leading_noise(content)):
+            if name == "pdf":
+                return "pdf"
+            if name in _IMAGE_SIGNATURE_NAMES:
+                return "image"
+            return "unknown"  # reject-only binary (zip/gzip/bzip2/lzip)
+    if _is_text_content(content):
+        return "text"
+    return "unknown"
 
 
 # ── Open-WebUI endpoint ──────────────────────────────────────────────
@@ -513,7 +679,7 @@ class LayoutParsingRequest(BaseModel):
     """Request body for Open-WebUI's /layout-parsing endpoint."""
 
     file: str  # base64-encoded file bytes
-    fileType: int = 0  # 0=PDF, 1=image
+    fileType: int = 0  # 0=PDF, 1=image (hint only — content detection wins)
     useDocOrientationClassify: bool = False
     useDocUnwarping: bool = False
     useChartRecognition: bool = False
@@ -553,7 +719,7 @@ async def layout_parsing(
         raise HTTPException(400, "Missing 'file' field")
 
     file_type = body.fileType
-    is_image = file_type == 1
+    hint_kind: Literal["pdf", "image"] = "image" if file_type == 1 else "pdf"
 
     try:
         file_bytes = base64.b64decode(file_b64)
@@ -563,10 +729,24 @@ async def layout_parsing(
     if not file_bytes:
         raise HTTPException(400, "File content is empty")
 
-    # ── Text file detection: if not a PDF, return as-is ──
-    if not is_image and _is_text_content(file_bytes):
-        # Determine file extension from filename hint or default to .txt
-        # (Open-WebUI doesn't send a filename, so we just return the text)
+    # ── Content-based type detection: the bytes decide the pipeline, not
+    # the caller's fileType hint (which Open-WebUI can get wrong or omit).
+    kind = detect_file_type(file_bytes)
+    if kind == "unknown":
+        raise HTTPException(415, UNSUPPORTED_FILE_TYPE_DETAIL)
+    if kind != hint_kind:
+        # A pdf/image hint on plain text is the normal Open-WebUI/.txt
+        # passthrough case — debug, not a warning.
+        log_fn = logger.debug if kind == "text" else logger.warning
+        log_fn(
+            "layout-parsing: fileType hint %s disagrees with content "
+            "detection %s — routing by content",
+            hint_kind,
+            kind,
+        )
+
+    # ── Text file: return as-is ──
+    if kind == "text":
         content = file_bytes.decode("utf-8", errors="replace")
         return SafeJSONResponse(
             content={
@@ -579,8 +759,9 @@ async def layout_parsing(
         )
 
     # ── PDF / image processing ──
-    # Determine temp file extension
-    suffix = ".png" if is_image else ".pdf"
+    # The temp suffix must match the *detected* kind: run_paddlex_structure_v3
+    # routes on the .pdf suffix (pdftoppm pre-render) vs image (direct).
+    suffix = ".png" if kind == "image" else ".pdf"
 
     tmp_path = None
     try:
@@ -592,7 +773,8 @@ async def layout_parsing(
 
         # Use PP-StructureV3 if enabled, fallback to plain OCR
         if os.getenv("USE_STRUCTURE_V3", "true").lower() in ("true", "1"):
-            pages = run_paddlex_structure_v3(tmp_path)
+            # run in a thread: pipeline can take minutes; keep the loop responsive.
+            pages = await asyncio.to_thread(run_paddlex_structure_v3, tmp_path)
             # Build structured markdown per page
             layout_results = []
             for page in pages:
@@ -604,7 +786,9 @@ async def layout_parsing(
                     }
                 )
         else:
-            pages = run_paddleocr(tmp_path)
+            # Same offload as the V3 path: the fallback blocks for minutes
+            # too and must not stall the event loop.
+            pages = await asyncio.to_thread(run_paddleocr, tmp_path)
             layout_results = [
                 {"markdown": {"text": page["text"]}, "structuredBlocks": None}
                 for page in pages
@@ -686,7 +870,7 @@ async def extract_text(
         raise HTTPException(400, "Missing file")
 
     ext = Path(file.filename).suffix.lower()
-    is_image = ext in IMAGE_EXTS
+    hint_kind: Literal["pdf", "image"] = "image" if ext in IMAGE_EXTS else "pdf"
 
     tmp_path = None
     try:
@@ -695,8 +879,24 @@ async def extract_text(
         if not file_bytes:
             raise HTTPException(400, "File content is empty")
 
-        # ── Text file detection: if not an image and looks like text, return as-is ──
-        if not is_image and _is_text_content(file_bytes):
+        # ── Content-based type detection: the bytes decide the pipeline,
+        # not the filename extension (which callers can get wrong or omit).
+        kind = detect_file_type(file_bytes)
+        if kind == "unknown":
+            raise HTTPException(415, UNSUPPORTED_FILE_TYPE_DETAIL)
+        if kind != hint_kind:
+            # A pdf/image extension on plain text is the normal .txt
+            # passthrough case — debug, not a warning.
+            log_fn = logger.debug if kind == "text" else logger.warning
+            log_fn(
+                "extract: extension %r disagrees with content detection %s "
+                "— routing by content",
+                ext,
+                kind,
+            )
+
+        # ── Text file: return as-is ──
+        if kind == "text":
             content = file_bytes.decode("utf-8", errors="replace")
             return SafeJSONResponse(
                 content={
@@ -714,7 +914,9 @@ async def extract_text(
                 }
             )
 
-        suffix = ext if ext else (".png" if is_image else ".pdf")
+        # The temp suffix must match the *detected* kind: run_paddlex_structure_v3
+        # routes on the .pdf suffix (pdftoppm pre-render) vs image (direct).
+        suffix = ".png" if kind == "image" else ".pdf"
 
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(file_bytes)
@@ -724,7 +926,8 @@ async def extract_text(
 
         # Use PP-StructureV3 if enabled, fallback to plain OCR
         if os.getenv("USE_STRUCTURE_V3", "true").lower() in ("true", "1"):
-            pages = run_paddlex_structure_v3(tmp_path)
+            # run in a thread: pipeline can take minutes; keep the loop responsive.
+            pages = await asyncio.to_thread(run_paddlex_structure_v3, tmp_path)
             # Build structured markdown per page
             result_pages = []
             for page in pages:
@@ -739,7 +942,9 @@ async def extract_text(
                     }
                 )
         else:
-            pages = run_paddleocr(tmp_path)
+            # Same offload as the V3 path: the fallback blocks for minutes
+            # too and must not stall the event loop.
+            pages = await asyncio.to_thread(run_paddleocr, tmp_path)
             result_pages = [
                 {
                     "page": p["page"],
