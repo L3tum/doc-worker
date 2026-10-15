@@ -1,7 +1,7 @@
 """
-Doc-Worker — Tests for worker.py sidecar generation.
-
-Tests generate_native_sidecar with mocked PaddleX pipelines.
+Doc-Worker — Tests for worker.py: sidecar generation, AcroForm pre-flatten,
+crash recovery, the retry loop, and Paperless pushes (PaddleX pipelines are
+mocked throughout).
 
 Moved from tests/test_worker.py to tests/unit/test_worker.py: CI
 (docker.yaml) runs `python -m pytest -q tests/`, so this file is now
@@ -29,6 +29,27 @@ from worker import (
     process_with_retries,
     recover_leftover_files,
 )
+
+
+def _point_worker_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point all worker pipeline globals at fresh tmp dirs.
+
+    Uses monkeypatch so the module globals are restored automatically
+    (the old direct assignments leaked into other tests).
+    """
+    import worker
+
+    for attr, subdir in (
+        ("INBOX", "inbox"),
+        ("PROCESSING", "processing"),
+        ("DONE", "done"),
+        ("ERROR", "error"),
+        ("DOCLING_OUT", "docling"),
+        ("PAPERLESS_CONSUME", "paperless"),
+    ):
+        path = tmp_path / subdir
+        path.mkdir(parents=True)
+        monkeypatch.setattr(worker, attr, path)
 
 
 # ── generate_native_sidecar tests ─────────────────────────────────────────
@@ -305,6 +326,94 @@ class TestMoveToError:
             sys.stdout = old_stdout
 
         assert "my custom reason" in stdout_output
+
+
+class TestPushToPaperless:
+    """push_to_paperless: atomic push to the Paperless-ngx consume folder
+    (write .tmp, then rename) — failure paths must not leave a half-pushed
+    file behind."""
+
+    def test_success_pushes_destination(self, tmp_path, monkeypatch):
+        import worker
+
+        monkeypatch.setattr(worker, "PAPERLESS_CONSUME", tmp_path)
+        work = tmp_path / "work"
+        work.mkdir()
+        src = work / "out.pdf"
+        src.write_bytes(b"ocr pdf")
+
+        assert worker.push_to_paperless(src) is True
+        assert (tmp_path / "out.pdf").read_bytes() == b"ocr pdf"
+        assert not (tmp_path / "out.pdf.tmp").exists()
+
+    def test_copy_failure_returns_false_and_cleans_tmp(self, tmp_path, monkeypatch):
+        import worker
+
+        monkeypatch.setattr(worker, "PAPERLESS_CONSUME", tmp_path)
+        work = tmp_path / "work"
+        work.mkdir()
+        src = work / "out.pdf"
+        src.write_bytes(b"ocr pdf")
+        monkeypatch.setattr(
+            worker.shutil,
+            "copy2",
+            lambda s, d: (_ for _ in ()).throw(OSError("disk full")),
+        )
+
+        assert worker.push_to_paperless(src) is False
+        assert not (tmp_path / "out.pdf").exists()
+        assert not (tmp_path / "out.pdf.tmp").exists()
+
+    def test_replace_failure_cleans_tmp(self, tmp_path, monkeypatch):
+        import worker
+
+        monkeypatch.setattr(worker, "PAPERLESS_CONSUME", tmp_path)
+        work = tmp_path / "work"
+        work.mkdir()
+        src = work / "out.pdf"
+        src.write_bytes(b"ocr pdf")
+        monkeypatch.setattr(
+            worker.os,
+            "replace",
+            lambda s, d: (_ for _ in ()).throw(OSError("cross-device")),
+        )
+
+        assert worker.push_to_paperless(src) is False
+        assert not (tmp_path / "out.pdf").exists()
+        assert not (tmp_path / "out.pdf.tmp").exists()
+
+
+class TestUniqueDestination:
+    """unique_destination: must never return a path that already exists
+    (a same-second collision would otherwise overwrite an older error
+    file, since shutil.move overwrites on POSIX)."""
+
+    def test_free_name_returned_as_is(self, tmp_path):
+        import worker
+
+        assert worker.unique_destination(tmp_path, "a.pdf") == tmp_path / "a.pdf"
+
+    def test_existing_destination_gets_timestamp(self, tmp_path):
+        import worker
+
+        (tmp_path / "a.pdf").write_text("x")
+        dest = worker.unique_destination(tmp_path, "a.pdf")
+        assert dest != tmp_path / "a.pdf"
+        assert dest.name.startswith("a_")
+        assert not dest.exists()
+
+    def test_same_second_collision_appends_counter(self, tmp_path):
+        import time
+
+        import worker
+
+        (tmp_path / "a.pdf").write_text("x")
+        ts = time.strftime("%Y%m%d%H%M%S")
+        (tmp_path / f"a_{ts}.pdf").write_text("x")
+
+        dest = worker.unique_destination(tmp_path, "a.pdf")
+        assert dest.name == f"a_{ts}_2.pdf"
+        assert not dest.exists()
 
 
 # ── recover_leftover_files tests ──────────────────────────────────────────
@@ -636,27 +745,6 @@ class TestFlattenAcroform:
             assert flatten_acroform_if_needed(src) is None
         assert stray_dir.is_dir()
 
-    @staticmethod
-    def _point_worker_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Point all worker pipeline globals at fresh tmp dirs.
-
-        Uses monkeypatch so the module globals are restored automatically
-        (the old direct assignments leaked into other tests).
-        """
-        import worker
-
-        for attr, subdir in (
-            ("INBOX", "inbox"),
-            ("PROCESSING", "processing"),
-            ("DONE", "done"),
-            ("ERROR", "error"),
-            ("DOCLING_OUT", "docling"),
-            ("PAPERLESS_CONSUME", "paperless"),
-        ):
-            path = tmp_path / subdir
-            path.mkdir(parents=True)
-            monkeypatch.setattr(worker, attr, path)
-
     def test_process_file_feeds_flattened_copy_to_ocr(
         self, tmp_path, pdfium, monkeypatch
     ):
@@ -666,7 +754,7 @@ class TestFlattenAcroform:
         """
         import worker
 
-        self._point_worker_at(tmp_path, monkeypatch)
+        _point_worker_at(tmp_path, monkeypatch)
         with (
             patch.object(worker, "DOCLING_MODE", "off"),
             patch("worker.run_ocrmypdf") as mock_ocr,
@@ -701,7 +789,7 @@ class TestFlattenAcroform:
         """
         import worker
 
-        self._point_worker_at(tmp_path, monkeypatch)
+        _point_worker_at(tmp_path, monkeypatch)
         with (
             patch.object(worker, "DOCLING_MODE", "off"),
             patch("worker.run_ocrmypdf", side_effect=RuntimeError("boom")) as mock_ocr,
@@ -732,7 +820,7 @@ class TestFlattenAcroform:
         """
         import worker
 
-        self._point_worker_at(tmp_path, monkeypatch)
+        _point_worker_at(tmp_path, monkeypatch)
         with (
             patch.object(worker, "DOCLING_MODE", "off"),
             patch("worker.flatten_acroform_if_needed", return_value=None),
@@ -845,22 +933,6 @@ class TestProcessFileSidecarFlattenOrdering:
     so sidecar and OCR text layer agree for /V-only widgets, while the
     DOCLING_OUT key stays the original filename."""
 
-    @staticmethod
-    def _point_worker_at(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        import worker
-
-        for attr, subdir in (
-            ("INBOX", "inbox"),
-            ("PROCESSING", "processing"),
-            ("DONE", "done"),
-            ("ERROR", "error"),
-            ("DOCLING_OUT", "docling"),
-            ("PAPERLESS_CONSUME", "paperless"),
-        ):
-            path = tmp_path / subdir
-            path.mkdir(parents=True)
-            monkeypatch.setattr(worker, attr, path)
-
     def test_native_sidecar_runs_on_flattened_copy_keyed_by_original(
         self, tmp_path, monkeypatch
     ):
@@ -870,7 +942,7 @@ class TestProcessFileSidecarFlattenOrdering:
         keyed by the original stem."""
         import worker
 
-        self._point_worker_at(tmp_path, monkeypatch)
+        _point_worker_at(tmp_path, monkeypatch)
         flattened = worker.PROCESSING / "form_flattened.pdf"
         flattened.write_bytes(b"flattened copy")
 
@@ -903,7 +975,7 @@ class TestProcessFileSidecarFlattenOrdering:
         recovery on the next startup)."""
         import worker
 
-        self._point_worker_at(tmp_path, monkeypatch)
+        _point_worker_at(tmp_path, monkeypatch)
         flattened = worker.PROCESSING / "form_flattened.pdf"
         flattened.write_bytes(b"flattened copy")
 
@@ -934,7 +1006,7 @@ class TestProcessFileSidecarFlattenOrdering:
         """
         import worker
 
-        self._point_worker_at(tmp_path, monkeypatch)
+        _point_worker_at(tmp_path, monkeypatch)
         flattened = worker.PROCESSING / "form__acroform_flattened__deadbeef.pdf"
         flattened.write_bytes(b"flattened copy")
 

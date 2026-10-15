@@ -336,6 +336,29 @@ class TestLayoutParsingE2E:
             )
         assert response.status_code == 413
 
+    def test_page_limit_413(self, client: TestClient) -> None:
+        """A PDF with more than MAX_OCR_PAGES pages is 413 BEFORE any model
+        work — the pipeline must never start on an oversized job (unbounded
+        300-dpi temp-disk staging is the DoS vector)."""
+        file_b64 = base64.b64encode(_FAKE_PDF).decode()
+        with (
+            patch.object(server, "MAX_OCR_PAGES", 1),
+            patch.object(server, "_count_pdf_pages", return_value=2),
+            patch.object(
+                paddlex_helpers,
+                "_get_paddlex_structure_v3_model",
+                side_effect=AssertionError("pipeline must not run"),
+            ),
+            patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"),
+        ):
+            response = client.post(
+                "/layout-parsing",
+                headers={"Authorization": "Bearer test-token"},
+                json={"file": file_b64, "fileType": 0},
+            )
+        assert response.status_code == 413
+        assert "Too many pages" in response.json()["detail"]
+
     # ── Content-based routing: the bytes decide the pipeline, the hint is a hint ──
     def test_image_content_with_pdf_hint(self, client: TestClient) -> None:
         """fileType=0 (PDF hint) but the bytes are an actual PNG → image pipeline.
@@ -416,6 +439,27 @@ class TestLayoutParsingE2E:
 
 # ── POST /extract — direct upload API ────────────────────────────────────
 class TestExtractE2E:
+    def test_extract_page_limit_413(self, client: TestClient) -> None:
+        """The page cap applies to /extract as well (same shared OCR core).
+        The pipeline must not start on an oversized job."""
+        with (
+            patch.object(server, "MAX_OCR_PAGES", 1),
+            patch.object(server, "_count_pdf_pages", return_value=2),
+            patch.object(
+                paddlex_helpers,
+                "_get_paddlex_structure_v3_model",
+                side_effect=AssertionError("pipeline must not run"),
+            ),
+            patch.object(server, "PADDLEOCR_VL_TOKEN", "test-token"),
+        ):
+            response = client.post(
+                "/extract",
+                headers={"Authorization": "Bearer test-token"},
+                files={"file": ("doc.pdf", _FAKE_PDF, "application/pdf")},
+            )
+        assert response.status_code == 413
+        assert "Too many pages" in response.json()["detail"]
+
     def test_extract_pdf_full_flow(self, client: TestClient) -> None:
         """Multipart upload → structured pages + blocks, numpy payload safe."""
         with (

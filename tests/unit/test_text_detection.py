@@ -72,14 +72,18 @@ class TestIsTextContent:
         assert all(b < 0x80 for b in WAV_7BIT_CLEAN)
         assert server._is_text_content(WAV_7BIT_CLEAN) is False
 
-    def test_rejects_zip(self) -> None:
-        assert server._is_text_content(b"PK\x03\x04" + b"\x00" * 100) is False
-
-    def test_rejects_gzip(self) -> None:
-        assert server._is_text_content(b"\x1f\x8b" + b"\x00" * 100) is False
-
-    def test_rejects_bzip2(self) -> None:
-        assert server._is_text_content(b"BZ" + b"\x00" * 100) is False
+    @pytest.mark.parametrize(
+        "name, data",
+        [
+            ("zip", b"PK\x03\x04" + b"\x00" * 100),
+            ("gzip", b"\x1f\x8b" + b"\x00" * 100),
+            ("bzip2", b"BZ" + b"\x00" * 100),
+            ("lzip", b"x\xda\x03" + b"\x00" * 100),
+        ],
+    )
+    def test_rejects_container_signatures(self, name: str, data: bytes) -> None:
+        """Reject-only container signatures never route to a pipeline."""
+        assert server._is_text_content(data) is False
 
     def test_rejects_random_binary(self) -> None:
         """Random binary data with no known signature must be rejected."""

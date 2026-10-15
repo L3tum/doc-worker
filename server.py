@@ -80,6 +80,12 @@ PADDLEOCR_MODELS = os.getenv("PADDLEOCR_MODELS", "/app/models")
 # Max request body: 100 MB (base64-encoded PDFs can be ~33% larger than raw)
 MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", "104857600"))  # 100 MB default
 
+# Hard page cap per request. At RENDER_DPI=300 an unbounded PDF is an
+# unbounded temp-disk + memory + wall-time allocation on the OCR endpoints
+# (unauthenticated when PADDLEOCR_VL_TOKEN is unset — DoS). Override via
+# MAX_OCR_PAGES.
+MAX_OCR_PAGES = int(os.getenv("MAX_OCR_PAGES", "500"))
+
 # Model idle timeout — destroy PaddleOCR model after N seconds of inactivity
 MODEL_IDLE_TIMEOUT = int(os.getenv("MODEL_IDLE_TIMEOUT", "30"))
 
@@ -427,16 +433,32 @@ async def limit_request_size(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    """Reject requests that exceed MAX_REQUEST_SIZE to prevent disk exhaustion."""
-    content_length = request.headers.get("content-length")
-    if content_length and int(content_length) > MAX_REQUEST_SIZE:
-        return JSONResponse(
-            status_code=413,
-            content={
-                "detail": f"Request too large (max {MAX_REQUEST_SIZE // 1024 // 1024} MB)"
-            },
-        )
+    """Bound every request body (see _body_size_policy) to prevent memory
+    and temp-disk exhaustion."""
+    violation = _body_size_policy(request.method, request.headers.get("content-length"))
+    if violation is not None:
+        return JSONResponse(status_code=413, content={"detail": violation})
     return await call_next(request)
+
+
+def _body_size_policy(method: str, content_length: str | None) -> str | None:
+    """413 detail for a request body, or None if it may proceed.
+
+    - POST without Content-Length (chunked): rejected — the body is fully
+      materialized (memory + temp file) before processing, so without a
+      declared length it is unbounded.
+    - POST with Content-Length > MAX_REQUEST_SIZE: rejected.
+    - Non-POST: no body to bound.
+    """
+    if method != "POST":
+        return None
+    if content_length is None:
+        return (
+            "Transfer-Encoding: chunked uploads are not supported; send Content-Length"
+        )
+    if int(content_length) > MAX_REQUEST_SIZE:
+        return f"Request too large (max {MAX_REQUEST_SIZE // 1024 // 1024} MB)"
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -675,6 +697,112 @@ def detect_file_type(content: bytes) -> Literal["pdf", "image", "text", "unknown
 
 
 # ── Open-WebUI endpoint ──────────────────────────────────────────────
+# ── Shared request plumbing (used by /layout-parsing and /extract) ──────
+def _require_model_ready() -> None:
+    """Early health guard for the OCR endpoints: fail fast with the same
+    503 shape as /health if model initialization failed at startup."""
+    init_exc = get_paddlex_init_exception()
+    if init_exc is not None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "component": "paddlex",
+                "error": str(init_exc),
+            },
+        )
+
+
+def _route_upload(file_bytes: bytes, hint_kind: str, endpoint: str) -> str:
+    """Content-based routing shared by /layout-parsing and /extract: the
+    BYTES decide the pipeline, not the caller's fileType hint (which
+    Open-WebUI can get wrong or omit) or the upload's extension.
+
+    Returns the detected kind ("pdf", "image", or "text"); raises 415 for
+    unrecognized non-text content.
+    """
+    kind = detect_file_type(file_bytes)
+    if kind == "unknown":
+        raise HTTPException(415, UNSUPPORTED_FILE_TYPE_DETAIL)
+    if kind != hint_kind:
+        # A pdf/image hint on plain text is the normal Open-WebUI/.txt
+        # passthrough case — debug, not a warning.
+        log_fn = logger.debug if kind == "text" else logger.warning
+        log_fn(
+            "%s: hint %r disagrees with content detection %s — routing by content",
+            endpoint,
+            hint_kind,
+            kind,
+        )
+    return kind
+
+
+def _count_pdf_pages(file_path: str) -> int | None:
+    """Page count of a PDF via pypdfium2 (already a hard dependency for the
+    AcroForm pre-flatten in worker.py), or None when uncountable — the
+    caller then passes the file through and the pipeline reports its own
+    error if it is actually broken."""
+    try:
+        import pypdfium2
+
+        with pypdfium2.PdfDocument(file_path) as doc:
+            return len(doc)
+    except Exception:
+        return None
+
+
+def _enforce_page_limit(file_path: str, kind: str) -> None:
+    """Reject PDFs with more than MAX_OCR_PAGES pages BEFORE any render or
+    model work (unbounded 300-dpi temp-disk staging — see MAX_OCR_PAGES).
+    Images/text are single-page by construction."""
+    if kind != "pdf":
+        return
+    page_count = _count_pdf_pages(file_path)
+    if page_count is not None and page_count > MAX_OCR_PAGES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Too many pages: {page_count} (max {MAX_OCR_PAGES})",
+        )
+
+
+async def _run_ocr_pipeline(file_bytes: bytes, kind: str) -> tuple[list[dict], bool]:
+    """Shared OCR core for /layout-parsing and /extract: enforce the page
+    cap, stage the detected content in a temp file whose suffix matches the
+    *detected* kind (run_paddlex_structure_v3 routes on the .pdf suffix —
+    pdftoppm pre-render — vs image — direct), run the configured pipeline
+    in a worker thread (it can take minutes; must not stall the event
+    loop), and always clean up the temp file.
+
+    Returns (pages, used_structure_v3). Job completion is stamped before
+    and after so a job longer than MODEL_IDLE_TIMEOUT restarts the idle
+    clock instead of being destroyed on the first poll after it finishes.
+    """
+    suffix = ".png" if kind == "image" else ".pdf"
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        _enforce_page_limit(tmp_path, kind)
+        _mark_model_used()
+
+        if os.getenv("USE_STRUCTURE_V3", "true").lower() in ("true", "1"):
+            # PP-StructureV3
+            pages = await asyncio.to_thread(run_paddlex_structure_v3, tmp_path)
+            used_v3 = True
+        else:
+            # Plain-OCR fallback — same offload: it blocks for minutes too.
+            pages = await asyncio.to_thread(run_paddleocr, tmp_path)
+            used_v3 = False
+
+        _mark_model_used()
+        return pages, used_v3
+    finally:
+        if tmp_path:
+            Path(tmp_path).unlink(missing_ok=True)
+
+
 class LayoutParsingRequest(BaseModel):
     """Request body for Open-WebUI's /layout-parsing endpoint."""
 
@@ -701,18 +829,7 @@ async def layout_parsing(
     raw content as text.
     """
     _check_token(authorization)
-
-    # Early health guard: fail fast if model failed to initialize
-    init_exc = get_paddlex_init_exception()
-    if init_exc is not None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "status": "unhealthy",
-                "component": "paddlex",
-                "error": str(init_exc),
-            },
-        )
+    _require_model_ready()
 
     file_b64 = body.file
     if not file_b64:
@@ -729,21 +846,7 @@ async def layout_parsing(
     if not file_bytes:
         raise HTTPException(400, "File content is empty")
 
-    # ── Content-based type detection: the bytes decide the pipeline, not
-    # the caller's fileType hint (which Open-WebUI can get wrong or omit).
-    kind = detect_file_type(file_bytes)
-    if kind == "unknown":
-        raise HTTPException(415, UNSUPPORTED_FILE_TYPE_DETAIL)
-    if kind != hint_kind:
-        # A pdf/image hint on plain text is the normal Open-WebUI/.txt
-        # passthrough case — debug, not a warning.
-        log_fn = logger.debug if kind == "text" else logger.warning
-        log_fn(
-            "layout-parsing: fileType hint %s disagrees with content "
-            "detection %s — routing by content",
-            hint_kind,
-            kind,
-        )
+    kind = _route_upload(file_bytes, hint_kind, "layout-parsing")
 
     # ── Text file: return as-is ──
     if kind == "text":
@@ -759,45 +862,24 @@ async def layout_parsing(
         )
 
     # ── PDF / image processing ──
-    # The temp suffix must match the *detected* kind: run_paddlex_structure_v3
-    # routes on the .pdf suffix (pdftoppm pre-render) vs image (direct).
-    suffix = ".png" if kind == "image" else ".pdf"
-
-    tmp_path = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-
-        _mark_model_used()
-
-        # Use PP-StructureV3 if enabled, fallback to plain OCR
-        if os.getenv("USE_STRUCTURE_V3", "true").lower() in ("true", "1"):
-            # run in a thread: pipeline can take minutes; keep the loop responsive.
-            pages = await asyncio.to_thread(run_paddlex_structure_v3, tmp_path)
+        pages, used_v3 = await _run_ocr_pipeline(file_bytes, kind)
+        if used_v3:
             # Build structured markdown per page
-            layout_results = []
-            for page in pages:
-                markdown_text = blocks_to_markdown(page.get("structured_blocks", []))
-                layout_results.append(
-                    {
-                        "markdown": {"text": markdown_text},
-                        "structuredBlocks": page.get("structured_blocks", []),
-                    }
-                )
+            layout_results = [
+                {
+                    "markdown": {
+                        "text": blocks_to_markdown(page.get("structured_blocks", []))
+                    },
+                    "structuredBlocks": page.get("structured_blocks", []),
+                }
+                for page in pages
+            ]
         else:
-            # Same offload as the V3 path: the fallback blocks for minutes
-            # too and must not stall the event loop.
-            pages = await asyncio.to_thread(run_paddleocr, tmp_path)
             layout_results = [
                 {"markdown": {"text": page["text"]}, "structuredBlocks": None}
                 for page in pages
             ]
-
-        # Stamp job completion so a job longer than MODEL_IDLE_TIMEOUT
-        # restarts the idle clock instead of being destroyed on the first
-        # poll right after it finishes.
-        _mark_model_used()
 
         return SafeJSONResponse(
             content={
@@ -811,9 +893,6 @@ async def layout_parsing(
     except Exception as exc:
         logger.exception("Layout parsing failed")
         raise HTTPException(500, f"Layout parsing failed: {exc}")
-    finally:
-        if tmp_path:
-            Path(tmp_path).unlink(missing_ok=True)
 
 
 # ── Direct API endpoints (not used by Open-WebUI) ────────────────────
@@ -853,18 +932,7 @@ async def extract_text(
     Returns: JSON with pages (structured markdown, structuredBlocks, raw blocks)
     """
     _check_token(authorization)
-
-    # Early health guard: fail fast if model failed to initialize
-    init_exc = get_paddlex_init_exception()
-    if init_exc is not None:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "status": "unhealthy",
-                "component": "paddlex",
-                "error": str(init_exc),
-            },
-        )
+    _require_model_ready()
 
     if not file.filename:
         raise HTTPException(400, "Missing file")
@@ -872,79 +940,47 @@ async def extract_text(
     ext = Path(file.filename).suffix.lower()
     hint_kind: Literal["pdf", "image"] = "image" if ext in IMAGE_EXTS else "pdf"
 
-    tmp_path = None
-    try:
-        file_bytes = await file.read()
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "File content is empty")
 
-        if not file_bytes:
-            raise HTTPException(400, "File content is empty")
+    kind = _route_upload(file_bytes, hint_kind, "extract")
 
-        # ── Content-based type detection: the bytes decide the pipeline,
-        # not the filename extension (which callers can get wrong or omit).
-        kind = detect_file_type(file_bytes)
-        if kind == "unknown":
-            raise HTTPException(415, UNSUPPORTED_FILE_TYPE_DETAIL)
-        if kind != hint_kind:
-            # A pdf/image extension on plain text is the normal .txt
-            # passthrough case — debug, not a warning.
-            log_fn = logger.debug if kind == "text" else logger.warning
-            log_fn(
-                "extract: extension %r disagrees with content detection %s "
-                "— routing by content",
-                ext,
-                kind,
-            )
-
-        # ── Text file: return as-is ──
-        if kind == "text":
-            content = file_bytes.decode("utf-8", errors="replace")
-            return SafeJSONResponse(
-                content={
-                    "filename": file.filename,
-                    "pages": [
-                        {
-                            "page": 1,
-                            "text": content,
-                            "markdown": content,
-                            "blocks": [],
-                            "structured_blocks": [],
-                        }
-                    ],
-                    "full_text": content,
-                }
-            )
-
-        # The temp suffix must match the *detected* kind: run_paddlex_structure_v3
-        # routes on the .pdf suffix (pdftoppm pre-render) vs image (direct).
-        suffix = ".png" if kind == "image" else ".pdf"
-
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-
-        _mark_model_used()
-
-        # Use PP-StructureV3 if enabled, fallback to plain OCR
-        if os.getenv("USE_STRUCTURE_V3", "true").lower() in ("true", "1"):
-            # run in a thread: pipeline can take minutes; keep the loop responsive.
-            pages = await asyncio.to_thread(run_paddlex_structure_v3, tmp_path)
-            # Build structured markdown per page
-            result_pages = []
-            for page in pages:
-                markdown_text = blocks_to_markdown(page.get("structured_blocks", []))
-                result_pages.append(
+    # ── Text file: return as-is ──
+    if kind == "text":
+        content = file_bytes.decode("utf-8", errors="replace")
+        return SafeJSONResponse(
+            content={
+                "filename": file.filename,
+                "pages": [
                     {
-                        "page": page["page"],
-                        "text": page["text"],  # raw text
-                        "markdown": markdown_text,
-                        "blocks": page["blocks"],  # raw OCR blocks
-                        "structured_blocks": page.get("structured_blocks", []),
+                        "page": 1,
+                        "text": content,
+                        "markdown": content,
+                        "blocks": [],
+                        "structured_blocks": [],
                     }
-                )
+                ],
+                "full_text": content,
+            }
+        )
+
+    # ── PDF / image processing ──
+    try:
+        pages, used_v3 = await _run_ocr_pipeline(file_bytes, kind)
+        if used_v3:
+            # Build structured markdown per page
+            result_pages = [
+                {
+                    "page": page["page"],
+                    "text": page["text"],  # raw text
+                    "markdown": blocks_to_markdown(page.get("structured_blocks", [])),
+                    "blocks": page["blocks"],  # raw OCR blocks
+                    "structured_blocks": page.get("structured_blocks", []),
+                }
+                for page in pages
+            ]
         else:
-            # Same offload as the V3 path: the fallback blocks for minutes
-            # too and must not stall the event loop.
-            pages = await asyncio.to_thread(run_paddleocr, tmp_path)
             result_pages = [
                 {
                     "page": p["page"],
@@ -955,11 +991,6 @@ async def extract_text(
                 }
                 for p in pages
             ]
-
-        # Stamp job completion (see /layout-parsing) so a long job restarts
-        # the idle clock instead of being destroyed on the first poll after
-        # it finishes.
-        _mark_model_used()
 
         full_text = "\n\n".join(p["text"] for p in pages if p["text"])
         return SafeJSONResponse(
@@ -974,9 +1005,6 @@ async def extract_text(
     except Exception as exc:
         logger.exception("Extraction failed")
         raise HTTPException(500, f"Extraction failed: {exc}")
-    finally:
-        if tmp_path:
-            Path(tmp_path).unlink(missing_ok=True)
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────

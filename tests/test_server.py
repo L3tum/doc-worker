@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import os
 import struct
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -634,3 +635,55 @@ class TestDetectFileTypeSignatures:
         NUL-laden file as binary), so the text check decides: text."""
         data = b"BM" + b"this is plain text" * 2
         assert server.detect_file_type(data) == "text"
+
+
+# ── Request-body size policy (chunked + oversized) ────────────────────────
+class TestBodySizePolicy:
+    """_body_size_policy: the body is fully materialized before processing,
+    so an unbounded (chunked, no Content-Length) POST is a DoS vector."""
+
+    def test_post_without_content_length_rejected(self):
+        assert server._body_size_policy("POST", None) is not None
+
+    def test_post_with_content_length_ok(self):
+        assert server._body_size_policy("POST", "100") is None
+
+    def test_post_oversized_rejected(self):
+        with patch.object(server, "MAX_REQUEST_SIZE", 100):
+            assert server._body_size_policy("POST", "101") is not None
+            assert server._body_size_policy("POST", "100") is None
+
+    def test_non_post_exempt(self):
+        assert server._body_size_policy("GET", None) is None
+        assert server._body_size_policy("GET", "999999999") is None
+
+    def test_chunked_post_rejected_413(self, test_client):
+        """A POST arriving without Content-Length (chunked transfer)
+        reaches the middleware as content-length=None → 413 before the
+        body is touched."""
+        body = b'{"file": "eA==", "fileType": 0}'
+        resp = test_client.post(
+            "/layout-parsing",
+            content=iter([body]),  # httpx sends iterables chunked (no length)
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 413
+        assert "chunked" in resp.json()["detail"]
+
+
+# ── PDF page counting (page-limit guard) ─────────────────────────────────
+class TestCountPdfPages:
+    def test_counts_real_pdf(self):
+        """_count_pdf_pages reads the true page count via pypdfium2
+        (the same rasterizer the worker uses for AcroForm flatten)."""
+        import pypdfium2  # hard dependency (worker.py AcroForm path)
+
+        fixture = Path(__file__).parent / "fixtures" / "two_column.pdf"
+        assert server._count_pdf_pages(str(fixture)) == 1
+        with pypdfium2.PdfDocument(str(fixture)) as doc:  # noqa: F841
+            pass  # fixture must be a valid, openable PDF
+
+    def test_uncountable_pdf_returns_none(self):
+        """A non-PDF path fails soft to None (the pipeline then reports
+        its own error instead of a 413)."""
+        assert server._count_pdf_pages("/nonexistent/nope.pdf") is None

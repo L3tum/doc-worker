@@ -1194,10 +1194,12 @@ class ModelIdleTracker:
 
 
 # ── PDF → image conversion helper ─────────────────────────────────────────
-# Render DPI for PDF→PNG page rasterization (pdftoppm -r). Pixel-based
-# defaults elsewhere in this module (pdftoppm timeout, reading-order column
-# threshold) are derived from this value.
-RENDER_DPI: int = 300
+# Render DPI for PDF→PNG page rasterization (pdftoppm -r). 300 is the
+# quality floor for the Structure-V3 OCR stage; override via RENDER_DPI to
+# trade OCR quality for temp-disk + memory on page-heavy deployments (e.g.
+# 200 ≈ 1.5× less staging). The pdftoppm timeout default derives from this
+# value (DEFAULT_PDFTOPPM_TIMEOUT below).
+RENDER_DPI: int = int(os.getenv("RENDER_DPI", "300"))
 
 # The 150-dpi-era base the pixel-scaled defaults derive from (pdftoppm
 # timeout, reading-order column threshold).
@@ -1467,8 +1469,6 @@ def run_paddlex_structure_v3(file_path: str) -> list[dict]:
             confidence — pre-sorted in reading order (column-aware; the sort
             happens in _process_structure_v3_pages with the page's true pixel
             width, so blocks_to_markdown can serialize in input order)
-        page_width_px (int): the rendered page's pixel width, present when it
-            could be read from the page image
     """
 
     # model_in_flight() spans model fetch through the whole page processing
@@ -1604,8 +1604,6 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
                 structured_blocks, page_width=page_width_px
             ),
         }
-        if page_width_px is not None:
-            page["page_width_px"] = int(page_width_px)
         pages.append(page)
 
     return pages
@@ -1887,6 +1885,9 @@ def _sort_blocks_by_reading_order(
     return ordered
 
 
+# PUBLIC API (this module has no __all__): server.py (/layout-parsing,
+# /extract), worker.py (native sidecars) and the in-image e2e scripts import
+# blocks_to_markdown by name — rename or move only with a repo-wide search.
 def blocks_to_markdown(structured_blocks: list[dict]) -> str:
     """Convert structured blocks to semantic Markdown.
 

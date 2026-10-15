@@ -710,6 +710,27 @@ class TestRenderDpiDefaults:
         # True at RENDER_DPI=300, LEGACY_DPI=150.
         assert DEFAULT_PDFTOPPM_TIMEOUT == 480
 
+    def test_render_dpi_env_override_drives_pdftoppm(self, tmp_path, monkeypatch):
+        """RENDER_DPI (env-overridable at import) is what pdftoppm renders
+        at — the `-r` argument must carry the current value."""
+        import subprocess as sp
+
+        import paddlex_helpers
+
+        monkeypatch.setattr(paddlex_helpers, "RENDER_DPI", 200)
+        (tmp_path / "page-1.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(paddlex_helpers.subprocess, "run", fake_run)
+        images = paddlex_helpers._pdf_to_images(str(tmp_path / "in.pdf"), str(tmp_path))
+
+        assert images == [str(tmp_path / "page-1.png")]
+        assert "200" in captured["cmd"]
+
 
 # ── OCR run function tests (with mocks) ───────────────────────────────────
 class TestRunPaddlexOcr:
@@ -864,9 +885,10 @@ class TestRunPaddlexStructureV3:
             pages = run_paddlex_structure_v3("/tmp/test.pdf")
 
         assert len(pages) == 1
-        # The field's consumer — previously dead on every mocked test
-        # (nonexistent PNG path → _image_width_px fails soft to None).
-        assert pages[0]["page_width_px"] == 2480
+        # (The page's true width is still consumed internally by the sort;
+        # page_width_px itself was an unused key in the page dict and is no
+        # longer exposed. A real PNG above is what makes _image_width_px
+        # succeed here — a missing path fails soft to the fallback.)
         # True width (2480) drives the span heuristic: H is the only span,
         # the remaining band is read column-first.
         assert [b["text"] for b in pages[0]["structured_blocks"]] == [
@@ -1444,4 +1466,29 @@ class TestPermanentErrorDetection:
 
         assert not _is_permanent_model_init_error(
             RuntimeError("something unexpected happened")
+        )
+
+
+# ── _ensure_paddlex_offline_compat ImportError branch ─────────────────────
+class TestEnsurePaddlexOfflineCompatImportError:
+    """The ImportError branch of _ensure_paddlex_offline_compat (PaddleX not
+    installed / broken install) is deterministic: log the cause and degrade
+    (patch disabled) — no crash. The model factory calls it on every init
+    attempt, so repeated calls must stay soft."""
+
+    def test_import_error_is_logged_and_soft(self, caplog):
+        import importlib
+        import logging
+
+        import paddlex_helpers
+
+        if importlib.util.find_spec("paddlex") is not None:
+            pytest.skip("paddlex installed — ImportError branch unreachable")
+
+        with caplog.at_level(logging.WARNING, logger="doc-worker.paddlex_helpers"):
+            paddlex_helpers._ensure_paddlex_offline_compat()
+            paddlex_helpers._ensure_paddlex_offline_compat()  # repeated call: still soft
+
+        assert any(
+            "PaddleX import failed" in record.message for record in caplog.records
         )

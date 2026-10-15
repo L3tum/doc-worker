@@ -29,13 +29,13 @@ INBOX → stability check → PROCESSING → [Docling sidecar] → [OCR] → [Pa
 
 ## Env Vars (runtime)
 
-`INBOX`, `PROCESSING`, `DONE`, `ERROR`, `DOCLING_DIR`, `PAPERLESS_CONSUME`, `OCR_LANG` (default `deu`), `OCR_USE_GPU`, `POLL_INTERVAL`, `DOCLING_BASE_URL`, `DOCLING_MODE`, `DOCLING_TIMEOUT`, `MAX_RETRIES`, `RETRY_DELAY`, `PADDLEOCR_VL_TOKEN`, `PADDLEOCR_MODELS` (default `/app/models`), `PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT` (image default `0`, see Version-Specific Hacks), `PADDLE_PDX_CACHE_HOME` (image default `/tmp/.paddlex`), `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK` (default `1`, set by `paddlex_helpers.py`)
+`INBOX`, `PROCESSING`, `DONE`, `ERROR`, `DOCLING_DIR`, `PAPERLESS_CONSUME`, `OCR_LANG` (default `deu`), `OCR_USE_GPU`, `POLL_INTERVAL`, `DOCLING_BASE_URL`, `DOCLING_MODE`, `DOCLING_TIMEOUT`, `MAX_RETRIES`, `RETRY_DELAY`, `PADDLEOCR_VL_TOKEN`, `PADDLEOCR_MODELS` (default `/app/models`), `MAX_OCR_PAGES` (default `500`, server page cap), `RENDER_DPI` (default `300`, server render DPI), `PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT` (image default `0`, see Version-Specific Hacks), `PADDLE_PDX_CACHE_HOME` (image default `/tmp/.paddlex`), `PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK` (default `1`, set by `paddlex_helpers.py`)
 
 ## Deployment Notes
 
 - The API is unauthenticated unless `PADDLEOCR_VL_TOKEN` is set (`docker-compose.yml` ships it commented out); there is no rate limiting — set the token for any exposed deployment.
-- `MAX_REQUEST_SIZE` bounds request bytes, not page count — consider a page-count cap for very large PDFs.
-- PP-StructureV3 pre-renders PDFs at 300 dpi (`paddlex_helpers.py` `RENDER_DPI`), ~4× the pixel work of the old 150 dpi: ~4× peak temp-disk staging (all pages held as PNG) and ~4× per-page decode memory.
+- `MAX_REQUEST_SIZE` bounds request bytes; POSTs without `Content-Length` (chunked) are rejected 413 — the body is fully materialized, so a missing declared length would be unbounded. `MAX_OCR_PAGES` (default 500) caps page count with a 413 before any render/model work.
+- PP-StructureV3 pre-renders PDFs at 300 dpi (`paddlex_helpers.py` `RENDER_DPI`, env-overridable to trade OCR quality for staging), ~4× the pixel work of the old 150 dpi: ~4× peak temp-disk staging (all pages held as PNG) and ~4× per-page decode memory.
 - `PAPDFTOPPM_TIMEOUT`'s default now scales with DPI (480 s at 300 dpi, derived from the 150-dpi-era 120 s); the env override is unchanged.
 
 ## Build Args
@@ -140,13 +140,32 @@ dict rejection and `math.isfinite` filtering (NaN/Inf no longer 500 the
 response via `json.dumps(allow_nan=False)`); `handle_docling`-raise
 leak fixed in `process_file`; `_ACROFORM_FLATTEN_STATE` docstring corrected and
 the `unpatched→skipped` transition now tested; `.gitattributes` marks the PDF
-fixtures as binary (`-text`) so autocrlf checkouts can't corrupt them.
+fixtures as binary (`-text`) so autocrlf checkouts can't corrupt them. And
+the previously parked items: `MAX_OCR_PAGES` page-count cap (default 500,
+env-overridable, 413 before any render/model work on both OCR endpoints);
+`RENDER_DPI` env-overridable (documented quality/staging tradeoff);
+chunked uploads (POST without Content-Length) rejected 413 in the size
+middleware; `process_file`'s flattened intermediate unlinked by one
+try/finally instead of three per-branch unlinks; `page_width_px` removed
+from the page dict (dead production data — the width is still consumed
+internally by the reading-order sort); the 503 health guard, content
+routing, and OCR core (page cap + kind-suffixed temp file + `to_thread`
+pipeline call + idle-clock stamping) deduplicated into
+`_require_model_ready` / `_route_upload` / `_run_ocr_pipeline` shared by
+both endpoints (also fixing the asymmetric endpoint log wording); the
+`_point_worker_at` test helper deduplicated to module level; and tests for
+the previously untested paths (`push_to_paperless` success/copy-failure/
+replace-failure, `unique_destination` same-second collision — which also
+got a numeric-suffix hardening against overwriting, `bzip2`/`lzip`
+signatures parametrized, `RENDER_DPI` → `pdftoppm -r`, real-PDF page
+counting, `_ensure_paddlex_offline_compat`'s ImportError branch, chunked
+413, page-cap 413 on both endpoints); `blocks_to_markdown` marked PUBLIC
+API (the module has no `__all__`) and `handle_docling`'s `sidecar_name`
+docstring carries the user-supplied-filename/trusted-volume security note.
 
 Still open:
 
-- For exposed deployments: add a page-count cap (`MAX_REQUEST_SIZE` caps bytes, not pages), consider an env override for `RENDER_DPI`, and monitor temp disk (300-dpi stages 1–1.5 GB of PNGs for a 500-page PDF).
 - Dependency: the `pypdfium2>=5,<6` upper bound can hard-conflict with a future ocrmypdf 17.x requiring pypdfium2>=6 while `ocrmypdf>=17.4.1,<18` still permits it — drop the cap or mirror ocrmypdf's floor.
-- Hygiene: consolidate `name→kind` routing (scattered across `_FILE_SIGNATURES`, `_IMAGE_SIGNATURE_NAMES`, and inline special-cases) and dedupe the ~14-line routing block shared by both endpoints; `DEFAULT_COLUMN_THRESHOLD_PX` is computed twice; dedupe ~60 lines of shared boilerplate in tests/fixtures generators and the duplicated check helpers in `variants_e2e.py`; the `Bearer` scheme match is case-sensitive (RFC-legal `bearer` rejected — unchanged from prior behavior, nit); helper-definition ordering in tests/unit/test_worker.py; optional fail-soft symmetry — fall back to the original if the flattened copy fails OCR.
-- `page_width_px` page-dict key is dead production data — sole consumer is a unit test; expose it in the sidecar/API JSON or delete it.
-- Tests: `_point_worker_at` helper duplicated across two test classes; `push_to_paperless` failure path untested; `bzip2`/`lzip` signature parametrize.
-- Nits: log-injection surface via crafted INBOX filenames (log names with `repr()`); exception text echoed in the 500 detail; env-var numeric coercion is unvalidated (`int(os.getenv(...))`); TIFF bytes under a `.png` suffix untested end-to-end; two >88-char literals; asymmetric endpoint log wording.
+- Ops: monitor temp disk (at 300 dpi a 500-page PDF stages 1–1.5 GB of PNGs; `RENDER_DPI` / `MAX_OCR_PAGES` are the levers).
+- Hygiene: consolidate `name→kind` routing across the signature tables (`_FILE_SIGNATURES`, `_IMAGE_SIGNATURE_NAMES`, inline special-cases — the endpoint-level dedupe is done, the table consolidation is not); dedupe ~60 lines of shared boilerplate in the tests/fixtures generators and the duplicated check helpers in `variants_e2e.py`; the `Bearer` scheme match is case-sensitive (RFC-legal `bearer` rejected — unchanged from prior behavior, nit); optional fail-soft symmetry — fall back to the original if the flattened copy fails OCR.
+- Nits: log-injection surface via crafted INBOX filenames (log names with `repr()`); exception text echoed in the 500 detail; env-var numeric coercion is unvalidated (`int(os.getenv(...))`); TIFF bytes under a `.png` suffix untested end-to-end; two >88-char literals.

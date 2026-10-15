@@ -127,7 +127,12 @@ def log_error(msg: str) -> None:
 
 
 def unique_destination(directory: Path, filename: str) -> Path:
-    """Return a non-existing destination path inside *directory*."""
+    """Return a non-existing destination path inside *directory*.
+
+    Same-second collisions (two files with the same name landing in the
+    same second) are disambiguated with a numeric suffix instead of
+    overwriting.
+    """
     dest = directory / filename
     if not dest.exists():
         return dest
@@ -135,7 +140,12 @@ def unique_destination(directory: Path, filename: str) -> Path:
     stem = dest.stem
     suffix = dest.suffix
     ts = time.strftime("%Y%m%d%H%M%S")
-    return directory / f"{stem}_{ts}{suffix}"
+    candidate = directory / f"{stem}_{ts}{suffix}"
+    n = 2
+    while candidate.exists():
+        candidate = directory / f"{stem}_{ts}_{n}{suffix}"
+        n += 1
+    return candidate
 
 
 def move_to_error(file_path: Path, reason: str) -> None:
@@ -272,6 +282,12 @@ def handle_docling(pdf_path: Path, sidecar_name: str | None = None) -> bool:
     output is keyed by this name (DOCLING_OUT/{stem of sidecar_name}/...)
     rather than by *pdf_path*'s name — used when processing a worker-owned
     intermediate copy (AcroForm pre-flatten).
+
+    Security note: *sidecar_name* derives from the user-supplied filename
+    (the worker lists files it finds in INBOX/); the output location is
+    DOCLING_OUT/{stem}/..., which the server trusts as a shared volume.
+    Only the path stem is used for keying, so a filename cannot escape
+    DOCLING_OUT/.
 
     Returns:
         True  — continue pipeline (sidecar succeeded or is disabled).
@@ -611,67 +627,61 @@ def process_file(pdf_path: Path) -> bool:
     # PROCESSING mount is small.
     flattened_path = flatten_acroform_if_needed(processing_path)
 
-    # Docling — runs on the flattened copy when one exists
+    # The flattened copy is a worker-owned intermediate: one try/finally
+    # unlinks it on EVERY exit path below (sidecar abort, OCR raise,
+    # Paperless failure, success) so it can never leak into PROCESSING/ or
+    # ride into DONE/.
     try:
+        # Docling — runs on the flattened copy when one exists
         sidecar_ok = handle_docling(
             flattened_path or processing_path, sidecar_name=filename
         )
-    except Exception:
-        # A raising backend (e.g. broken `requests` install) must not
-        # leak the worker-owned intermediate until the next startup.
-        if flattened_path is not None:
-            flattened_path.unlink(missing_ok=True)
-        raise
-    if not sidecar_ok:
-        # The flattened copy is an intermediate: unlink it even when the
-        # sidecar aborts, so it cannot leak into PROCESSING/.
-        if flattened_path is not None:
-            flattened_path.unlink(missing_ok=True)
-        log_error("Sidecar generation failed and will be retried if attempts remain.")
-        return False
-
-    # OCR
-    ocr_output = PROCESSING / f"{processing_path.stem}_ocr{processing_path.suffix}"
-    try:
-        run_ocrmypdf(flattened_path or processing_path, ocr_output)
-        log("  OCR: OK")
-    except Exception as exc:
-        # Re-raise (instead of returning False) so the retry loop in
-        # process_with_retries() can classify deterministic errors as
-        # non-retryable and skip wasted GPU passes.
-        if isinstance(exc, ZeroDivisionError):
-            # Backstop: the graft-dpi shim (ocrmypdf_paddleocr/compat.py, applied in the
-            # plugin's initialize) did not convert this page — either it was not applied
-            # (internals changed under the <18 pin) or a zero-dpi path it doesn't cover.
-            # Deterministic, so fail fast to ERROR/ rather than burn GPU passes.
+        if not sidecar_ok:
             log_error(
-                f"OCR failed: zero-DPI page in {filename} (upstream ocrmypdf "
-                f"zero-dpi bug; graft-dpi shim did not convert it) — non-retryable, not retrying."
+                "Sidecar generation failed and will be retried if attempts remain."
             )
-        else:
-            log_error(f"OCR failed: {exc}")
+            return False
+
+        # OCR
+        ocr_output = PROCESSING / f"{processing_path.stem}_ocr{processing_path.suffix}"
+        try:
+            run_ocrmypdf(flattened_path or processing_path, ocr_output)
+            log("  OCR: OK")
+        except Exception as exc:
+            # Re-raise (instead of returning False) so the retry loop in
+            # process_with_retries() can classify deterministic errors as
+            # non-retryable and skip wasted GPU passes.
+            if isinstance(exc, ZeroDivisionError):
+                # Backstop: the graft-dpi shim (ocrmypdf_paddleocr/compat.py, applied in the
+                # plugin's initialize) did not convert this page — either it was not applied
+                # (internals changed under the <18 pin) or a zero-dpi path it doesn't cover.
+                # Deterministic, so fail fast to ERROR/ rather than burn GPU passes.
+                log_error(
+                    f"OCR failed: zero-DPI page in {filename} (upstream ocrmypdf "
+                    f"zero-dpi bug; graft-dpi shim did not convert it) — non-retryable, not retrying."
+                )
+            else:
+                log_error(f"OCR failed: {exc}")
+            if ocr_output.exists():
+                ocr_output.unlink()
+            raise
+
+        # Paperless
+        if not push_to_paperless(ocr_output):
+            if ocr_output.exists():
+                ocr_output.unlink()
+            return False
+
+        # Done
+        shutil.move(str(processing_path), str(DONE / filename))
+        # Clean up intermediate OCR output file
         if ocr_output.exists():
             ocr_output.unlink()
-        raise
+        log(f"  → DONE/ ({filename})")
+        return True
     finally:
-        # The flattened copy is an intermediate: unlink on both the success
-        # and failure paths.
         if flattened_path is not None:
             flattened_path.unlink(missing_ok=True)
-
-    # Paperless
-    if not push_to_paperless(ocr_output):
-        if ocr_output.exists():
-            ocr_output.unlink()
-        return False
-
-    # Done
-    shutil.move(str(processing_path), str(DONE / filename))
-    # Clean up intermediate OCR output file
-    if ocr_output.exists():
-        ocr_output.unlink()
-    log(f"  → DONE/ ({filename})")
-    return True
 
 
 def process_with_retries(pdf: Path, max_retries: int, retry_delay: int) -> None:
