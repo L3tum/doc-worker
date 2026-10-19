@@ -188,10 +188,11 @@ jobs:
           # ("can't open file '/e2e/umlaut_e2e.py'"). The image was just
           # built from this commit, so the in-image copy is the exact
           # code under test.
-          # Both e2e suites run in ONE container: a second `docker run`
-          # would cold-start the PP-StructureV3 model again (double
-          # model-init time on every OCR-related push, inside the
-          # 45-minute publish-gate budget).
+          # Both e2e suites run in ONE container: a second container
+          # would add a second container start on every OCR-related push
+          # (inside the 45-minute publish-gate budget); the per-script
+          # model init happens either way because each e2e script
+          # initializes its own process.
           docker run --rm \
             -w /app \
             -e PYTHONPATH=/app \

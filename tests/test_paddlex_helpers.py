@@ -6,6 +6,7 @@ Tests blocks_to_markdown, run_paddlex_ocr (with mocks), and model validation.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 import pytest
@@ -14,6 +15,7 @@ from paddlex_helpers import (
     DEFAULT_PDFTOPPM_TIMEOUT,
     LEGACY_DPI,
     RENDER_DPI,
+    _convert_table_html_to_markdown,
     _sort_blocks_by_reading_order,
     blocks_to_markdown,
     paddleocr_lang_code,
@@ -700,15 +702,89 @@ class TestBlocksToMarkdown:
         assert "## Subtitle" in result
 
 
+# ── Table colspan clamp (untrusted HTML → bounded row) ─────────────────
+class TestTableColspanClamp:
+    """_convert_table_html_to_markdown clamps model-transcribed colspan.
+
+    The colspan attribute comes from PaddleX's transcribed HTML — the
+    document's OWN content, untrusted. An unclamped <td
+    colspan="999999999"> would append ~1e9 cells to the row (≈1.7 GB
+    of list slots) and OOM the worker. The clamp is max(1, min(int,
+    1000)): 1000 is far beyond any real table, and the >=1 floor keeps
+    range(<=0) from silently dropping the cell.
+    """
+
+    def test_giant_colspan_clamps_to_1000_columns(self):
+        md = _convert_table_html_to_markdown(
+            '<table><tr><td colspan="999999999">X</td></tr><tr><td>A</td></tr></table>'
+        )
+        # Two rows in → row + separator + row; the clamped row is 1000
+        # columns, not 999,999,999.
+        lines = md.splitlines()
+        assert len(lines) == 3
+        assert lines[0].count("X") == 1000
+        # The short second row is padded to the clamped width.
+        assert "A" in lines[2]
+
+    def test_colspan_boundary_and_garbage(self):
+        for value, expected in [
+            ("1000", 1000),  # == clamp
+            ("1001", 1000),  # > clamp
+            ("2", 2),  # small values pass through
+            ("0", 1),  # below the floor → 1 (cell must not vanish)
+            ("-5", 1),  # negative → 1
+            ("abc", 1),  # garbage → 1 (the no-attribute value)
+            ("2.5", 1),  # non-integer → 1
+        ]:
+            md = _convert_table_html_to_markdown(
+                f'<table><tr><td colspan="{value}">C</td></tr></table>'
+            )
+            assert md.splitlines()[0].count("C") == expected, (
+                f"colspan={value!r}: expected {expected} columns"
+            )
+
+    def test_blocks_to_markdown_giant_colspan_does_not_500(self):
+        """Public entry point: the same crafted table routed through
+        blocks_to_markdown (the production serializer) — clamped, no
+        memory blowup, no exception."""
+        blocks = [
+            {
+                "type": "table",
+                "text": '<html><body><table><tr><td colspan="999999999">Header</td></tr></table></body></html>',
+                "bbox": [0, 0, 0, 0],
+                "confidence": 0.95,
+            }
+        ]
+        result = blocks_to_markdown(blocks)
+        assert "Header" in result
+
+
 # ── DPI-scaled defaults ─────────────────────────────────────────────────────
 class TestRenderDpiDefaults:
     """The pixel-scaled defaults derive from one LEGACY_DPI base."""
 
-    def test_pdftoppm_timeout_scales_from_legacy_dpi(self):
-        """DEFAULT_PDFTOPPM_TIMEOUT scales off LEGACY_DPI, not a hardcoded 150."""
-        assert DEFAULT_PDFTOPPM_TIMEOUT == round(120 * (RENDER_DPI / LEGACY_DPI) ** 2)
-        # True at RENDER_DPI=300, LEGACY_DPI=150.
-        assert DEFAULT_PDFTOPPM_TIMEOUT == 480
+    def test_pdftoppm_timeout_rule(self):
+        """_pdftoppm_timeout_for_dpi: the 150-dpi-era 120 s baseline scaled
+        by the per-page pixel multiplier (dpi / LEGACY_DPI) squared, clamped
+        to >= 1 s (a tiny RENDER_DPI must not yield timeout=0)."""
+        import paddlex_helpers
+
+        rule = paddlex_helpers._pdftoppm_timeout_for_dpi
+        assert rule(LEGACY_DPI) == 120
+        assert rule(300) == 480
+        assert rule(72) == 28
+        assert rule(1) == 1
+
+    def test_default_pdftoppm_timeout_wiring(self):
+        """Import-time default = the rule applied to the import-time
+        RENDER_DPI (the wiring — the rule itself is tested above)."""
+        import paddlex_helpers
+
+        assert DEFAULT_PDFTOPPM_TIMEOUT == paddlex_helpers._pdftoppm_timeout_for_dpi(
+            RENDER_DPI
+        )
+        if RENDER_DPI == 300:  # default env (no RENDER_DPI override)
+            assert DEFAULT_PDFTOPPM_TIMEOUT == 480
 
     def test_render_dpi_env_override_drives_pdftoppm(self, tmp_path, monkeypatch):
         """RENDER_DPI (env-overridable at import) is what pdftoppm renders
@@ -730,6 +806,132 @@ class TestRenderDpiDefaults:
 
         assert images == [str(tmp_path / "page-1.png")]
         assert "200" in captured["cmd"]
+
+    def test_render_dpi_env_contract_in_fresh_interpreter(self):
+        """The documented RENDER_DPI env var drives the import-time
+        defaults in a FRESH interpreter (RENDER_DPI=200 → 213 s timeout,
+        2/3 of the 150-dpi column threshold). Subprocess-based on purpose:
+        paddlex_helpers runs eager monkey-patches at import and the
+        defaults derive from the env var at import time — an in-process
+        importlib.reload would re-run the eager patches and leak state.
+        (The monkeypatch-based test above still pins call-time attribute
+        use in the same process.)"""
+        from conftest import run_fresh_interpreter_ok
+
+        script = (
+            "import paddlex_helpers as p\n"
+            "assert p.RENDER_DPI == 200, p.RENDER_DPI\n"
+            "assert p.DEFAULT_PDFTOPPM_TIMEOUT == 213, p.DEFAULT_PDFTOPPM_TIMEOUT\n"
+            "assert p.COLUMN_THRESHOLD_PX == 50.0 * 200 / 150, "
+            "p.COLUMN_THRESHOLD_PX\n"
+            "print('OK')\n"
+        )
+        run_fresh_interpreter_ok(script, env_overrides={"RENDER_DPI": "200"})
+
+    def test_render_dpi_zero_env_contract_in_fresh_interpreter(self):
+        """RENDER_DPI=0 must clamp to 1 in a FRESH interpreter — 0/negative
+        DPI is an invalid `pdftoppm -r` argument — and the DPI-scaled
+        timeout rule must floor at 1 s: at RENDER_DPI=1 the rule is
+        max(1, round(120 * (1/150) ** 2)) = max(1, 0) = 1. Same subprocess
+        pattern as the sibling 200 test above (defaults are computed at
+        import time, so only a fresh interpreter proves the env contract).
+        """
+        from conftest import run_fresh_interpreter_ok
+
+        script = (
+            "import paddlex_helpers as p\n"
+            "assert p.RENDER_DPI == 1, p.RENDER_DPI\n"
+            "assert p.DEFAULT_PDFTOPPM_TIMEOUT == 1, p.DEFAULT_PDFTOPPM_TIMEOUT\n"
+            "assert p.COLUMN_THRESHOLD_PX == 50.0 * 1 / 150, p.COLUMN_THRESHOLD_PX\n"
+            "print('OK')\n"
+        )
+        run_fresh_interpreter_ok(script, env_overrides={"RENDER_DPI": "0"})
+
+    @pytest.mark.parametrize(
+        ("env_value", "expected_timeout"),
+        [("0", 1), ("999", 999)],
+        ids=["zero", "explicit"],
+    )
+    def test_pdftoppm_timeout_env_contract_in_fresh_interpreter(
+        self, env_value, expected_timeout
+    ):
+        """PAPDFTOPPM_TIMEOUT is parsed at import (like its sibling knobs
+        — see the constant in paddlex_helpers): zero/negative clamp to 1 s
+        (a 0/negative operator value must not make every render
+        fail/timeout with a misleading error); an explicit positive value
+        passes through unchanged. (0 and negative hit the same max(1, ...) floor;
+        0 pins it — the negative twin was dropped to save a 10-30 s
+        subprocess per CI run on the CPU image.) Subprocess-based on
+        purpose: the value is an import-time constant, so only a fresh
+        interpreter proves the env contract (the wiring test below pins
+        call-time use in the same process)."""
+        from conftest import run_fresh_interpreter_ok
+
+        script = (
+            "import paddlex_helpers as p\n"
+            f"assert p.PAPDFTOPPM_TIMEOUT == {expected_timeout}, "
+            "p.PAPDFTOPPM_TIMEOUT\n"
+            "print('OK')\n"
+        )
+        run_fresh_interpreter_ok(
+            script, env_overrides={"PAPDFTOPPM_TIMEOUT": env_value}
+        )
+
+    def test_pdftoppm_timeout_env_unset_uses_dpi_default_in_fresh_interpreter(
+        self,
+    ):
+        """With PAPDFTOPPM_TIMEOUT unset, the import-time constant equals
+        the DPI-scaled default (DEFAULT_PDFTOPPM_TIMEOUT), not a hardcoded
+        literal. Fresh interpreter for the same reason as the sibling
+        contract test above (the value is computed at import time)."""
+        from conftest import run_fresh_interpreter_ok
+
+        script = (
+            "import paddlex_helpers as p\n"
+            "assert p.PAPDFTOPPM_TIMEOUT == p.DEFAULT_PDFTOPPM_TIMEOUT, "
+            "(p.PAPDFTOPPM_TIMEOUT, p.DEFAULT_PDFTOPPM_TIMEOUT)\n"
+            "print('OK')\n"
+        )
+        run_fresh_interpreter_ok(script, env_removals=("PAPDFTOPPM_TIMEOUT",))
+
+    def test_pdftoppm_timeout_env_non_numeric_fails_at_import(self):
+        """A non-numeric PAPDFTOPPM_TIMEOUT fails loudly AT IMPORT
+        (ValueError), matching the sibling knobs (RENDER_DPI /
+        MAX_REQUEST_SIZE fail the same way at import) — not as a generic
+        500 on the first render of a request."""
+        from conftest import run_fresh_interpreter
+
+        proc = run_fresh_interpreter(
+            "import paddlex_helpers", env_overrides={"PAPDFTOPPM_TIMEOUT": "abc"}
+        )
+        assert proc.returncode != 0
+        assert "ValueError" in proc.stderr
+
+    def test_pdftoppm_timeout_wiring_uses_module_constant(self, tmp_path, monkeypatch):
+        """Wiring: _pdf_to_images passes the import-time PAPDFTOPPM_TIMEOUT
+        constant as the subprocess timeout (the env contract is pinned in
+        the fresh-interpreter tests above; this pins the call-site use in
+        the same process — the same two-sided pattern as
+        test_default_pdftoppm_timeout_wiring). No real subprocess:
+        subprocess.run is replaced with a recorder and a pre-created
+        page-1.png is what _pdf_to_images returns."""
+        import subprocess as sp
+
+        import paddlex_helpers
+
+        (tmp_path / "page-1.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        captured: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            captured.update(kwargs)
+            return sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(paddlex_helpers, "PAPDFTOPPM_TIMEOUT", 42)
+        monkeypatch.setattr(paddlex_helpers.subprocess, "run", fake_run)
+        images = paddlex_helpers._pdf_to_images(str(tmp_path / "in.pdf"), str(tmp_path))
+
+        assert images == [str(tmp_path / "page-1.png")]
+        assert captured["timeout"] == 42
 
 
 # ── OCR run function tests (with mocks) ───────────────────────────────────
@@ -764,6 +966,92 @@ class TestRunPaddlexOcr:
         assert pages[0]["page"] == 1
         assert pages[0]["text"] == ""
         assert pages[0]["blocks"] == []
+
+
+# ── Degenerate raw geometry (H2 sibling: raw rec_boxes/rec_polys NaN/Inf) ──
+class TestRunPaddlexOcrDegenerateGeometry:
+    """Raw model geometry with non-finite coords must serialize safely.
+
+    The structured-blocks path was fixed via _normalize_bbox (block_bbox);
+    this pins the SIBLING raw path — rec_boxes/rec_polys flow through
+    _finite_geom into pages[*]["blocks"][*]["bbox"], and a NaN/Inf reaching
+    json.dumps(allow_nan=False) would 500 the whole response (and the
+    sidecar JSON)."""
+
+    @pytest.mark.parametrize(
+        ("raw_box", "expected"),
+        [
+            ([1.0, float("nan"), 3.0, 4.0], [1.0, 0.0, 3.0, 4.0]),
+            (
+                [float("nan"), float("inf"), float("-inf"), float("nan")],
+                [0.0, 0.0, 0.0, 0.0],
+            ),
+        ],
+    )
+    def test_run_paddleocr_non_finite_rec_boxes(self, raw_box, expected):
+        """Non-finite coords in a raw rec_box are zeroed in place; the page
+        dict must survive json.dumps(allow_nan=False)."""
+        import paddlex_helpers
+
+        class _FakeModel:
+            def predict(self, _path):
+                return iter(
+                    [
+                        {
+                            "rec_texts": ["x"],
+                            "rec_scores": [0.9],
+                            "rec_boxes": [raw_box],
+                            "rec_polys": [],
+                        }
+                    ]
+                )
+
+        with patch.object(
+            paddlex_helpers, "_get_paddlex_model", return_value=_FakeModel()
+        ):
+            pages = run_paddleocr("/tmp/degenerate.pdf")
+
+        assert pages[0]["blocks"][0]["bbox"] == expected
+        json.dumps(pages, allow_nan=False)
+
+    def test_run_paddleocr_rec_polys_fallback_preserves_polygon_shape(self):
+        """The rec_polys fallback (empty rec_boxes) must NOT force a
+        4-element shape — an 8-float polygon stays 8 floats, non-finites
+        zeroed in place."""
+        import paddlex_helpers
+
+        poly = [1.0, 2.0, float("nan"), 4.0, 5.0, 6.0, 7.0, float("nan")]
+
+        class _FakeModel:
+            def predict(self, _path):
+                return iter(
+                    [
+                        {
+                            "rec_texts": ["x"],
+                            "rec_scores": [0.9],
+                            "rec_boxes": [],
+                            "rec_polys": [poly],
+                        }
+                    ]
+                )
+
+        with patch.object(
+            paddlex_helpers, "_get_paddlex_model", return_value=_FakeModel()
+        ):
+            pages = run_paddleocr("/tmp/degenerate.pdf")
+
+        assert pages[0]["blocks"][0]["bbox"] == [
+            1.0,
+            2.0,
+            0.0,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            0.0,
+        ]
+        assert len(pages[0]["blocks"][0]["bbox"]) == 8
+        json.dumps(pages, allow_nan=False)
 
 
 # ── Structure V3 run function tests (with mocks) ──────────────────────────
@@ -1113,6 +1401,115 @@ class TestNormalizeBbox:
         out = _normalize_bbox(raw)
         assert out == expected
         assert all(type(v) is float for v in out)
+
+
+# ── _finite_geom (lenient geometry sanitizer) ─────────────────────────────
+class TestFiniteGeom:
+    """_finite_geom: the lenient sibling of _normalize_bbox.
+
+    _normalize_bbox enforces the strict 4-float box contract; _finite_geom
+    sanitizes whatever geometry shape the model emitted (4-float box,
+    2N-float polygon, nested point lists) without forcing a shape, and must
+    keep every result safe for json.dumps(allow_nan=False) — the server
+    serializes with allow_nan=False (SafeJSONResponse), so a surviving
+    NaN/Inf would 500 the whole request (the production failure class).
+    """
+
+    def test_nested_list_recursion(self):
+        """Non-finite floats are zeroed at every nesting level."""
+        from paddlex_helpers import _finite_geom
+
+        out = _finite_geom([[1.0, float("nan")], [float("inf"), 2.0]])
+        assert out == [[1.0, 0.0], [0.0, 2.0]]
+        json.dumps(out, allow_nan=False)
+
+    def test_top_level_non_finite_float_zeroed(self):
+        from paddlex_helpers import _finite_geom
+
+        assert _finite_geom(float("nan")) == 0.0
+        assert _finite_geom(float("inf")) == 0.0
+        json.dumps(_finite_geom(float("nan")), allow_nan=False)
+
+    def test_wellformed_box_passthrough(self):
+        """A well-formed 4-float box passes through value-identical."""
+        from paddlex_helpers import _finite_geom
+
+        out = _finite_geom([1.0, 2.0, 3.0, 4.0])
+        assert out == [1.0, 2.0, 3.0, 4.0]
+        json.dumps(out, allow_nan=False)
+
+    def test_top_level_dict_rejected_to_zero_box(self):
+        """A top-level dict is out-of-contract geometry → the zero box.
+
+        Same fail-soft as _normalize_bbox: the dict must not survive into
+        the response, and the NaN inside it must not survive either.
+        """
+        from paddlex_helpers import _finite_geom
+
+        out = _finite_geom({"x": float("nan")})
+        assert out == [0.0, 0.0, 0.0, 0.0]
+        assert all(type(v) is float for v in out)
+        json.dumps(out, allow_nan=False)
+
+    def test_nested_dict_walked_value_sanitized(self):
+        """A dict nested in a list stays a dict with its floats sanitized.
+
+        Unlike the top-level dict (rejected), a nested dict is walked: the
+        list shape is preserved and only the non-finite values are zeroed
+        (the dict itself serializes fine — only NaN/Inf floats crash
+        json.dumps(allow_nan=False)).
+        """
+        from paddlex_helpers import _finite_geom
+
+        out = _finite_geom([[1.0, 2.0], {"w": float("inf")}])
+        assert out == [[1.0, 2.0], {"w": 0.0}]
+        assert isinstance(out[1], dict)
+        json.dumps(out, allow_nan=False)
+
+    def test_none_stays_none(self):
+        """Absent geometry (None) stays absent — not coerced to the zero box."""
+        from paddlex_helpers import _finite_geom
+
+        assert _finite_geom(None) is None
+
+    def test_nested_tuple_from_tolist_walked(self):
+        """A .tolist() that yields a tuple reaches the walk unsanitized.
+
+        _jsonable normalizes plain tuples to lists, but its .tolist()
+        branch returns the result WITHOUT recursing — an object whose
+        tolist() yields a tuple (a custom ndarray wrapper) can still
+        deliver a tuple to _walk, and a NaN inside it would otherwise
+        500 json.dumps(allow_nan=False). Tuples are walked like lists and
+        re-emitted as lists.
+        """
+        from paddlex_helpers import _finite_geom
+
+        class ToListTuple:
+            def tolist(self):
+                return (float("nan"), 2.0)
+
+        out = _finite_geom([ToListTuple(), 1.0])
+        assert out == [[0.0, 2.0], 1.0]
+        assert isinstance(out[0], list)
+        json.dumps(out, allow_nan=False)
+
+    def test_top_level_tuple_from_tolist_walked(self):
+        """A TOP-LEVEL .tolist() result that is a tuple is walked too.
+
+        Pins the top-level dispatch: without the tuple branch there, a
+        top-level tuple from tolist() would bypass the walk entirely
+        (returned as-is) with its NaN intact.
+        """
+        from paddlex_helpers import _finite_geom
+
+        class ToListTopTuple:
+            def tolist(self):
+                return (float("inf"), 1.0)
+
+        out = _finite_geom(ToListTopTuple())
+        assert out == [0.0, 1.0]
+        assert isinstance(out, list)
+        json.dumps(out, allow_nan=False)
 
 
 class TestStructuredBlocksNumpySerializability:

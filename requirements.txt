@@ -3,6 +3,45 @@ ocrmypdf>=17.4.1,<18
 # worker.py now imports it directly for AcroForm pre-flatten (AGENTS.md
 # Version-Specific Hack #5) — pin it explicitly.
 pypdfium2>=5,<6
+# server.py imports pypdf directly: _enforce_pdf_caps measures each page's
+# EFFECTIVE MediaBox/CropBox with it, because the renderer (pdftoppm,
+# no -cropbox) rasterizes the page-tree-inherited, corner-normalized box
+# while pypdfium2's page-level box APIs see neither (PDFium crbug 1786),
+# AND counts the page tree (get_num_pages → _flatten) for the page cap —
+# the /Count entry is spec-optional and attacker-writable, and both
+# parsers' count APIs return it uncross-checked (pypdfium2's CountPages
+# for 0 < /Count < 0xFFFFF; pypdf's get_num_pages for encrypted docs). A
+# lying /Count is an unbounded-render DoS on the unauthenticated API.
+# Pure-python, no deps. NOTE: its page-tree-inheritance + box + page-count
+# semantics are load-bearing for BOTH caps — re-verify the cap's
+# regression tests (tests/test_server.py::TestEnforcePdfCaps) when bumping
+# this pin. Floor raised to 6.16.1: the 2026 DoS cluster in crafted-PDF
+# parsing — CVE-2026-54531 (infinite loop, outlines) fixed 6.13.0,
+# CVE-2026-54651 (infinite loop, Article/Thread) fixed 6.13.1,
+# CVE-2026-59937 (malformed xref-stream) fixed 6.14.0, and
+# CVE-2026-84310/84311 (GHSA-763m-79hh-57f2, algorithmic-complexity DoS in
+# outline / XObject traversal) fixed 6.16.1 — the server feeds it up-to-
+# 100-MB unauthenticated bytes, so the security floor is load-bearing.
+# Also load-bearing: its OWN page-tree safety guards (Configuration.
+# page_tree_maximum_depth=100, page_tree_maximum_entries=100_000, cycle
+# detection) — _enforce_pdf_caps 413s fail-closed when they trip (see
+# _is_pypdf_page_tree_guard_error): the only other count (pypdfium2's)
+# is /Count-gated, i.e. the attacker-writable value the gate distrusts.
+# If a future 6.x changes the guards' exception types, the fail-closed
+# branch silently stops matching them — every non-guard pypdf failure
+# path logs with a traceback (look for "_enforce_pdf_caps:" warnings),
+# and the cap's regression tests re-verify the trip. RESIDUALS (see
+# server._enforce_pdf_caps): (1) CONSTRUCTOR-level parser disagreement
+# (pypdf rejects the bytes, pypdfium2 opens the same ones — the
+# verified shape: a spec-legal PDF missing the startxref section)
+# fails CLOSED (413 "Unparseable PDF"): the old fail-soft skipped the
+# pixel cap ENTIRELY for a renderer-openable document; (2) bytes
+# NEITHER parser opens fail soft (BOTH caps skipped — the pipeline's
+# own error applies); (3) a document pypdf OPENED but that fails a
+# mid-pass step fails soft on the page cap via the /Count-gated pdfium
+# count where that is the only count available. All residual branches
+# log with traceback.
+pypdf>=6.16.1,<7
 paddlex[base]==3.7.2
 # Pinned: the get_word_info patch in paddlex_helpers.py targets the PaddleX 3.2.0-3.7.2 source; bumping this pin must re-run the e2e-ocr gate (requirements.txt is in its path filter).
 paddlepaddle==3.3.0
@@ -14,6 +53,8 @@ fastapi==0.138.1
 starlette==1.3.1
 pydantic==2.13.4
 uvicorn[standard]
-requests
+# Pinned: unpinned `requests` is a supply-chain exposure in a library the
+# Docling multipart CRLF fix relies on (server.py); 2.x is the stable line.
+requests>=2.32,<3
 python-multipart
 pytest

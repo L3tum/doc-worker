@@ -142,7 +142,6 @@ def _find_all(normalized: str, marker: str) -> list[int]:
 def _check_acroform(work: Path) -> None:
     """Check A: flatten → ocrmypdf → pdftotext must show the typed values."""
     import worker
-    from worker import flatten_acroform_if_needed
 
     work.mkdir(parents=True, exist_ok=True)
     fixture = _find_fixture(ACROFORM_FIXTURE)
@@ -164,7 +163,7 @@ def _check_acroform(work: Path) -> None:
         )
     print("[e2e] check A: red guard OK (values invisible without pre-flatten)")
 
-    flattened = flatten_acroform_if_needed(original)
+    flattened = worker.flatten_acroform_if_needed(original)
     if flattened is None:
         raise E2EError(
             "flatten_acroform_if_needed returned None — no AcroForm "

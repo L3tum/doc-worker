@@ -65,7 +65,9 @@ class TestCallDoclingConvert:
     hermetic and assert the sidecar naming contract directly.
     """
 
-    def _point_worker_at(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    def _point_worker_at_docling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
         """Point DOCLING_BASE_URL and DOCLING_OUT at test-local values.
 
         Returns the monkeypatched DOCLING_OUT for later assertions.
@@ -88,7 +90,7 @@ class TestCallDoclingConvert:
         DOCLING_OUT key must use the original, so the intermediate name
         never leaks into the sidecar output.
         """
-        docling_out = self._point_worker_at(tmp_path, monkeypatch)
+        docling_out = self._point_worker_at_docling(tmp_path, monkeypatch)
 
         # the dummy plays the role of the flattened intermediate the worker
         # would actually upload.
@@ -131,7 +133,7 @@ class TestCallDoclingConvert:
         A plain file (no intermediate) must produce sidecars under
         DOCLING_OUT/<its stem>/ named after itself.
         """
-        docling_out = self._point_worker_at(tmp_path, monkeypatch)
+        docling_out = self._point_worker_at_docling(tmp_path, monkeypatch)
 
         report = tmp_path / "report.pdf"
         report.write_bytes(b"%PDF-1.4 fake")
@@ -164,7 +166,7 @@ class TestCallDoclingConvert:
 
         No sidecar files may be written when the request itself fails.
         """
-        docling_out = self._point_worker_at(tmp_path, monkeypatch)
+        docling_out = self._point_worker_at_docling(tmp_path, monkeypatch)
 
         report = tmp_path / "report.pdf"
         report.write_bytes(b"%PDF-1.4 fake")
@@ -174,3 +176,128 @@ class TestCallDoclingConvert:
         assert worker.call_docling_convert(report) is False
         # nothing may be written under DOCLING_OUT on a request failure.
         assert not docling_out.exists()
+
+    def test_leading_dot_sidecar_name_stays_inside_docling_out(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_requests: types.ModuleType,
+    ) -> None:
+        """H4: Path('...pdf').stem is '..' — without normalization the sidecar
+        would be keyed one level above DOCLING_OUT/. Degenerate stems must map
+        to a safe component so the output stays inside DOCLING_OUT/ no matter
+        what filename the client/INBOX supplies."""
+        docling_out = self._point_worker_at_docling(tmp_path, monkeypatch)
+
+        report = tmp_path / "report.pdf"
+        report.write_bytes(b"%PDF-1.4 fake")
+
+        fake_requests.post.return_value = _FakeResponse([{"md": "# x", "json": "{}"}])
+
+        assert worker.call_docling_convert(report, sidecar_name="...pdf") is True
+
+        md_path = docling_out / "_" / "_.md"
+        json_path = docling_out / "_" / "_.json"
+        assert md_path.exists()
+        assert json_path.exists()
+        # Nothing may land OUTSIDE DOCLING_OUT/ (the '..' stem escape):
+        # the old code wrote DOCLING_OUT / ".." / "..md" = the parent dir.
+        assert not (docling_out.parent / "..md").exists()
+        assert not (docling_out.parent / "..json").exists()
+        written = sorted(p.name for p in docling_out.rglob("*") if p.is_file())
+        assert written == ["_.json", "_.md"]
+
+    def test_path_traversal_sidecar_name_contained(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_requests: types.ModuleType,
+    ) -> None:
+        """A traversal-bearing sidecar_name is keyed by its Path stem — the
+        output lands under DOCLING_OUT/<stem>/, never above DOCLING_OUT/."""
+        docling_out = self._point_worker_at_docling(tmp_path, monkeypatch)
+
+        report = tmp_path / "report.pdf"
+        report.write_bytes(b"%PDF-1.4 fake")
+
+        fake_requests.post.return_value = _FakeResponse([{"md": "# x", "json": "{}"}])
+
+        assert (
+            worker.call_docling_convert(report, sidecar_name="../../evil.pdf") is True
+        )
+
+        md_path = docling_out / "evil" / "evil.md"
+        json_path = docling_out / "evil" / "evil.json"
+        assert md_path.exists()
+        assert json_path.exists()
+        # Only the contained pair may exist under DOCLING_OUT/.
+        written = sorted(
+            p.relative_to(docling_out).as_posix()
+            for p in docling_out.rglob("*")
+            if p.is_file()
+        )
+        assert written == ["evil/evil.json", "evil/evil.md"]
+
+    def test_crlf_in_sidecar_name_stripped_from_upload(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_requests: types.ModuleType,
+    ) -> None:
+        """CRLF in an INBOX filename must not inject headers into the
+        internal Docling request: upload_name strips CR and LF before it is
+        interpolated into the multipart Content-Disposition header (m4).
+        The stripped name also feeds the DOCLING_OUT output key.
+        """
+        docling_out = self._point_worker_at_docling(tmp_path, monkeypatch)
+
+        report = tmp_path / "report.pdf"
+        report.write_bytes(b"%PDF-1.4 fake")
+
+        fake_requests.post.return_value = _FakeResponse([{"md": "# x", "json": "{}"}])
+
+        assert (
+            worker.call_docling_convert(
+                report, sidecar_name="evil\r\nX-Injected: 1.pdf"
+            )
+            is True
+        )
+
+        call = fake_requests.post.call_args
+        # The multipart filename must be exactly the stripped name — no
+        # \r, no \n (an unstripped CRLF would inject 'X-Injected: 1' as an
+        # extra header of the internal request).
+        upload_name = call.kwargs["files"]["files"][0]
+        assert upload_name == "evilX-Injected: 1.pdf"
+        assert "\r" not in upload_name
+        assert "\n" not in upload_name
+        assert call.kwargs["files"]["files"][2] == "application/pdf"
+
+        # The stripped name also feeds the sidecar output key.
+        stem = "evilX-Injected: 1"
+        assert (docling_out / stem / f"{stem}.md").exists()
+        assert (docling_out / stem / f"{stem}.json").exists()
+
+    def test_benign_sidecar_name_passes_through_unchanged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        fake_requests: types.ModuleType,
+    ) -> None:
+        """Control for the CRLF strip: a name without CR/LF is uploaded
+        byte-for-byte unchanged (the strip must not touch any other byte).
+        """
+        self._point_worker_at_docling(tmp_path, monkeypatch)
+
+        report = tmp_path / "report.pdf"
+        report.write_bytes(b"%PDF-1.4 fake")
+
+        fake_requests.post.return_value = _FakeResponse([{"md": "# x", "json": "{}"}])
+
+        assert (
+            worker.call_docling_convert(report, sidecar_name="report 2 (final).pdf")
+            is True
+        )
+
+        call = fake_requests.post.call_args
+        assert call.kwargs["files"]["files"][0] == "report 2 (final).pdf"

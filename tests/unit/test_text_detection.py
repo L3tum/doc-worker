@@ -331,8 +331,8 @@ class TestDetectFileType:
         assert server.detect_file_type(data) == "image"
 
     def test_corrupt_png_body_still_classified_by_header(self) -> None:
-        """Classification is anchored at offset 0: a corrupt body after a
-        valid header must not change the kind (corrupt files fail later in
-        the pipeline, not in routing)."""
+        """Classification is anchored at the first non-noise byte: a
+        corrupt body after a valid header must not change the kind
+        (corrupt files fail later in the pipeline, not in routing)."""
         data = b"\x89PNG\r\n\x1a\n" + b"\x00\x01\x02\xff\xfe" * 10
         assert server.detect_file_type(data) == "image"

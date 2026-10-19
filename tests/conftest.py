@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 from collections.abc import Generator
@@ -13,6 +14,50 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+
+# ── Fresh-interpreter env-contract tests ─────────────────────────────────
+
+
+def run_fresh_interpreter(
+    script: str,
+    env_overrides: dict[str, str] | None = None,
+    env_removals: tuple[str, ...] = (),
+    timeout: int = 120,
+) -> subprocess.CompletedProcess:
+    """Run *script* in a FRESH python interpreter (the import-time env
+    contract tests need one: the clamp/env-parse runs at import, so an
+    in-process reload would not re-prove it). Returns the
+    CompletedProcess — the caller asserts on returncode/stdout/stderr
+    (the shape differs per test: most expect 0 + "OK", one expects a
+    nonzero exit + the error in stderr)."""
+    env = dict(os.environ)
+    for name in env_removals:
+        env.pop(name, None)
+    if env_overrides:
+        env.update(env_overrides)
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,  # inspected: returncode + stdout/stderr per test
+    )
+
+
+def run_fresh_interpreter_ok(
+    script: str,
+    env_overrides: dict[str, str] | None = None,
+    env_removals: tuple[str, ...] = (),
+    timeout: int = 120,
+) -> None:
+    """run_fresh_interpreter + the common success contract: exit 0 and
+    the script printed OK."""
+    proc = run_fresh_interpreter(script, env_overrides, env_removals, timeout)
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
 
 
 # ── Regression guard ──────────────────────────────────────────────────────

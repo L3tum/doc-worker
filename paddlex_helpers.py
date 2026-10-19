@@ -972,9 +972,25 @@ def _retry_model_init(
         except Exception as e:
             if _is_permanent_model_init_error(e):
                 cache_fn._init_exception = _build_enriched_permanent_error(e)  # type: ignore[attr-defined]
+                # The API surfaces a generic 503 detail for cached init
+                # failures; log the full traceback here so server-side logs
+                # carry the permanent failure's detail.
+                logger.exception(
+                    "PaddleX %s model initialization failed permanently",
+                    pipeline_label,
+                )
                 raise cache_fn._init_exception from e  # type: ignore[misc,attr-defined]
             if attempt == max_retries - 1:
                 cache_fn._init_exception = e  # type: ignore[attr-defined]
+                # Log the full traceback at capture time, same as the
+                # permanent branch above; the API only surfaces the generic
+                # 503 detail.
+                logger.exception(
+                    "PaddleX %s model initialization failed after %d attempts; "
+                    "caching for subsequent calls",
+                    pipeline_label,
+                    max_retries,
+                )
                 raise
             delay = base_delay * (2**attempt)
             logger.warning(
@@ -1197,13 +1213,33 @@ class ModelIdleTracker:
 # Render DPI for PDF→PNG page rasterization (pdftoppm -r). 300 is the
 # quality floor for the Structure-V3 OCR stage; override via RENDER_DPI to
 # trade OCR quality for temp-disk + memory on page-heavy deployments (e.g.
-# 200 ≈ 1.5× less staging). The pdftoppm timeout default derives from this
-# value (DEFAULT_PDFTOPPM_TIMEOUT below).
-RENDER_DPI: int = int(os.getenv("RENDER_DPI", "300"))
+# 200 ≈ 56% less staging — staging scales with pixel count, (300/200)²).
+# The pdftoppm timeout default derives from this value
+# (DEFAULT_PDFTOPPM_TIMEOUT below).
+# Clamped to >= 1: a 0/negative DPI is an invalid `pdftoppm -r` argument
+# and would fail/misrender every page. The DPI-scaled timeout is separately
+# clamped to >= 1 s by _pdftoppm_timeout_for_dpi.
+# (A non-numeric RENDER_DPI is an operator error and still fails loudly
+# at import.)
+RENDER_DPI: int = max(1, int(os.getenv("RENDER_DPI", "300")))
 
 # The 150-dpi-era base the pixel-scaled defaults derive from (pdftoppm
 # timeout, reading-order column threshold).
 LEGACY_DPI: int = 150
+
+# Min x-distance (at the render DPI) to treat two block left-edges as
+# separate columns: the 150-dpi-era 50 px literal (≈ 8.5 mm on paper)
+# scaled to the render DPI — 100 px at RENDER_DPI=300, LEGACY_DPI=150.
+COLUMN_THRESHOLD_PX: float = 50.0 * RENDER_DPI / LEGACY_DPI
+
+
+def _pdftoppm_timeout_for_dpi(dpi: int) -> int:
+    """pdftoppm timeout rule: the 150-dpi-era 120 s baseline scaled by
+    the per-page *pixel* multiplier (dpi / LEGACY_DPI) squared — 300 dpi
+    is 4x the pixel work of the old 120 s. Clamped to >= 1 s so a tiny
+    RENDER_DPI cannot yield timeout=0."""
+    return max(1, round(120 * (dpi / LEGACY_DPI) ** 2))
+
 
 # pdftoppm wall-clock budget, scaled off the 150-dpi-era 120 s by
 # (RENDER_DPI / LEGACY_DPI)² — the per-page *pixel* multiplier: 300 dpi is
@@ -1211,7 +1247,17 @@ LEGACY_DPI: int = 150
 # staging (all pages held as PNG) and ~4× per-page decode memory, so the
 # old 120 s would starve large PDFs. At RENDER_DPI=300: 480 s. Override
 # with PAPDFTOPPM_TIMEOUT (seconds); env override semantics unchanged.
-DEFAULT_PDFTOPPM_TIMEOUT: int = round(120 * (RENDER_DPI / LEGACY_DPI) ** 2)
+DEFAULT_PDFTOPPM_TIMEOUT: int = _pdftoppm_timeout_for_dpi(RENDER_DPI)
+
+# pdftoppm wall-clock budget (seconds), env-overridable. Parsed at import
+# (like the sibling knobs RENDER_DPI / MAX_REQUEST_SIZE / ...) so a
+# non-numeric value is an operator error that fails loudly at STARTUP —
+# not a generic 500 on the first render of a request. Clamped to >= 1:
+# a 0/negative operator value must not make every render TimeoutExpired
+# with a misleading error.
+PAPDFTOPPM_TIMEOUT: int = max(
+    1, int(os.getenv("PAPDFTOPPM_TIMEOUT", str(DEFAULT_PDFTOPPM_TIMEOUT)))
+)
 
 
 def _pdf_to_images(pdf_path: str, tmp_dir: str) -> list[str]:
@@ -1236,18 +1282,16 @@ def _pdf_to_images(pdf_path: str, tmp_dir: str) -> list[str]:
         pdf_path,
         str(tmp_path),
     ]
-    # Timeout configurable via PAPDFTOPPM_TIMEOUT (seconds); the default
-    # scales with the render DPI — see DEFAULT_PDFTOPPM_TIMEOUT above.
-    pdftoppm_timeout = int(
-        os.getenv("PAPDFTOPPM_TIMEOUT", str(DEFAULT_PDFTOPPM_TIMEOUT))
-    )
+    # Timeout: the import-time PAPDFTOPPM_TIMEOUT constant (env override
+    # parsed at import — a misconfigured value fails at startup, see the
+    # constant above; default scales with the render DPI).
     try:
         result = subprocess.run(
-            cmd, check=True, capture_output=True, text=True, timeout=pdftoppm_timeout
+            cmd, check=True, capture_output=True, text=True, timeout=PAPDFTOPPM_TIMEOUT
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
-            f"pdftoppm timed out after {pdftoppm_timeout} seconds converting {pdf_path}. "
+            f"pdftoppm timed out after {PAPDFTOPPM_TIMEOUT} seconds converting {pdf_path}. "
             f"The PDF may be too large or corrupted. "
             f"Set PAPDFTOPPM_TIMEOUT to increase the limit."
         )
@@ -1374,6 +1418,45 @@ def _normalize_bbox(raw: object) -> list[float]:
     return values
 
 
+def _finite_geom(raw: Any) -> Any:
+    """Make raw model geometry (blocks 'bbox') JSON-safe.
+
+    Coerces via _jsonable (ndarray → Python floats), then replaces
+    every non-finite float (NaN/Inf — json.dumps with allow_nan=False
+    would 500 the whole response) with 0.0, preserving the shape:
+    4-float box, 2N-float polygon (rec_polys), or nested point lists.
+    None stays None (absent box). A top-level dict is out-of-contract
+    geometry (not a box or polygon) and is rejected, failing soft to the
+    zero box — symmetric with _normalize_bbox; a dict nested in a list is
+    walked so any non-finite float inside it is sanitized (the dict itself
+    serializes fine — only NaN/Inf floats crash json.dumps(allow_nan=False)).
+    Tuples are walked like lists and re-emitted as lists: _jsonable
+    normally normalizes tuples away, but its .tolist() branch returns the
+    result WITHOUT recursing, so an object whose .tolist() yields a tuple
+    (a custom ndarray wrapper) can still deliver one to the walk —
+    untraversed, a NaN inside it would 500 the response.
+    Unlike _normalize_bbox this does NOT force a 4-element shape —
+    polygons are legal here (see the rec_boxes/rec_polys fallback in the
+    page assemblers).
+    """
+    value = _jsonable(raw)
+    if isinstance(value, dict):
+        return [0.0, 0.0, 0.0, 0.0]
+
+    def _walk(item: Any) -> Any:
+        if isinstance(item, dict):
+            return {k: _walk(v) for k, v in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [_walk(i) for i in item]
+        if isinstance(item, float) and not math.isfinite(item):
+            return 0.0
+        return item
+
+    if isinstance(value, (list, tuple, float)):
+        return _walk(value)
+    return value
+
+
 def _nullsafe(value: Any, default: Any) -> Any:
     """Return ``value`` unless it is None, else ``default``.
 
@@ -1441,7 +1524,7 @@ def run_paddleocr(file_path: str) -> list[dict]:
             blocks.append(
                 {
                     "text": str(text),
-                    "bbox": _jsonable(bbox),
+                    "bbox": _finite_geom(bbox),
                     "confidence": round(confidence, 4),
                 }
             )
@@ -1541,8 +1624,9 @@ def _process_structure_v3_pages(model: Any, images: list[str]) -> list[dict]:
                 bbox = rec_polys[idx]
 
             # Recursively convert bbox to plain Python values (ndarray or
-            # list of numpy scalars — see _jsonable)
-            safe_bbox = _jsonable(bbox)
+            # list of numpy scalars — see _jsonable) and sanitize
+            # non-finite floats (NaN/Inf) to 0.0 (see _finite_geom)
+            safe_bbox = _finite_geom(bbox)
 
             blocks.append(
                 {
@@ -1648,7 +1732,20 @@ def _convert_table_html_to_markdown(html_content: str) -> str:
                         html_module.unescape(self.current_cell.strip())
                     )
                 colspan_value = attr_dict.get("colspan") or 1
-                self.colspan = int(colspan_value)
+                try:
+                    # Clamped: colspan is model-transcribed HTML from the
+                    # document itself, and a crafted <td colspan="999999999">
+                    # would otherwise append ~1e9 cells below (≈1.7 GB of
+                    # list slots + strings) and OOM the worker. 1000 is
+                    # far beyond any real table (max_cols padding would
+                    # then allocate the same per sibling row — still
+                    # bounded). Clamped to >= 1: range(<=0) would silently
+                    # drop the cell entirely.
+                    self.colspan = max(1, min(int(colspan_value), 1000))
+                except (TypeError, ValueError):
+                    # Garbage colspan ("abc", "2.5") must not 500 the
+                    # request — treat it as 1 (the no-attribute value).
+                    self.colspan = 1
                 self.in_cell = True
                 self.current_cell = ""
                 # If this is a header cell, we'll bold the content later
@@ -1723,14 +1820,14 @@ def _compute_column_clusters(
     """Cluster left x-coordinates into column centers.
 
     *threshold* is the minimum x-distance between distinct columns. None
-    (default) scales with the render DPI: the 150-dpi-era 50 px literal,
-    i.e. ``50.0 * RENDER_DPI / LEGACY_DPI`` — 100 px at RENDER_DPI=300,
+    (default) uses COLUMN_THRESHOLD_PX — the 150-dpi-era 50 px literal
+    (≈ 8.5 mm on paper) scaled to the render DPI: 100 px at RENDER_DPI=300,
     LEGACY_DPI=150.
 
     Returns None if there's only one column or no blocks.
     """
     if threshold is None:
-        threshold = 50.0 * RENDER_DPI / LEGACY_DPI
+        threshold = COLUMN_THRESHOLD_PX
     if not lefts:
         return None
     lefts_sorted = sorted(lefts)
@@ -1755,7 +1852,13 @@ def _image_width_px(image_path: str) -> float | None:
 
         with Image.open(image_path) as img:
             width = float(img.size[0])
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Could not read page-image width for %r: %s — reading-order "
+            "sort falls back to content extent",
+            image_path,
+            exc,
+        )
         return None
     return width if width > 0 else None
 
@@ -1799,9 +1902,9 @@ def _sort_blocks_by_reading_order(
     Args:
         structured_blocks: List of block dicts with 'bbox' keys.
         column_threshold: Min x-distance to consider as separate columns.
-            None (default) scales with the render DPI: the 150-dpi-era 50 px
-            literal, i.e. ``50.0 * RENDER_DPI / LEGACY_DPI`` — 100 px at
-            RENDER_DPI=300, LEGACY_DPI=150. The 50 px literal was ≈ 8.5 mm
+            None (default) uses COLUMN_THRESHOLD_PX — the 150-dpi-era 50 px
+            literal scaled to the render DPI: 100 px at RENDER_DPI=300,
+            LEGACY_DPI=150. The 50 px literal was ≈ 8.5 mm
             on paper at 150 dpi; the DPI-scaled default preserves that
             physical scale at 300 dpi instead of silently halving it to
             ≈ 4.2 mm (which split hanging indents into phantom columns).
@@ -1821,7 +1924,7 @@ def _sort_blocks_by_reading_order(
         return sorted(structured_blocks, key=_yx)
 
     if column_threshold is None:
-        column_threshold = 50.0 * RENDER_DPI / LEGACY_DPI
+        column_threshold = COLUMN_THRESHOLD_PX
 
     # True page width when the caller has the rendered image; content extent
     # (rightmost block edge) otherwise — the pre-true-width fallback.
@@ -1898,9 +2001,9 @@ def blocks_to_markdown(structured_blocks: list[dict]) -> str:
         - table → Markdown table (HTML converted)
         - image → [Image] or [Figure: caption] if a figure_title precedes it
 
-    Pure serializer — input order is taken as-is (NO sorting): callers
-    (run_paddlex_structure_v3) deliver structured_blocks already ordered
-    in reading order (see _process_structure_v3_pages).
+    Pure serializer — output preserves the given block order (no
+    sorting); in-repo callers pass blocks already ordered by
+    _sort_blocks_by_reading_order.
     """
     lines: list[str] = []
     last_figure_title = ""

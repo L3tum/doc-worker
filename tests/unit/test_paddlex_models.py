@@ -988,6 +988,41 @@ def test_run_paddlex_structure_v3_consumes_generator_predict_result(
     ]
 
 
+def test_run_paddlex_structure_v3_non_finite_rec_boxes_serialize_safely(
+    monkeypatch, mock_pdf_to_images
+):
+    """Non-finite coords in overall_ocr_res.rec_boxes must serialize safely.
+
+    The H2 sibling of the block_bbox/_normalize_bbox fix: the raw block
+    path goes through _finite_geom, and a NaN/Inf reaching
+    json.dumps(allow_nan=False) would 500 the endpoint response (and the
+    worker sidecar JSON)."""
+    import json
+
+    monkeypatch.setattr(
+        "paddlex_helpers._get_paddlex_structure_v3_model",
+        lambda: _GeneratorPredictModel(
+            [
+                {
+                    "overall_ocr_res": {
+                        "rec_texts": ["x"],
+                        "rec_scores": [0.9],
+                        "rec_boxes": [[1.0, float("nan"), 3.0, 4.0]],
+                        "rec_polys": [],
+                    },
+                    "parsing_res_list": [],
+                    "layout_det_res": {},
+                }
+            ]
+        ),
+    )
+
+    pages = run_paddlex_structure_v3("document.pdf")
+
+    assert pages[0]["blocks"][0]["bbox"] == [1.0, 0.0, 3.0, 4.0]
+    json.dumps(pages, allow_nan=False)
+
+
 # ── Model lifecycle: destroy + recreate ──────────────────────────────────
 
 
@@ -1101,7 +1136,7 @@ def test_retry_on_transient_error(tmp_path, monkeypatch):
 # ── Retry logic: permanent error caching ─────────────────────────────────
 
 
-def test_cache_permanent_error(tmp_path, monkeypatch):
+def test_cache_permanent_error(tmp_path, monkeypatch, caplog):
     """Permanent errors ('already been initialized') are cached and don't retry."""
     import paddlex_helpers
 
@@ -1124,9 +1159,19 @@ def test_cache_permanent_error(tmp_path, monkeypatch):
     )
 
     # First call: should raise
-    with pytest.raises(RuntimeError, match="already been initialized"):
-        paddlex_helpers._get_paddlex_model()
+    with caplog.at_level(logging.ERROR, logger="doc-worker.paddlex_helpers"):
+        with pytest.raises(RuntimeError, match="already been initialized"):
+            paddlex_helpers._get_paddlex_model()
     assert attempts == 1  # only 1 attempt, no retries for permanent errors
+
+    # The API surfaces only a generic 503 for cached init failures — the
+    # full traceback at capture time is the server-side compensation; pin
+    # the logger.exception record (level + exc_info) so a regression that
+    # drops the traceback cannot pass silently.
+    permanent = [r for r in caplog.records if "failed permanently" in r.getMessage()]
+    assert len(permanent) == 1
+    assert permanent[0].levelno == logging.ERROR
+    assert permanent[0].exc_info is not None  # the traceback, not just the message
 
     # Second call: should re-raise the cached exception (not retry)
     with pytest.raises(RuntimeError, match="already been initialized"):
@@ -1848,7 +1893,7 @@ class TestStructureV3RetryLogic:
             paddlex_helpers._get_paddlex_structure_v3_model()
         assert attempts == 1  # still 1
 
-    def test_structure_v3_exhausts_retries(self, tmp_path, monkeypatch):
+    def test_structure_v3_exhausts_retries(self, tmp_path, monkeypatch, caplog):
         """Structure V3 exhausts all 3 retry attempts on persistent transient error."""
         import paddlex_helpers
 
@@ -1869,9 +1914,18 @@ class TestStructureV3RetryLogic:
             create_pipeline=always_fails,
         )
 
-        with pytest.raises(RuntimeError, match="persistent network error"):
-            paddlex_helpers._get_paddlex_structure_v3_model()
+        with caplog.at_level(logging.ERROR, logger="doc-worker.paddlex_helpers"):
+            with pytest.raises(RuntimeError, match="persistent network error"):
+                paddlex_helpers._get_paddlex_structure_v3_model()
         assert attempts == 3  # exhausted all retries
+
+        # Same server-side compensation as the permanent branch above: the
+        # API only surfaces the generic 503 detail, so the capture-time
+        # traceback (logger.exception, with exc_info) is pinned here.
+        exhausted = [r for r in caplog.records if "failed after" in r.getMessage()]
+        assert len(exhausted) == 1
+        assert exhausted[0].levelno == logging.ERROR
+        assert exhausted[0].exc_info is not None  # the traceback, not just the message
 
 
 # ── Structure V3 destroy and recreate ────────────────────────────────────
@@ -2697,6 +2751,10 @@ class TestPredictSerialization:
         deadline = time.time() + 10
         while not state["job1_inside"] and time.time() < deadline:
             time.sleep(0.01)
+        assert state["job1_inside"], (
+            "job 1 never entered predict within the deadline — overlap check "
+            "would pass vacuously"
+        )
         release_job1.set()
         t1.join(30)
         t2.join(30)

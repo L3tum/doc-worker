@@ -198,6 +198,46 @@ class TestGenerateNativeSidecar:
                 finally:
                     worker.DOCLING_OUT = old
 
+    def test_sidecar_leading_dot_name_stays_inside_docling_out(self):
+        """H4 (native path): a leading-dot filename ('...pdf' → Path stem
+        '..') must not key the sidecar above DOCLING_OUT/ — the degenerate
+        stem maps to the safe component '_'. (The Docling-API path is
+        covered in test_docling_api.py.)"""
+        import worker
+
+        mock_pages = [
+            {
+                "page": 1,
+                "text": "t",
+                "blocks": [],
+                "structured_blocks": [],
+            }
+        ]
+
+        with patch("worker.run_paddlex_structure_v3", return_value=mock_pages):
+            with patch("worker.blocks_to_markdown", return_value=""):
+                pdf_path = Path(tempfile.gettempdir()) / "sidecar_dotdot_src.pdf"
+                pdf_path.write_text("fake")
+
+                old = worker.DOCLING_OUT
+                worker.DOCLING_OUT = Path(tempfile.gettempdir()) / "sidecar_test_dotdot"
+                try:
+                    assert (
+                        generate_native_sidecar(pdf_path, sidecar_name="...pdf") is True
+                    )
+
+                    # Output stays inside DOCLING_OUT/ under the safe stem '_'.
+                    md_path = worker.DOCLING_OUT / "_" / "_.md"
+                    json_path = worker.DOCLING_OUT / "_" / "_.json"
+                    assert md_path.exists()
+                    assert json_path.exists()
+                    # The old code would have written DOCLING_OUT / ".." /
+                    # "..md" — one level above DOCLING_OUT/.
+                    assert not (worker.DOCLING_OUT.parent / "..md").exists()
+                    assert not (worker.DOCLING_OUT.parent / "..json").exists()
+                finally:
+                    worker.DOCLING_OUT = old
+
     def test_handle_docling_native(self):
         """Test handle_docling with native mode."""
         import worker
@@ -402,18 +442,85 @@ class TestUniqueDestination:
         assert dest.name.startswith("a_")
         assert not dest.exists()
 
-    def test_same_second_collision_appends_counter(self, tmp_path):
-        import time
-
+    def test_same_second_collision_appends_counter(self, tmp_path, monkeypatch):
         import worker
 
+        # Pin the timestamp: unique_destination() calls time.strftime() at
+        # call time, so a second-rollover between computing `ts` here and
+        # that call would flake the exact-name assertion.
+        ts = "20260101000000"
+        monkeypatch.setattr(worker.time, "strftime", lambda fmt: ts)
+
         (tmp_path / "a.pdf").write_text("x")
-        ts = time.strftime("%Y%m%d%H%M%S")
         (tmp_path / f"a_{ts}.pdf").write_text("x")
 
         dest = worker.unique_destination(tmp_path, "a.pdf")
         assert dest.name == f"a_{ts}_2.pdf"
         assert not dest.exists()
+
+    def test_three_way_collision_increments_counter(self, tmp_path, monkeypatch):
+        """Base, timestamped, AND _2 all exist → _3: the numeric-suffix
+        loop must walk past every existing candidate in the same second.
+
+        time.strftime is pinned (monkeypatched) so the test and
+        unique_destination() see the same timestamp even across a
+        second-rollover."""
+        import worker
+
+        ts = "20260101000000"
+        monkeypatch.setattr(worker.time, "strftime", lambda fmt: ts)
+
+        (tmp_path / "a.pdf").write_text("x")
+        (tmp_path / f"a_{ts}.pdf").write_text("x")
+        (tmp_path / f"a_{ts}_2.pdf").write_text("x")
+
+        dest = worker.unique_destination(tmp_path, "a.pdf")
+        assert dest.name == f"a_{ts}_3.pdf"
+        assert not dest.exists()
+
+
+# ── _is_flatten_intermediate (strict worker-owned shape) ─────────────────
+class TestIsFlattenIntermediate:
+    """_is_flatten_intermediate: strict worker-owned flatten shape.
+
+    Only ``<non-empty head>__acroform_flattened__<8 lowercase hex><suffix>``
+    is recognized (uuid.uuid4().hex[:8] is always lowercase). Any other
+    tail must NOT be recognized — crash recovery unlinks recognized
+    intermediates and preserves everything else, so a false positive is
+    silent data loss.
+    """
+
+    @pytest.mark.parametrize(
+        ("name", "suffix", "expected"),
+        [
+            pytest.param("a__acroform_flattened__12345678", ".pdf", True, id="8-hex"),
+            # 7 hex — key future-regression case: a `>= 8` length
+            # relaxation must fail here.
+            pytest.param("a__acroform_flattened__1234567", ".pdf", False, id="7-hex"),
+            pytest.param("a__acroform_flattened__123456789", ".pdf", False, id="9-hex"),
+            # Uppercase — the worker only ever writes lowercase.
+            pytest.param(
+                "a__acroform_flattened__DEADBEEF", ".pdf", False, id="uppercase"
+            ),
+            pytest.param(
+                "a__acroform_flattened__abcz1234", ".pdf", False, id="non-hex"
+            ),
+            pytest.param(
+                "__acroform_flattened__12345678", ".pdf", False, id="empty-head"
+            ),
+            pytest.param(
+                "a__acroform_flattened__", ".pdf", False, id="marker-only-tail"
+            ),
+            pytest.param("a__acroform_flattened__12345678", "", True, id="no-suffix"),
+            pytest.param(
+                "a.pdf__acroform_flattened__8badf00d", ".pdf", True, id="dotted-head"
+            ),
+        ],
+    )
+    def test_length_rule(self, name: str, suffix: str, expected: bool) -> None:
+        import worker
+
+        assert worker._is_flatten_intermediate(name, suffix) is expected
 
 
 # ── recover_leftover_files tests ──────────────────────────────────────────
@@ -451,14 +558,22 @@ class TestRecoverLeftoverFiles:
         # No files should be moved
         assert not any(tmp_error.iterdir())
 
-    def test_no_overwrite_in_error(self):
-        """Uses timestamped name if file already in ERROR/."""
+    def test_no_overwrite_in_error(self, tmp_path, monkeypatch):
+        """Uses timestamped name if file already in ERROR/. The exact
+        name is pinned by fixing the strftime stamp (house pattern), so
+        the assertion is on the precise recovered filename, not a
+        substring guess; the original's bytes must be untouched and the
+        recovered copy must keep its own bytes."""
         import worker
 
-        tmp_processing = Path(tempfile.mkdtemp())
-        tmp_error = Path(tempfile.mkdtemp())
-        worker.PROCESSING = tmp_processing
-        worker.ERROR = tmp_error
+        tmp_processing = tmp_path / "processing"
+        tmp_error = tmp_path / "error"
+        tmp_processing.mkdir()
+        tmp_error.mkdir()
+        monkeypatch.setattr(worker, "PROCESSING", tmp_processing)
+        monkeypatch.setattr(worker, "ERROR", tmp_error)
+        # Pin the collision suffix to a fixed stamp (exact-name pinning).
+        monkeypatch.setattr(worker.time, "strftime", lambda _fmt: "20250101120000")
 
         # Create existing file in ERROR/
         existing = tmp_error / "conflict.pdf"
@@ -472,12 +587,12 @@ class TestRecoverLeftoverFiles:
 
         # Original file should be untouched
         assert existing.read_text() == "already here"
-        # New timestamped file should exist
-        error_pdfs = list(tmp_error.glob("*.pdf"))
-        assert len(error_pdfs) == 2
-        # One should have the timestamp suffix
-        timestamped = [f for f in error_pdfs if "_20" in f.name]
-        assert len(timestamped) == 1
+        # The recovered copy exists under the EXACT expected name and
+        # keeps its bytes.
+        recovered = tmp_error / "conflict_20250101120000.pdf"
+        assert recovered.exists()
+        assert recovered.read_text() == "leftover content"
+        assert len(list(tmp_error.glob("*.pdf"))) == 2
 
     def test_stale_flattened_intermediate_unlinked(self, monkeypatch):
         """A stale marker-named intermediate is unlinked (not promoted) —
@@ -511,6 +626,33 @@ class TestRecoverLeftoverFiles:
             f for f in tmp_error.iterdir() if worker._FLATTENED_MARKER in f.name
         ]
         assert not flattened_in_error
+
+    def test_uppercase_marker_tail_preserved(self, monkeypatch):
+        """A marker-named file with an *uppercase* 8-hex tail is not a
+        worker intermediate (uuid.uuid4().hex is lowercase) — even with its
+        original present in PROCESSING/, it must be preserved in ERROR/
+        with its content intact, never unlinked. (Contrast: the lowercase
+        twin IS unlinked — see
+        test_stale_flattened_intermediate_unlinked.)
+        """
+        import worker
+
+        tmp_processing = Path(tempfile.mkdtemp())
+        tmp_error = Path(tempfile.mkdtemp())
+        monkeypatch.setattr(worker, "PROCESSING", tmp_processing)
+        monkeypatch.setattr(worker, "ERROR", tmp_error)
+
+        (tmp_processing / "a.pdf").write_text("original")
+        (tmp_processing / "a__acroform_flattened__DEADBEEF.pdf").write_text("user data")
+
+        recover_leftover_files()
+
+        # Nothing is unlinked: both files land in ERROR/, content intact.
+        assert not any(tmp_processing.iterdir())
+        assert (tmp_error / "a.pdf").read_text() == "original"
+        assert (
+            tmp_error / "a__acroform_flattened__DEADBEEF.pdf"
+        ).read_text() == "user data"
 
     def test_user_file_named_like_old_intermediate_preserved(self, monkeypatch):
         """An old-style *_flattened.pdf user file is preserved, not unlinked.
@@ -562,6 +704,38 @@ class TestRecoverLeftoverFiles:
         recovered = tmp_error / intermediate_name
         assert recovered.exists()
         assert recovered.read_text() == "worker intermediate"
+
+    def test_non_hex_marker_tail_preserved(self, monkeypatch):
+        """A marker-named file whose tail is NOT exactly 8 hex chars is not
+        a worker intermediate (strict recognition) — it must be preserved
+        in ERROR/, not silently unlinked (the pre-fix behavior deleted it
+        whenever the sibling original was also present).
+
+        The same name is pre-occupied in ERROR/ to pin the
+        unique_destination rename branch of recovery."""
+        import worker
+
+        tmp_processing = Path(tempfile.mkdtemp())
+        tmp_error = Path(tempfile.mkdtemp())
+        monkeypatch.setattr(worker, "PROCESSING", tmp_processing)
+        monkeypatch.setattr(worker, "ERROR", tmp_error)
+
+        (tmp_processing / "b.pdf").write_text("original")
+        (tmp_processing / "b__acroform_flattened__zzzz.pdf").write_text("user data")
+        (tmp_error / "b__acroform_flattened__zzzz.pdf").write_text("older")
+
+        recover_leftover_files()
+
+        # The original is recovered as usual...
+        assert (tmp_error / "b.pdf").exists()
+        # ...and the marker-named (but non-strict) file is PRESERVED —
+        # renamed via unique_destination because its name is taken.
+        zzzz_files = sorted(p for p in tmp_error.iterdir() if "zzzz" in p.name)
+        assert len(zzzz_files) == 2
+        recovered = next(
+            p for p in zzzz_files if p.name != "b__acroform_flattened__zzzz.pdf"
+        )
+        assert recovered.read_text() == "user data"
 
     def test_marker_named_directory_skipped(self, monkeypatch):
         """A marker-named *directory* in PROCESSING/ must not crash startup.
@@ -660,6 +834,12 @@ class TestFlattenAcroform:
         assert out.name.endswith(".pdf")
         assert out.name != "form_flattened.pdf"
         assert worker._ACROFORM_FLATTEN_STATE == "active"
+
+        # Producer → consumer round-trip (review): the crash-recovery
+        # classifier — the CONSUMER of this producer's naming — must
+        # accept this exact real name + suffix, not just a hand-rolled
+        # literal that happens to satisfy the same rule.
+        assert worker._is_flatten_intermediate(out.name, out.suffix) is True
 
         # The copy has no AcroForm left; the original still does.
         flat_doc = pdfium.PdfDocument(str(out))

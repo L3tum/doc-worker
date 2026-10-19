@@ -142,6 +142,12 @@ curl -X POST http://localhost:8000/extract \
 | `PADDLEOCR_VL_TOKEN` | *(none)* | Bearer token for `/layout-parsing` and `/extract` auth (Open-WebUI) |
 | `PADDLEOCR_MODELS` | `/app/models` | Path to pre-downloaded PaddleOCR model dirs |
 | `MAX_REQUEST_SIZE` | `104857600` | Max request body size in bytes (100 MB default) |
+| `MAX_OCR_PAGES` | `500` | Max pages per OCR request; over-cap documents 413 before staging (unauthenticated-DoS guard). Counted by walking the page tree with pypdf — the `/Count` entry is spec-optional and attacker-writable, and both parsers' count APIs return it uncross-checked (a lying `/Count` would otherwise pass the cap: every /Count-gated consumer — poppler's render loop included, which is clamped to the raw `/Count` — sees only the first /Count pages; the concrete DoS residual is the page-size dimension, closed by `MAX_RENDERED_PIXELS`) |
+| `MAX_RENDERED_PIXELS` | `100000000` | Max width_px * height_px of a rendered PDF page at RENDER_DPI — measured from the LARGER of the page's effective MediaBox and CropBox (poppler-faithful: inherited from the page tree when the page sets none, inverted corners normalized — measured via pypdf, since pypdfium2's page-level box APIs see neither, PDFium crbug 1786; pdftoppm renders the MediaBox even when a CropBox is set); over-cap pages 413 before staging. ALSO the cap on an IMAGE upload's header-declared canvas (`PIL Image.open().size`, metadata-only — a few-KB highly-compressible PNG can declare a canvas whose decode is tens of GB); the same envelope, no separate knob |
+| `MAX_CONCURRENT_OCR_JOBS` | `2` | Max in-flight OCR jobs; saturated requests get 503 instead of queueing |
+| `MAX_CONCURRENT_PDF_PARSSES` | `2` | Max concurrent pre-slot PDF cap-check parses (page-tree count + per-page box measurement, offloaded to a worker thread; image uploads' header-size read is bounded by this same gate — a pathological image header is O(file size) to parse). The parse runs BEFORE the job slot — a rejected job must not take a slot — so its fan-out is bounded by this knob, not `MAX_CONCURRENT_OCR_JOBS`; saturated requests get 503 instead of queueing |
+
+*Temp-disk sizing note:* staging scales with `RENDER_DPI` × page count × per-page pixels, so tune `RENDER_DPI`, `MAX_OCR_PAGES` and `MAX_RENDERED_PIXELS` together to fit the temp volume (the default cap envelope is 500 pages × 100 Mpx ≈ 150 GB theoretical worst case).
 
 ### Build Arguments
 

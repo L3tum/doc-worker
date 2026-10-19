@@ -164,14 +164,43 @@ def move_to_error(file_path: Path, reason: str) -> None:
 # ---------------------------------------------------------------------------
 # Distinctive marker of the worker-owned AcroForm pre-flatten intermediate
 # (see flatten_acroform_if_needed): a real user file cannot plausibly
-# contain it, so crash recovery can recognize worker-owned intermediates
-# unambiguously; the uuid makes concurrent workers safe.
+# contain it, and the 8-hex uuid tail makes the shape specific enough that
+# crash recovery can recognize worker-owned intermediates unambiguously
+# (see _is_flatten_intermediate); the uuid makes concurrent workers safe.
 _FLATTENED_MARKER = "__acroform_flattened__"
+
+# uuid.uuid4().hex is lowercase, so a file matching the documented
+# worker-owned shape exactly is all we ever create; an uppercase tail
+# may be a user file and must be preserved, not unlinked.
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _is_flatten_intermediate(name: str, suffix: str) -> bool:
+    """True iff *name* has exactly the worker-owned flatten shape
+    ``<non-empty head>__acroform_flattened__<8 hex><suffix>`` (see
+    flatten_acroform_if_needed: uuid.uuid4().hex[:8]).
+
+    A marker substring with any other tail (wrong length, non-hex
+    characters, empty head) is NOT recognized as worker-owned — such
+    files are preserved in ERROR/ instead of unlinked.
+    """
+    head, sep, tail = name.partition(_FLATTENED_MARKER)
+    if not sep or not head:
+        return False
+    if suffix and tail.endswith(suffix):
+        tail = tail[: -len(suffix)]
+    return len(tail) == 8 and set(tail) <= _HEX_DIGITS
 
 
 def recover_leftover_files() -> None:
-    """Move any stale files from PROCESSING into ERROR on startup."""
-    # Deterministic order: marker-named intermediates first (while their
+    """Move any stale files from PROCESSING into ERROR on startup.
+
+    A leftover is only ever UNLINKED when it matches the strict
+    worker-owned flatten shape (see _is_flatten_intermediate) AND its
+    original is still present; every other file — including marker-named
+    ones whose tail is not exactly 8 hex — is preserved in ERROR/.
+    """
+    # Deterministic order: strict-shape intermediates first (while their
     # original is still in PROCESSING/ the marker branch can recognize the
     # pair and unlink the re-creatable copy — processing the original first
     # would move it away and preserve the intermediate instead), then the
@@ -179,7 +208,10 @@ def recover_leftover_files() -> None:
     leftovers = (
         sorted(
             PROCESSING.iterdir(),
-            key=lambda p: (0 if _FLATTENED_MARKER in p.name else 1, p.name),
+            key=lambda p: (
+                0 if _is_flatten_intermediate(p.name, p.suffix) else 1,
+                p.name,
+            ),
         )
         if PROCESSING.exists()
         else []
@@ -196,27 +228,24 @@ def recover_leftover_files() -> None:
         if not f.is_file():
             log(f"  Skipped non-file leftover: {f.name}/")
             continue
-        # A name containing the marker makes the file unambiguously
-        # worker-owned (see flatten_acroform_if_needed), so a user file
-        # can no longer be silently unlinked. The intermediate is
-        # re-creatable only while the corresponding original (the name
-        # prefix before the marker) is also present in PROCESSING/ —
-        # unlink it in that case. Without the original it may be the only
-        # surviving copy of the user's document, so preserve it in ERROR/
-        # instead of silently deleting it.
-        if _FLATTENED_MARKER in f.name:
+        # Only a file with the strict worker-owned flatten shape is
+        # recognized as re-creatable (see _is_flatten_intermediate) — a
+        # marker substring with any other tail may be the user's own file,
+        # so it falls through to ERROR/ instead of being unlinked. The
+        # intermediate is re-creatable only while the corresponding
+        # original (the name prefix before the marker) is also present in
+        # PROCESSING/ — unlink it in that case. Without the original it
+        # may be the only surviving copy of the user's document, so
+        # preserve it in ERROR/ instead of silently deleting it.
+        if _is_flatten_intermediate(f.name, f.suffix):
             original = PROCESSING / (f.name.split(_FLATTENED_MARKER, 1)[0] + f.suffix)
             if original.exists():
                 f.unlink(missing_ok=True)
                 log(f"  Removed stale AcroForm intermediate: {f.name}")
                 continue
-        dest = ERROR / f.name
-        # Avoid overwriting existing error files
-        if dest.exists():
-            stem = f.stem
-            suffix = f.suffix
-            ts = time.strftime("%Y%m%d%H%M%S")
-            dest = ERROR / f"{stem}_{ts}{suffix}"
+        # unique_destination hardens against overwriting existing error
+        # files (same-second collisions get a numeric suffix).
+        dest = unique_destination(ERROR, f.name)
         shutil.move(str(f), str(dest))
         log(f"  Recovered: {f.name} → ERROR/")
 
@@ -224,6 +253,20 @@ def recover_leftover_files() -> None:
 # ---------------------------------------------------------------------------
 # Docling API helpers
 # ---------------------------------------------------------------------------
+def _safe_sidecar_stem(name: str) -> str:
+    """Path-component-safe stem for DOCLING_OUT keying.
+
+    ``Path('...pdf').stem`` is ``'..'`` — a leading-dot filename would
+    otherwise key the sidecar one level above DOCLING_OUT/. Degenerate
+    stems map to a fixed safe component so the output stays inside
+    DOCLING_OUT/ no matter what filename the client/INBOX supplies.
+    """
+    stem = Path(name).stem
+    if stem in ("", ".", ".."):
+        return "_"
+    return stem
+
+
 def call_docling_convert(pdf_path: Path, sidecar_name: str | None = None) -> bool:
     """Send a PDF to the Docling API and return True on success.
 
@@ -242,6 +285,10 @@ def call_docling_convert(pdf_path: Path, sidecar_name: str | None = None) -> boo
 
     url = f"{DOCLING_BASE_URL}/v1alpha/convert"
     upload_name = sidecar_name or pdf_path.name
+    # Strip CR/LF: upload_name (a user-supplied INBOX filename) is interpolated
+    # into the multipart Content-Disposition header — a CRLF would inject
+    # headers into the internal Docling request.
+    upload_name = upload_name.replace("\r", "").replace("\n", "")
     try:
         with open(pdf_path, "rb") as f:
             files = {"files": (upload_name, f, "application/pdf")}
@@ -252,7 +299,7 @@ def call_docling_convert(pdf_path: Path, sidecar_name: str | None = None) -> boo
         # Docling returns a list of conversion results
         results = resp.json()
         if isinstance(results, list) and len(results) > 0:
-            filename_stem = Path(upload_name).stem
+            filename_stem = _safe_sidecar_stem(upload_name)
             out_dir = DOCLING_OUT / filename_stem
             out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -286,8 +333,10 @@ def handle_docling(pdf_path: Path, sidecar_name: str | None = None) -> bool:
     Security note: *sidecar_name* derives from the user-supplied filename
     (the worker lists files it finds in INBOX/); the output location is
     DOCLING_OUT/{stem}/..., which the server trusts as a shared volume.
-    Only the path stem is used for keying, so a filename cannot escape
-    DOCLING_OUT/.
+    The stem is normalized to a safe single component via
+    _safe_sidecar_stem — a leading-dot filename like '...pdf' would
+    otherwise yield stem '..' and write into DOCLING_OUT's parent — so
+    sidecar output is guaranteed to stay inside DOCLING_OUT/.
 
     Returns:
         True  — continue pipeline (sidecar succeeded or is disabled).
@@ -351,7 +400,7 @@ def generate_native_sidecar(pdf_path: Path, sidecar_name: str | None = None) -> 
         # poll right after it finishes.
         _mark_model_used()
 
-        filename_stem = Path(name).stem
+        filename_stem = _safe_sidecar_stem(name)
         out_dir = DOCLING_OUT / filename_stem
         out_dir.mkdir(parents=True, exist_ok=True)
 
