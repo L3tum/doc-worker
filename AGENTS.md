@@ -72,7 +72,16 @@ re-run the `e2e-ocr` CI gate** — it runs the umlaut fixture and the
 variants fixtures through the full pipeline and prints the state of every
 patch/flag. Most hacks are monkey-patches with fail-soft shape gates, so
 a bad upgrade won't break import — but a patch can silently end up
-`skipped`, which shows up in the e2e diagnostics line.
+`skipped`, which shows up in the e2e diagnostics line. The variants
+e2e has a fail-soft signal of the same kind: `[e2e] check B|C: WARNING:
+model geometry disagrees with the fixture layout` means PP-StructureV3
+localized a column marker on the wrong side (or with an unusable bbox),
+so the column-first **ordering** assertion is disarmed for that run and
+the check degrades to marker presence (the sort itself stays
+deterministically unit-tested in `tests/test_paddlex_helpers.py`). A
+one-off warning is model noise; if it **persists across runs**, the
+ordering e2e is not covering the fix — revisit the fixture geometry or
+the model before relying on it.
 
 1. **`PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT=0`** — image `ENV` (Dockerfile).
    PaddleX 3.7.2 picks `run_mode="mkldnn"` on CPU by default, which

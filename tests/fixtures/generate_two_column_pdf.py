@@ -4,9 +4,9 @@ Doc-Worker — deterministic two-column PDF fixture generator (E2E).
 
 Generates tests/fixtures/two_column.pdf: one US-Letter page, vector
 text only (Helvetica base font — no font files), laid out as a
-full-width title plus two text columns:
+left-aligned title (x=72 pt) plus two text columns:
 
-    TWOCOLUMNS                     (full-width title)
+    TWOCOLUMNS                     (title, left-aligned at x=72 pt)
     LEFTONE       RIGHTONE
     LEFTTWO       RIGHTTWO
     LEFTTHREE     RIGHTTHREE

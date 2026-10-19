@@ -4,9 +4,9 @@ Doc-Worker — deterministic Word-split-layout PDF fixture generator (E2E).
 
 Generates tests/fixtures/word_split.pdf: one US-Letter page, vector
 text only (Helvetica base font), laid out like a Word-style split with
-a full-width header and two narrow text cells:
+a left-aligned header (x=72 pt) and two narrow text cells:
 
-    WORDHEADER                     (full-width header)
+    WORDHEADER                     (header, left-aligned at x=72 pt)
     WORDLEFTONE    WORDRIGHTONE
     WORDLEFTTWO    WORDRIGHTTWO
 

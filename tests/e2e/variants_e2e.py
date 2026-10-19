@@ -166,7 +166,9 @@ def _warn_model_geometry(
         f"[e2e] check {check}: WARNING: model geometry disagrees with the "
         f"fixture layout ({detail}) — the reading-order sort is ordering the "
         f"model's own boxes; column-first assertion skipped (marker presence "
-        f"still verified)."
+        f"still verified). A one-off warning is model noise; if it persists "
+        f"across runs the ordering assertion is effectively disarmed — see "
+        f"AGENTS.md (Version-Specific Hacks) before relying on ordering e2e."
     )
     print("---- structure-v3 markdown ----")
     print(markdown)
@@ -363,7 +365,7 @@ def _check_two_column(work: Path) -> None:
             "(expected the entire left column before the right column)"
         )
     if _find_all(normalized, TWO_COLUMN_TITLE)[0] > left_max:
-        raise E2EError("full-width title did not precede the columns")
+        raise E2EError("title did not precede the columns")
     print(
         f"[e2e] check B: OK: column-first order (title first, LEFT {left_max} < RIGHT {right_min})"
     )
