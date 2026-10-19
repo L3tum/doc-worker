@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Doc-Worker — deterministic two-column PDF fixture generator (E2E).
 
